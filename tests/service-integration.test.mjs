@@ -8,8 +8,11 @@ import { expectedSessions, latestFinalizableSession, shiftDate } from '../backen
 import { CALCULATION_VERSION, createJob, dataVersion, importDataset, openDatabase, recordDailyPublication, updateJob } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
 import { materializeHistory } from '../backend/materialization.mjs';
+import { enqueuePreparation, preparationSpecs } from '../backend/preparation.mjs';
+import { writePreparedSnapshot } from '../backend/prepared-snapshots.mjs';
 import { EodhdProvider, importProviderData } from '../backend/provider.mjs';
-import { createService, performJob, scheduledPrecomputeKey } from '../backend/service.mjs';
+import { createDailyTick } from '../backend/server.mjs';
+import { createService, dailyCaptureAvailability, performJob, scheduledPrecomputeKey } from '../backend/service.mjs';
 import { savedScreenRoute, tradingViewUrl } from '../frontend/ui.js';
 
 const bar = (symbol, date, close) => ({ symbol, date, open: close, low: close, high: close, close,
@@ -157,6 +160,161 @@ async function completedJob(dispatch, id) {
   assert.fail('Background job did not finish');
 }
 
+test('US All preparation publishes Monitor and historical ranks without GET-triggered work', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = expectedSessions('2024-01-02', '2024-06-01').slice(-83);
+  const symbols = ['CORE', 'AMEXSTOCK', 'SPY'];
+  importDataset(db, { provider: 'fixture', securities: [
+    asset(symbols[0], dates[0]), asset(symbols[1], dates[0], { exchange: 'NYSE AMERICAN' }),
+    asset('SPY', dates[0], { type: 'etf' }),
+  ], prices: symbols.flatMap((symbol, index) => dates.map((date, day) => bar(symbol, date, 100 + day * (3 - index)))) });
+  const { dispatch, engine } = createService({ db, workers: false, preparedOnly: true });
+  const context = { universe: 'us-all', model: 'short-momentum', classification: 'provider', reference: 'latest' };
+  const query = new URLSearchParams(context);
+  const show = (path) => dispatch({ url: `/api/v1/${path}${path.includes('?') ? '&' : '?'}${query}` });
+  const cold = await show('market/monitor');
+  assert.equal(cold.status, 200);
+  assert.equal(cold.body.materialization.preparationState, 'unregistered');
+  assert.deepEqual(cold.body.rows, []);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, 0);
+  const specs = preparationSpecs(db, engine, { ...context, universe: 'us-core', model: 'composite' })
+    .filter(({ context: input }) => input.universe === context.universe && input.model === context.model);
+  assert.deepEqual(specs.map(({ phase }) => phase), ['current','recent','history']);
+  const installed = enqueuePreparation(db, specs);
+  assert.equal(installed.queued, 3);
+  assert.equal(enqueuePreparation(db, specs).queued, 0);
+  const waiting = await show('market/monitor');
+  assert.equal(waiting.body.materialization.status, 'queued');
+  assert.equal(waiting.body.materialization.jobId, installed.jobs[1].id);
+  const restarted = createService({ db, workers: false, preparedOnly: true });
+  const outcome = await completedJob(restarted.dispatch, installed.jobs.at(-1).id);
+  assert.equal(outcome.status, 'complete', outcome.error);
+  assert.equal(outcome.result.totalSessions, dates.length * 2);
+  const jobs = db.prepare('SELECT count(*) AS n FROM jobs').get().n;
+  const overview = await show('market/overview');
+  const monitor = await show('market/monitor');
+  assert.equal(overview.body.coverage.traded, symbols.length);
+  assert.equal(monitor.body.materialization.complete, true);
+  assert.equal(monitor.body.rows.length, 63);
+  assert.equal(monitor.body.date, dates.at(-1));
+  const daily = await show('rankings?series=1&cadence=daily&limit=83&symbol=AMEXSTOCK');
+  const weekly = await show('rankings?series=1&cadence=weekly&limit=83&symbol=AMEXSTOCK');
+  assert.equal(daily.body.archived, dates.length);
+  assert.ok(weekly.body.rows.length && weekly.body.rows.every(({ date }) => daily.body.rows.some((row) => row.date === date)));
+  assert.ok(db.prepare('SELECT count(*) AS n FROM prepared_rank_blocks').get().n);
+  const historicalDate = dates.at(-8);
+  const historical = new URLSearchParams({ ...context, reference: 'as-of', date: historicalDate });
+  const stockRows = await post(dispatch, 'screens/query', { context: Object.fromEntries(historical), all: true });
+  const canonical = engine.snapshot(engine.context(Object.fromEntries(historical)), { velocity: true, persist: false, cache: false });
+  const fields = ({ symbol, close, rsRank, rsPercentile, velocity1w }) => [symbol, close, rsRank, rsPercentile, velocity1w];
+  assert.deepEqual(stockRows.body.rows.map(fields).sort(), canonical.stocks.filter(({traded}) => traded).map(fields).sort());
+  const contributor = await dispatch({ url: '/api/v1/market/breadth/advancers/contributors?' + historical });
+  assert.equal(contributor.body.metric.numerator, canonical.breadth.advancers.numerator);
+  assert.equal(contributor.body.total, canonical.breadth.advancers.numerator);
+  const ticker = await dispatch({ url: '/api/v1/stocks/AMEXSTOCK?' + historical + '&lookback=20' });
+  assert.equal(ticker.status, 200, ticker.body.error);
+  assert.equal(ticker.body.chartBars.length, 0);
+  assert.equal(ticker.body.detailPreparation.chart.state, 'not-prepared');
+  assert.equal(ticker.body.date, historicalDate);
+  assert.equal(ticker.body.rsRank, canonical.stocks.find(({symbol})=>symbol==='AMEXSTOCK').rsRank);
+  const status = (await dispatch({ url: '/api/v1/data/status' })).body.preparation;
+  assert.deepEqual(status.universes[0].stages, { current: { complete: 1, total: 1 }, recent: { complete: 1, total: 1 }, history: { complete: 1, total: 1 } });
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, jobs, 'prepared views do not enqueue jobs');
+  const unknown = await show('market/monitor?metrics=up_17pct_37d,down_17pct_37d');
+  assert.equal(unknown.body.materialization.preparationState, 'unregistered');
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, jobs, 'unregistered reads do not enqueue jobs');
+  const rangeQuery = { context, columns: ['symbol','range_distance_high_5d','range_since_high_5d'] };
+  const coldRange = await post(dispatch, 'screens/query', rangeQuery);
+  assert.equal(coldRange.body.materialization.prepareAction, 'range');
+  assert.equal(coldRange.body.materialization.preparationState, 'unregistered');
+  const registered = await post(dispatch, 'data/preparation', { context: { ...context, rangeWindows: [5], followLatest: true } });
+  assert.equal(registered.status, 202, registered.body.error);
+  assert.deepEqual(registered.body.jobs.map(({ type }) => type), ['prepare-range','prepare-range-history']);
+  const rangeResult = await completedJob(dispatch, registered.body.jobs.at(-1).id);
+  assert.equal(rangeResult.status, 'complete', rangeResult.error);
+  assert.equal(rangeResult.result.done, true);
+  const matched = await post(dispatch, 'screens/query', rangeQuery);
+  assert.ok(matched.body.rows.some((row) => row.symbol === 'AMEXSTOCK' && row.range_distance_high_5d === 0 && row.range_since_high_5d === 0));
+});
+
+test('ticker GET reads prepared rows and chart products without running price or risk analytics', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = expectedSessions('2024-01-02', '2024-05-20');
+  const [first, date] = [dates[0], dates.at(-1)];
+  const context = { universe: 'sample', date, basis: 'reconstructed', reference: 'as-of', benchmark: 'SPY' };
+  importDataset(db, { provider: 'fixture', securities: [asset('AAA', first), asset('SPY', first, { type: 'etf' })],
+    prices: dates.flatMap((day, index) => [bar('AAA', day, 100 + index + index % 3), bar('SPY', day, 400 + 2 * index + index % 4)]) });
+  const { dispatch, engine } = createService({ db, workers: false, preparedOnly: true });
+  const config = engine.context(context);
+  const prior = { ...config, date: dates.at(-2), requestedDate: dates.at(-2) };
+  writePreparedSnapshot(db, engine, config, engine.snapshot(config));
+  writePreparedSnapshot(db, engine, prior, engine.snapshot(prior));
+  materializeHistory(db, engine, config, { limit: 2, withRanks: true });
+  const expected = engine.detail(config, 'AAA', 63, { velocity: false });
+  engine.detail = () => assert.fail('Ticker GET called engine.detail');
+  engine.studyPrices = () => assert.fail('Ticker GET called engine.studyPrices');
+  const get = (action = '', extra = {}) => dispatch({
+    url: '/api/v1/stocks/AAA' + action + '?' + new URLSearchParams({ ...context, lookback: 63, ...extra }),
+  });
+  const cold = await get();
+  assert.equal(cold.status, 200, cold.body.error);
+  assert.equal(cold.body.symbol, 'AAA');
+  assert.equal(cold.body.close, expected.close);
+  assert.equal(cold.body.detailPreparation.metrics.state, 'ready');
+  assert.equal(cold.body.detailPreparation.chart.state, 'not-prepared');
+  assert.equal(cold.body.risk, null);
+  assert.equal((await get('', { export: 'csv' })).status, 202);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, 0);
+  const ranks = await get('/rankings', { cadence: 'daily', limit: 2 });
+  assert.equal(ranks.status, 200, ranks.body.error);
+  assert.equal(ranks.body.supplyDemand.state, 'ready');
+  assert.deepEqual(ranks.body.rows.map(({ udv_50d, udv_state_50d }) => [udv_50d, udv_state_50d]),
+    [prior, config].map((point) => {
+      const row = engine.snapshot(point).stocks.find(({ securityId }) => securityId === 'fixture:AAA');
+      return [row.udv_50d, row.udv_state_50d];
+    }));
+  const job = await post(dispatch, 'stocks/AAA/prepare', { context, lookback: 63 });
+  assert.equal(job.status, 202, job.body.error);
+  assert.equal((await completedJob(dispatch, job.body.id)).status, 'complete');
+  const ready = await get();
+  assert.equal(ready.status, 200, ready.body.error);
+  assert.deepEqual(['chart', 'risk', 'metrics', 'weekly'].map((key) => ready.body.detailPreparation[key].state),
+    ['ready', 'ready', 'ready', 'unprepared']);
+  assert.equal(ready.body.detailPreparation.state, 'partial');
+  assert.equal(ready.body.chartBars.length, 63);
+  assert.equal(ready.body.chartBars.at(-1).close, expected.close);
+  assert.ok(ready.body.risk.observations >= 20);
+  assert.equal((await get('', { export: 'csv' })).status, 200);
+  const weekly = engine.snapshot(config, { velocity: true, persist: false });
+  writePreparedSnapshot(db, engine, config, weekly, { velocity: true });
+  assert.equal((await get()).body.detailPreparation.state, 'ready');
+});
+
+test('imports and saved definitions register durable preparation before their views are read', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const { dispatch } = createService({ db, workers: false, preparedOnly: true });
+  const date = '2024-01-05';
+  const receipt = await post(dispatch, 'data/import', { provider: 'fixture',
+    securities: [asset('READY', date)], prices: [bar('READY', date, 100)] });
+  assert.equal(receipt.status, 201);
+  const before = (await dispatch({ url: '/api/v1/data/preparation' })).body;
+  assert.ok(before.total > 0);
+  assert.ok(before.universes.some(({ universe }) => universe === 'us-all'));
+  assert.ok(before.universes.every(({ universe }) => universe !== 'sample'));
+  assert.equal((await post(dispatch, 'data/preparation', {})).body.queued, 0);
+  const model = await post(dispatch, 'ranking-models', { name: 'Durable fixture', definition: { windows: [{ length: 5, weight: 1 }] } });
+  assert.equal(model.status, 201);
+  const after = (await dispatch({ url: '/api/v1/data/preparation' })).body;
+  assert.ok(after.total > before.total);
+  assert.ok(after.contexts.some((point) => point.universe === 'us-all' && point.model === model.body.id));
+  assert.equal((await post(dispatch, 'data/preparation', { retry: true })).body.queued, 0);
+  for (let pass = 0; pass < 250 && db.prepare("SELECT 1 FROM jobs WHERE status IN ('running','queued') LIMIT 1").get(); pass++) await delay(20);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM jobs WHERE status<>'complete'").get().n, 0);
+});
+
 test('a refresh retains an already published session while retrying incomplete older coverage without duplicate imports', async (t) => {
   const { db } = fixture(t);
   const latest = latestFinalizableSession();
@@ -202,6 +360,283 @@ test('a refresh retains an already published session while retrying incomplete o
   assert.match(degraded.result.warnings[0], /Older session unavailable upstream/);
   assert.deepEqual(requested, [older, older, older]);
   assert.equal(db.prepare('SELECT count(*) AS count FROM daily_publications').get().count, 1);
+});
+
+test('scheduled capture does not refetch already received partial sessions', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const clock = new Date('2024-01-10T02:00:00Z');
+  const date = latestFinalizableSession(clock);
+  const days = expectedSessions(shiftDate(date, -5), date).slice(-3);
+  const securities = ['FIRST','SECOND'].map((symbol) => asset(symbol, '2020-01-02'));
+  for (const [index, day] of days.entries()) {
+    const receipt = importDataset(db, { provider: 'eodhd', dataset: 'bulk-eod', scope: 'full', expected: 2,
+      expectedRoster: securities.map(({symbol}) => ({symbol})), securities,
+      prices: securities.slice(0, index ? 2 : 1).map(({symbol}) => bar(symbol, day, 100)) });
+    if (index) recordDailyPublication(db, { date: day, rawVersion: receipt.version, dataRevision: receipt.version, models: [] });
+  }
+  const requests = [];
+  const { dispatch, ...service } = createService({ db, workers: false, provider: {
+    getSecurities: async () => securities,
+    getDailyPrices: async (query) => { requests.push(query.date); throw new Error('No automatic duplicate capture'); },
+  } });
+  const tick = createDailyTick(service, db, { providerEnabled: true, now: () => clock, config: {} });
+  tick();
+  tick();
+  assert.equal(db.prepare('SELECT count(*) AS total FROM jobs').get().total, 0);
+  const job = await post(dispatch, 'data/refresh', { bulk: true, from: days[0], to: date, verifiedOnly: true, skipCaptured: true });
+  const outcome = await completedJob(dispatch, job.body.id);
+  assert.equal(outcome.status, 'complete', outcome.error);
+  assert.equal(outcome.result.downloadSkipped, true);
+  assert.deepEqual(outcome.result.stillPending, days.slice(0, 1));
+  assert.deepEqual(requests, []);
+});
+
+test('daily capture uses 16:30 New York time and only retries the latest partial session with a durable cap', (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = ['2024-03-08', '2024-03-11'];
+  const securities = ['FIRST', 'SECOND'].map((symbol) => asset(symbol, '2020-01-02'));
+  const seed = (date, complete) => importDataset(db, { provider: 'eodhd', dataset: 'bulk-eod', scope: 'full', expected: 2,
+    expectedRoster: securities.map(({ symbol }) => ({ symbol })), securities,
+    prices: securities.slice(0, complete ? 2 : 1).map(({ symbol }) => bar(symbol, date, 100)) });
+  const prior = seed('2024-03-07', true);
+  recordDailyPublication(db, { date: '2024-03-07', rawVersion: prior.version, dataRevision: prior.version, models: [] });
+  let clock = new Date('2024-03-08T21:29:00Z');
+  const jobs = [];
+  const makeTick = () => createDailyTick({ journalConfiguration: () => null, enqueue(type, payload, key) {
+    jobs.push({ type, payload, key, id: createJob(db, type, { ...payload, jobKey: key }).id });
+  } }, db, { providerEnabled: true, now: () => clock, config: {} });
+  const at = (stamp) => { clock = new Date(stamp); makeTick()(); };
+  const finish = (stamp) => {
+    const { id } = jobs.at(-1);
+    updateJob(db, id, 'complete', 100, {});
+    db.prepare('UPDATE jobs SET updated_at=? WHERE id=?').run(stamp, id);
+  };
+  makeTick()();
+  assert.equal(jobs.length, 0);
+  at('2024-03-08T21:30:00Z');
+  assert.equal(jobs[0].payload.date, dates[0]);
+  assert.equal(jobs[0].payload.captureAttempt, 1);
+  const friday = seed(dates[0], true);
+  recordDailyPublication(db, { date: dates[0], rawVersion: friday.version, dataRevision: friday.version, models: [] });
+  finish('2024-03-08T21:30:00Z');
+  at('2024-03-11T20:29:00Z');
+  assert.equal(jobs.length, 1);
+  at('2024-03-11T20:30:00Z');
+  assert.equal(jobs[1].payload.date, dates[1]);
+  seed(dates[1], false);
+  finish('2024-03-11T20:32:00Z');
+  at('2024-03-11T20:40:00Z');
+  assert.equal(jobs.length, 2);
+  at('2024-03-11T20:42:00Z');
+  assert.equal(jobs[2].payload.force, true);
+  finish('2024-03-11T20:42:00Z');
+  at('2024-03-11T20:57:00Z');
+  finish('2024-03-11T20:57:00Z');
+  at('2024-03-11T21:22:00Z');
+  finish('2024-03-11T21:22:00Z');
+  at('2024-03-11T21:59:00Z');
+  at('2024-03-12T19:59:00Z');
+  assert.deepEqual(jobs.slice(1).map(({ payload }) => [payload.date, payload.captureAttempt]),
+    dates.slice(1).flatMap((date) => [1, 2, 3, 4].map((attempt) => [date, attempt])));
+  assert.equal(dailyCaptureAvailability(db, dates[1], clock).state, 'exhausted');
+});
+
+test('a queued automatic capture retires without using the provider after the next session closes', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  let requests = 0;
+  const outcome = await performJob(db, 'provider-import', {
+    bulk: true, date: '2024-03-11', scheduledFor: '2024-03-11', captureAttempt: 3, force: true,
+  }, { now: () => new Date('2024-03-12T21:00:00Z'), provider: { getSecurities() { requests++; return []; } } });
+  assert.equal(requests, 0);
+  assert.equal(outcome.downloadSkipped, true);
+  assert.equal(outcome.sourceAvailability, 'superseded');
+});
+
+test('same-session backup failures retry after thirty minutes and stop after three attempts', (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const date = '2024-04-17';
+  const source = importDataset(db, { provider: 'eodhd', dataset: 'bulk-eod', scope: 'full', expected: 1,
+    expectedRoster: [{ symbol: 'AAA' }], securities: [asset('AAA', '2020-01-02')], prices: [bar('AAA', date, 100)] });
+  recordDailyPublication(db, { date, rawVersion: source.version, dataRevision: source.version, models: [] });
+  let clock;
+  const attempts = [];
+  const tick = createDailyTick({ journalConfiguration: () => null, enqueue(type, payload, key) {
+    attempts.push(createJob(db, type, { ...payload, jobKey: key }));
+  } }, db, { now: () => clock, config: { MARKET_BACKUP: '1' } });
+  const at = (time) => { clock = new Date(`${date}T${time}:00Z`); tick(); };
+  const fail = (time) => {
+    updateJob(db, attempts.at(-1).id, 'failed', 0, null, 'Synthetic backup failure');
+    db.prepare('UPDATE jobs SET updated_at=? WHERE id=?').run(`${date}T${time}:00Z`, attempts.at(-1).id);
+  };
+  at('21:00');
+  fail('21:00');
+  at('21:29');
+  assert.equal(attempts.length, 1);
+  at('21:30');
+  fail('21:31');
+  at('22:00');
+  assert.equal(attempts.length, 2);
+  at('22:01');
+  fail('22:01');
+  at('23:01');
+  assert.deepEqual(attempts.map(({ type, payload }) => [type, payload.backupAttempt, payload.jobKey]),
+    [['backup', 1, `backup:${date}`], ['backup', 2, `backup:${date}:2`], ['backup', 3, `backup:${date}:3`]]);
+});
+
+test('search finds date-valid catalog identities without preparing analytics', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const { dispatch } = createService({ db, workers: false, preparedOnly: true });
+  importDataset(db, { provider: 'fixture', securities: [asset('AAA', '2024-03-07'), asset('BBB', '2024-03-08')],
+    prices: [bar('AAA', '2024-03-07', 100), bar('BBB', '2024-03-08', 101)] });
+  const response = await dispatch({ url: '/api/v1/stocks/search?q=company&date=2024-03-07&limit=5' });
+  assert.equal(response.status, 200, response.body.error);
+  assert.deepEqual(response.body.rows.map(({ symbol }) => symbol), ['AAA']);
+  assert.equal(db.prepare('SELECT count(*) AS total FROM jobs').get().total, 0);
+});
+
+test('queued legacy recent preparations start with the newest standard and Monitor dates', async (t) => {
+  const { db } = fixture(t);
+  const dates = expectedSessions('2024-01-02', '2024-07-14').slice(-125);
+  importDataset(db, { provider: 'fixture', securities: [asset('AAA', dates[0])],
+    prices: dates.map((date, index) => bar('AAA', date, 100 + index)) });
+  const engine = createEngine(db);
+  const { recentOrder, ...legacy } = preparationSpecs(db, engine, { universe: 'us-core', model: 'composite' })
+    .find(({ phase, context }) => phase === 'recent' && context.universe === 'us-core' && context.model === 'composite');
+  assert.equal(recentOrder, 'newest-interleaved');
+  const first = await performJob(db, 'prepare-context', legacy);
+  assert.deepEqual(first.batch, { from: dates.at(-60), to: dates.at(-1), sessions: 60, standard: true, baseComplete: false });
+  assert.equal(first.continuation.recentOrder, 'newest-interleaved');
+  const second = await performJob(db, 'prepare-context', { ...legacy, ...first.continuation });
+  assert.deepEqual(second.batch, { ...first.batch, standard: false });
+});
+
+test('prepared-only screens with missing weekly or historical inputs withhold totals and exports', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = expectedSessions('2024-01-02', '2024-01-31');
+  const context = { universe: 'sample', date: dates.at(-1) };
+  importDataset(db, { provider: 'fixture', securities: [asset('AAA', dates[0])], prices: dates.map((date) => bar('AAA', date, 100)) });
+  const { dispatch, engine } = createService({ db, workers: false, preparedOnly: true });
+  engine.snapshot(engine.context(context));
+  const velocity = await post(dispatch, 'screens/query', { context, computed: [{ field: 'custom_weekly', expression: 'velocity4w+1' }] });
+  assert.equal(velocity.status, 202);
+  assert.equal(velocity.body.total, null);
+  assert.equal(velocity.body.pendingReason, 'Weekly RS signals');
+  const lag = await post(dispatch, 'screens/query', { context, export: 'csv', filter: { expression: 'previous(close,1)>0' } });
+  assert.equal(lag.status, 202);
+  assert.equal(lag.body.total, null);
+  assert.equal(lag.body.materialization.requiredDate, dates.at(-2));
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, 0);
+});
+
+test('historical range expressions require and use the prepared values from the comparison date', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = expectedSessions('2024-01-02', '2024-01-31');
+  const prior = dates.at(-6);
+  const date = dates.at(-1);
+  const context = { universe: 'sample', date };
+  importDataset(db, { provider: 'fixture', securities: [asset('AAA', dates[0])], prices: dates.map((session) =>
+    bar('AAA', session, session === prior ? 90 : session === date ? 110 : 100)) });
+  const { dispatch, engine } = createService({ db, workers: false, preparedOnly: true });
+  for (const session of [date, prior]) engine.snapshot(engine.context({ ...context, date: session }));
+  const prepare = (session) => performJob(db, 'prepare-range', { context: { universe: 'us-all', date: session }, windows: [5] });
+  await prepare(date);
+  const query = { context, computed: [
+    { field: 'custom_prior', expression: 'previous(range_distance_high_5d,5)' },
+    { field: 'custom_change', expression: 'change(range_distance_high_5d,5)' },
+  ], filter: { expression: 'change(range_distance_high_5d,5)>0.09' }, all: true };
+  const cold = await post(dispatch, 'screens/query', { ...query, export: 'csv' });
+  assert.equal(cold.status, 202);
+  assert.equal(cold.body.materialization.prepareAction, 'range');
+  assert.equal(cold.body.materialization.requiredDate, prior);
+  assert.deepEqual(cold.body.materialization.missingWindows, [5]);
+  await prepare(prior);
+  const ready = await post(dispatch, 'screens/query', query);
+  assert.equal(ready.status, 200, ready.body.error);
+  assert.equal(ready.body.total, 1);
+  closeTo(ready.body.rows[0].custom_prior, -0.1);
+  closeTo(ready.body.rows[0].custom_change, 0.1);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, 0);
+});
+
+test('range alerts disclose deferred rules and compare both prepared values before a crossing', async (t) => {
+  const { db, dispatch } = fixture(t);
+  const dates = expectedSessions('2024-03-01', '2024-03-15');
+  const latest = dates.at(-1);
+  importDataset(db, { provider: 'fixture', securities: [asset('AAA', dates[0])],
+    prices: dates.map((date, index) => bar('AAA', date, index === dates.length - 1 ? 110 : index === dates.length - 2 ? 90 : 100)) });
+  const rule = await post(dispatch, 'alert-rules', { name: 'Return near rolling high', definition: {
+    type: 'stocks', direction: 'enters', context: { universe: 'sample' },
+    filter: { field: 'range_distance_high_5d', op: 'gte', value: -0.05 },
+  } });
+  const cold = await post(dispatch, 'alerts/evaluate', { context: { date: latest } });
+  assert.equal(cold.body.evaluated, 0);
+  assert.deepEqual(cold.body.deferred.map(({ ruleId, windows }) => [ruleId, windows]), [[rule.body.id, [5]]]);
+  for (const date of dates.slice(-2)) {
+    const prepared = await performJob(db, 'prepare-range', { context: { universe: 'us-all', date }, windows: [5] });
+    assert.deepEqual(prepared.windows, [5]);
+  }
+  const events = await dispatch({ url: '/api/v1/alerts' });
+  assert.deepEqual(events.body.map(({ action, symbol, date }) => [action, symbol, date]), [['enters', 'AAA', latest]]);
+  assert.equal((await post(dispatch, 'alerts/evaluate', { context: { date: latest } })).body.fired, 0);
+});
+
+test('custom contributor reads reuse their prepared paired legacy breakout without creating work', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = expectedSessions('2024-01-02', '2024-03-20');
+  const securities = ['UP', 'DOWN'].map((symbol) => asset(symbol, dates[0]));
+  importDataset(db, { provider: 'fixture', securities, prices: dates.flatMap((date, index) => [
+    bar('UP', date, index < 20 ? 100 : 140), bar('DOWN', date, index < 20 ? 100 : 70),
+  ]) });
+  const { dispatch, engine } = createService({ db, workers: false, preparedOnly: true });
+  const context = { universe: 'sample', reference: 'as-of' };
+  const paired = engine.context({ ...context, breadthKeys: ['up_17pct_37d', 'down_17pct_37d'] });
+  const canonical = engine.snapshot(paired);
+  materializeHistory(db, engine, paired, { limit: 2 });
+  assert.equal(canonical.breadth.down_17pct_37d.numerator, 1);
+  assert.equal(canonical.breadth.down_17pct_37d.denominator, 2);
+  assert.equal(engine.snapshotAvailable(engine.context({ ...context, breadthKeys: ['down_17pct_37d'] })), false);
+  const outcome = await dispatch({ url: '/api/v1/market/breadth/down_17pct_37d/contributors?universe=sample&reference=as-of' });
+  assert.equal(outcome.status, 200);
+  assert.equal(outcome.body.total, 1);
+  assert.deepEqual(outcome.body.rows.map(({ symbol }) => symbol), ['DOWN']);
+  assert.deepEqual(outcome.body.metric, canonical.breadth.down_17pct_37d);
+  const trend = await dispatch({ url: '/api/v1/market/breadth/down_17pct_37d?series=1&materializedOnly=1&limit=2&universe=sample&reference=as-of' });
+  assert.equal(trend.body.materialization.complete, true);
+  assert.equal(trend.body.rows.length, 2);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, 0);
+});
+
+test('a named cohort freezes membership at submission revision and reports outcomes without rescreening', async (t) => {
+  const { db, dispatch } = fixture(t);
+  const dates = expectedSessions('2024-03-04', '2024-03-08');
+  const securities = ['AAA', 'BBB'].map((symbol) => asset(symbol, dates[0]));
+  importDataset(db, { provider: 'fixture', securities, prices: dates.flatMap((date) => [bar('AAA', date, 100), bar('BBB', date, 50)]) });
+  const entry = dates[1];
+  const queued = await post(dispatch, 'research/cohorts', { name: 'Frozen higher prices', date: entry, horizons: [1],
+    context: { basis: 'reconstructed', universe: 'sample' }, screen: { filter: { field: 'close', op: 'gt', value: 75 } } });
+  assert.equal(queued.status, 202);
+  assert.deepEqual((await dispatch({ url: '/api/v1/cohorts' })).body, []);
+  importDataset(db, { provider: 'fixture', prices: [bar('AAA', entry, 40), bar('BBB', entry, 110)] });
+  const created = await completedJob(dispatch, queued.body.id);
+  assert.equal(created.status, 'complete', created.error);
+  assert.equal(created.result.selectionContext.dataVersion, 1);
+  const [saved] = (await dispatch({ url: '/api/v1/cohorts' })).body;
+  assert.deepEqual(saved.definition.frozen.members.map(({ symbol }) => symbol), ['AAA']);
+  const rerun = await post(dispatch, `cohorts/${saved.id}/execute`, { screen: { filter: { field: 'symbol', value: 'BBB' } } });
+  const replay = await completedJob(dispatch, rerun.body.id);
+  assert.equal(replay.status, 'complete', replay.error);
+  assert.equal(replay.result.selectionContext.dataVersion, 1);
+  assert.equal(replay.result.dataVersion, 2);
+  assert.equal(replay.result.memberCount, 1);
+  assert.deepEqual(replay.result.results[0].members.map(({ securityId }) => securityId), ['fixture:AAA']);
 });
 
 test('the persisted queue runs one provider task across workspace connections and advances after failure', async (t) => {
@@ -250,6 +685,36 @@ test('the persisted queue runs one provider task across workspace connections an
   assert.equal(complete.result.imported, 1);
   assert.deepEqual(order, ['FIRST.US', 'SECOND.US']);
   assert.equal(maximum, 1);
+});
+
+test('the worker prioritizes publication, selected ticker jobs, and primary preparation over the wider matrix', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  db.exec(`CREATE TABLE test_dispatch_order (id TEXT);
+    CREATE TRIGGER test_record_dispatch AFTER UPDATE OF status ON jobs WHEN NEW.status='running' BEGIN
+      INSERT INTO test_dispatch_order VALUES (NEW.id);
+    END`);
+  const core = { universe: 'us-core', model: 'composite', basis: 'reconstructed', reference: 'latest' };
+  const context = (phase, config) => ['prepare-context', { phase, context: { ...core, ...config }, historySessions: 1 }];
+  const preferences = [
+    ['backup', {}],
+    ['prepare-stock-details', { securityIds: ['fixture:AAA'], context: core }],
+    context('current', core),
+    ['prepare-stock-details', { context: core }],
+    ['prepare-range', { context: core, windows: [20] }],
+    context('recent', { universe: 'us-all' }),
+    context('history', { universe: 'nyse', reference: 'as-of' }),
+    context('current', { universe: 'nyse', model: 'short-momentum' }),
+    context('recent', { universe: 'nyse' }),
+    context('history', { universe: 'us-all' }),
+  ];
+  // Within the shared current products priority, the longer waiting task gets the slot.
+  const queued = preferences.map(([type, payload], index) => ({ type, payload, priority: index === 4 ? 3 : index }));
+  const inserted = [...queued].reverse().map(({ type, payload, priority }) => ({ ...createJob(db, type, payload), priority }));
+  const { dispatch } = createService({ db, workers: false });
+  await completedJob(dispatch, inserted[0].id);
+  const actual = db.prepare('SELECT id FROM test_dispatch_order ORDER BY rowid').all().map(({ id }) => id);
+  assert.deepEqual(actual, inserted.toSorted((a, b) => a.priority - b.priority).map(({ id }) => id));
 });
 
 test('persisted queued jobs resume through real worker threads and checkpoint contention leaves completion intact', async (t) => {
@@ -406,6 +871,15 @@ test('observed divergences persist their dated evidence without appearing in the
     prices: dates.flatMap((date, index) => [...names.map((symbol) => bar(symbol, date, date === last ? 80 : 100 + index)),
       bar('SPY', date, 300 + index)]) });
   const url = '/api/v1/market/events?limit=63&coverageMode=';
+  assert.deepEqual((await dispatch({ url: url + 'observed' })).body.events, []);
+  assert.equal(db.prepare("SELECT 1 FROM sqlite_schema WHERE name='divergence_events'").get(), undefined);
+  const prepare = async (options) => {
+    const queued = await post(dispatch, 'market/health/prepare', options);
+    assert.equal(queued.status, 202);
+    const result = await completedJob(dispatch, queued.body.id);
+    assert.equal(result.status, 'complete', result.error);
+  };
+  await prepare({ coverageMode: 'observed' });
   const observed = await dispatch({ url: url + 'observed' });
   assert.equal(observed.status, 200, observed.body.error);
   const event = observed.body.events.find(({ id }) => id === 'benchmark_high_breadth_falls');
@@ -415,12 +889,51 @@ test('observed divergences persist their dated evidence without appearing in the
   const persisted = db.prepare('SELECT count(*) AS count FROM divergence_events').get().count;
   assert.deepEqual((await dispatch({ url: url + 'observed' })).body.events, observed.body.events);
   assert.equal(db.prepare('SELECT count(*) AS count FROM divergence_events').get().count, persisted);
+  await prepare({ coverageMode: 'observed', observedMinimum: 15, observedThreshold: 0.75 });
   const adjusted = await dispatch({ url: url + 'observed&observedMinimum=15&observedThreshold=0.75' });
   assert.equal(adjusted.body.observedMinimum, 15);
   assert.equal(adjusted.body.observedThreshold, 0.75);
   assert.ok(adjusted.body.events.some(({ id }) => id === 'benchmark_high_breadth_falls'));
   assert.equal(db.prepare('SELECT count(DISTINCT recipe) AS count FROM divergence_events').get().count, 2);
   assert.deepEqual((await dispatch({ url: url + 'verified' })).body.events, []);
+});
+
+test('prepared health is read-only and reuses earlier sessions across an append-only price revision', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = expectedSessions('2024-01-02', '2024-04-15');
+  const last = dates.at(-1);
+  const { dispatch, engine } = createService({ db, workers: false, preparedOnly: true });
+  const first = importDataset(db, { provider: 'fixture', securities: [asset('AAA', dates[0])],
+    prices: dates.slice(0, -1).map((date) => bar('AAA', date, 100)) });
+  const context = { universe: 'sample', reference: 'as-of' };
+  const get = () => dispatch({ url: '/api/v1/market/health?universe=sample&reference=as-of&series=1&limit=2' });
+  const unprepared = await get();
+  assert.equal(unprepared.body.state, 'unprepared');
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, 0);
+  const recent = preparationSpecs(db, engine, context, { requested: context }).find(({ phase }) => phase === 'recent');
+  const prerequisite = createJob(db, 'prepare-context', recent);
+  const breadthQueued = await get();
+  assert.equal(breadthQueued.body.materialization.prepareAction, 'health');
+  assert.equal(breadthQueued.body.materialization.pending, undefined);
+  assert.equal(breadthQueued.body.contextPreparation.jobId, prerequisite.id);
+  assert.equal(breadthQueued.body.contextPreparation.status, 'queued');
+  assert.equal(db.prepare('SELECT count(*) AS n FROM jobs').get().n, 1);
+  updateJob(db, prerequisite.id, 'complete', 100, {});
+  materializeHistory(db, engine, engine.context(context), { limit: dates.length });
+  const firstJob = await post(dispatch, 'market/health/prepare', { context });
+  const firstResult = await completedJob(dispatch, firstJob.body.id);
+  assert.equal(firstResult.status, 'complete', firstResult.error);
+  const second = importDataset(db, { provider: 'fixture', prices: [bar('AAA', last, 101)] });
+  materializeHistory(db, engine, engine.context(context), { limit: dates.length });
+  const secondJob = await post(dispatch, 'market/health/prepare', { context });
+  const secondResult = await completedJob(dispatch, secondJob.body.id);
+  assert.equal(secondResult.status, 'complete', secondResult.error);
+  assert.equal(secondResult.result.reused, dates.length - 1);
+  const history = await get();
+  assert.deepEqual(history.body.history.map(({ date, dataVersion }) => [date, dataVersion]),
+    [[dates.at(-2), first.version], [last, second.version]]);
+  assert.equal(history.body.materialization, undefined);
 });
 
 test('an explicit observed comparable fraction changes health eligibility while verified coverage stays withheld', async (t) => {

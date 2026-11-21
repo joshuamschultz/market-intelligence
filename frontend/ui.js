@@ -42,6 +42,7 @@ const glyphs = {
 export const names = {
   overview: 'Market Overview', monitor: 'Market Monitor', screener: 'Stock Screener', rankings: 'RS Rankings', industries: 'Industries',
   history: 'Historical Explorer', journal: 'Market Journal', screens: 'Saved Screens', watchlists: 'Watchlists', alerts: 'Alerts', settings: 'Settings & Data',
+  stock: 'Ticker',
 };
 const escaped = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 export const safe = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => escaped[char]);
@@ -78,6 +79,7 @@ export const panelHead = (title, description = '', tools = '') => `<header class
 export const empty = (title, message, glyph = 'info', tools = '') => `<div class="empty">${icon(glyph)}<h3>${safe(title)}</h3><p>${safe(message)}</p>${tools}</div>`;
 export const pending = (label = 'Loading analysis…') => `<div class="pending" role="status">${safe(label)}</div>`;
 export const publishingHistory = (job) => {
+  if (job.status === 'queued') return pending('Queued for background preparation');
   if (job.status === 'waiting_for_capture') {
     const completed = job.capture?.stages?.prices?.complete;
     return pending(`Waiting for market data import${numeric(completed) ? ` · ${count(completed)} symbol histories loaded` : '…'}`);
@@ -95,6 +97,64 @@ export const chip = (label, style = '') => `<span class="chip ${style}">${safe(l
 export const segment = (name, choices, selected, classes = 'segmented') => `<div class="${classes}">${choices.map(([value, label]) =>
   `<button type="button" data-action="${name}" data-value="${safe(value)}" aria-pressed="${String(value) === String(selected)}">${safe(label)}</button>`).join('')}</div>`;
 export const field = (label, control, tip = '') => `<label class="field"><span>${safe(label)}</span>${control}${tip ? `<small>${safe(tip)}</small>` : ''}</label>`;
+export const breadthMovePresets = [
+  { id:'daily', label:'Daily momentum', threshold:4, sessions:1 },
+  { id:'swing', label:'Monthly momentum', threshold:25, sessions:20 },
+  { id:'surge', label:'Large monthly moves', threshold:50, sessions:20 },
+  { id:'quarter', label:'Quarterly momentum', threshold:25, sessions:63 },
+  { id:'intermediate', label:'34-session moves', threshold:13, sessions:34 },
+];
+export const breadthMoveKey = (side, threshold, sessions) => `${side}_${threshold}pct${sessions > 1 ? `_${sessions}d` : ''}`;
+export const breadthMoveHelp = {
+  fixed: 'The fixed comparisons use ±4% over 1 session, ±25% and ±50% over 20, ±25% over 63, and ±13% over 34.',
+  visible: 'How many dated rows the table shows. Each row uses the lookback listed in its column header.',
+  window: 'Trading sessions between the two split-adjusted closing prices. 63 sessions is about three months and 126 is about six. Each row uses its own closing date.',
+  threshold: 'For a 34-session comparison at 13%, the downside reading counts a 34-session return of −15% and excludes −5%. The upside reading counts returns of +13% or more.',
+  scale: 'Auto gives each group a shared scale for gains and losses based on its largest visible reading. Common uses 0–100% for every group. The printed percentages retain their exact values.',
+  counts: 'The numerator counts stocks that meet the rule. The denominator counts traded stocks with enough comparable price history for that rule. 100 of 1,000 is 10%.',
+  extremes: 'Compare each reading with the prior 252 sessions. A marker requires at least 60 valid readings and identifies the top or bottom tenth.',
+  statistics: 'SMA is the average of the last 5, 10, or 20 daily participation percentages. Δ is the change in percentage points versus 1, 5, or 21 trading sessions ago.',
+};
+export function helpTooltip(id, label, description) {
+  return `<span class="help-tip"><button type="button" class="help-tip-trigger" aria-label="${safe(`About ${label}`)}"
+    aria-describedby="${safe(id)}">${icon('info')}</button>
+    <span class="help-tip-content" role="tooltip" id="${safe(id)}" hidden>${safe(description)}</span></span>`;
+}
+export function helpField(id, label, control, description) {
+  const help = `${id}-help`;
+  return `<div class="field"><div class="field-caption"><label for="${safe(id)}">${safe(label)}</label>${helpTooltip(help, label, description)}</div>
+    ${control(`id="${safe(id)}" aria-describedby="${safe(help)}"`)}</div>`;
+}
+export function bindHelpTooltips(root) {
+  for (const help of root.querySelectorAll('.help-tip')) {
+    const button = help.querySelector('.help-tip-trigger');
+    const content = help.querySelector('.help-tip-content');
+    let hovering = false;
+    let focused = false;
+    let dismissed = false;
+    const update = () => {
+      content.hidden = dismissed || !(hovering || focused);
+      if (!content.hidden) {
+        content.style.removeProperty('--help-offset');
+        const bounds = content.getBoundingClientRect();
+        const width = help.ownerDocument.documentElement.clientWidth;
+        if (width) content.style.setProperty('--help-offset', `${Math.max(0, 12 - bounds.left) - Math.max(0, bounds.right - width + 12)}px`);
+      }
+    };
+    help.addEventListener('pointerenter', () => { hovering = true; dismissed = false; update(); });
+    help.addEventListener('pointerleave', () => { hovering = false; update(); });
+    button.addEventListener('focus', () => { focused = true; dismissed = false; update(); });
+    button.addEventListener('blur', () => { focused = false; dismissed = false; update(); });
+    button.addEventListener('click', () => { dismissed = false; button.focus(); update(); });
+    button.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || content.hidden) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dismissed = true;
+      update();
+    });
+  }
+}
 export function observedCoverageFields(settings = {}) {
   const enabled = settings.coverageMode === 'observed';
   const disabled = enabled ? '' : ' disabled';
@@ -197,10 +257,21 @@ for (const days of [10, 20, 50, 100, 150, 200]) {
 for (const band of [1, 5, 10, 20]) baseFields.push([`enteredTop${band}`, `Entered top ${band}% RS`, 'bool']);
 for (const days of [20, 50, 100, 252]) baseFields.push([`new_high_${days}d`, `New ${days}D high`, 'bool'], [`new_low_${days}d`, `New ${days}D low`, 'bool']);
 export const fields = new Map(baseFields.map(([id, label, format = 'text']) => [id, { id, label, format }]));
+const rangeFieldPattern = /^range_(distance|since|age)_(high|low)_(\d+)d$/;
+export const rangeFieldId = (metric, side, days) => `range_${metric}_${side}_${days}d`;
+export function rangeFieldDetails(id) {
+  const match = rangeFieldPattern.exec(id);
+  if (!match) return null;
+  const [, metric, side, days] = match;
+  const labels = { distance: `From ${days}D ${side}`, since: `Sessions since ${days}D new ${side}`, age: `Age of ${days}D window ${side}` };
+  return { id, label: labels[metric], format: metric === 'distance' ? 'rate' : 'integer', days: Number(days), metric, side };
+}
 export const screenColumns = ['symbol', 'name', 'close', 'return_1d', 'return_21d', 'rsPercentile', 'velocity4w', 'udv_50d', 'adv_20d', 'distance_high_252d'];
 export const rankColumns = ['rsRank', 'symbol', 'name', 'rsPercentile', 'rsScore', 'velocity1w', 'velocity4w', 'velocity12w', 'return_63d', 'return_252d'];
 export const fieldDetails = (id, computed = [], row = {}) => {
   if (fields.has(id)) return fields.get(id);
+  const range = rangeFieldDetails(id);
+  if (range) return range;
   const column = computed.find((item) => item.field === id);
   return { id, label: column?.label || id, format: column?.format || (numeric(row[id]) ? 'decimal' : 'text') };
 };

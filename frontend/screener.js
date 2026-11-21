@@ -1,6 +1,6 @@
 import {
   action, attr, bindVirtualTable, chip, count, dateLabel, empty, field, fieldDetails, fields, heading, icon, notice, number, numeric, option,
-  panelHead, pagination, pathPart, pending, rankColumns, safe, savedScreenRoute, screenColumns, segment, table, tradingViewLink, warming,
+  panelHead, pagination, pathPart, pending, rangeFieldDetails, rangeFieldId, rankColumns, safe, savedScreenRoute, screenColumns, segment, table, tradingViewLink, warming,
 } from './ui.js';
 import { partialCoverage } from './overview.js';
 
@@ -16,8 +16,10 @@ const defaultFilter = () => ({ operator: 'and', filters: [] });
 const defaultSort = [{ field: 'rsRank', direction: 'asc' }];
 const periodColumns = ['periodRank', 'periodPercentile', 'periodReturn'];
 const standardPeriodColumns = [...pinned, ...periodColumns, 'rsRank', 'rsPercentile', 'industry'];
-const periodLabels = { windows: 'Return lengths', averages: 'Moving-average lengths', volumeWindows: 'Volume lengths' };
-const periodDefaults = () => ({ windows: [], averages: [], volumeWindows: [] });
+const periodLabels = { windows: 'Return lengths', averages: 'Moving-average lengths', volumeWindows: 'Volume lengths', rangeWindows: 'High/low lookbacks' };
+const periodDefaults = () => ({ windows: [], averages: [], volumeWindows: [], rangeWindows: [] });
+const rangeMeasures = [['distance', 'Distance from high or low'], ['since', 'Sessions since last new high or low'], ['age', 'Age of high or low within window']];
+const rangeModes = [['none', 'Columns only'], ['gte', 'At least'], ['lte', 'At most'], ['between', 'Between']];
 const initialColumns = (ranking) => [...(ranking ? rankColumns : screenColumns)];
 const columnSort = (columns) => [...new Set([...pinned, ...columns])];
 const defaultWindow = () => ({ kind: 'sessions', length: 21, offset: 0, weight: 25 });
@@ -84,9 +86,94 @@ function registerPeriods(periods) {
     register(`float_turnover_${days}d`, `Float turnover ${days}D`, 'rate');
     register(`obv_slope_${days}d`, `${days}D OBV change`, 'compact');
   }
+  for (const days of periods.rangeWindows ?? []) {
+    for (const [metric] of rangeMeasures) {
+      for (const side of ['high', 'low']) {
+        const details = rangeFieldDetails(rangeFieldId(metric, side, days));
+        register(details.id, details.label, details.format);
+      }
+    }
+  }
 }
 
 const listPeriods = (input) => [...new Set(String(input || '').split(',').map((item) => item.trim()).filter(Boolean).map(Number))];
+
+function usedRangeWindows(screen) {
+  const fields = JSON.stringify([screen.filter, screen.sort, screen.columns, screen.computed?.map(({ expression }) => expression)]);
+  const used = [...fields.matchAll(/\brange_(?:distance|since|age)_(?:high|low)_(\d+)d\b/g)].map(([, window]) => Number(window));
+  return [...new Set([...listPeriods(screen.context?.rangeWindows), ...used])].sort((a, b) => a - b);
+}
+
+function rangeEditor(env, apply) {
+  const target = env.showDialog(env.modal, 'Highs and lows', `<form class="stack" id="range-filter-editor">
+    <div class="form-grid">
+      ${field('Measure', `<select name="measure">${rangeMeasures.map(([id, label]) => option(id, label, 'distance')).join('')}</select>`)}
+      ${field('Side', `<select name="side">${option('high', 'High', 'high')}${option('low', 'Low', 'high')}</select>`)}
+      ${field('Lookback (trading sessions)', '<input name="lookback" type="number" min="1" max="7560" step="1" value="20" required>')}
+      ${field('Condition', '<select name="condition"></select>')}
+      <div class="form-grid" id="range-operands"></div>
+    </div>
+    <p class="muted" id="range-definition"></p>
+    <div class="form-error" role="alert" hidden></div>
+    <div><button type="submit" class="button primary">Apply high/low settings</button></div></form>`);
+  const form = target.querySelector('form');
+  const select = form.elements.condition;
+  const explanations = {
+    distance: 'Compares the close with the highest high or lowest low across the window, including the selected session.',
+    since: 'Counts market sessions since price strictly exceeded the preceding window’s high or fell below its low. Ties leave the clock running. An event today counts as zero. Gaps and unverified split crossings can make an age unavailable.',
+    age: 'Counts from the most recent occurrence of the window’s high or low, including ties. This age stays inside the lookback.',
+  };
+  function showOperands() {
+    const choice = select.value;
+    const distance = form.elements.measure.value === 'distance';
+    target.querySelector('#range-operands').innerHTML = choice === 'none' ? '' : distance
+      ? field('Within (%)', '<input name="value" type="number" min="0" step="any" value="5" required>')
+      : field(choice === 'between' ? 'From (sessions)' : 'Trading sessions', '<input name="value" type="number" min="0" max="7560" step="1" value="30" required>') +
+        (choice === 'between' ? field('Through (sessions)', '<input name="upper" type="number" min="0" max="7560" step="1" required>') : '');
+  }
+  function showCondition() {
+    const measure = form.elements.measure.value;
+    const options = measure === 'distance' ? [['within', 'Within a percentage'], rangeModes[0]] : [...rangeModes.slice(1), rangeModes[0]];
+    select.innerHTML = options.map(([id, label]) => option(id, label, options[0][0])).join('');
+    target.querySelector('#range-definition').textContent = explanations[measure];
+    showOperands();
+  }
+  showCondition();
+  form.elements.measure.onchange = showCondition;
+  select.onchange = showOperands;
+  target.onsubmit = async (event) => {
+    event.preventDefault();
+    const values = new FormData(form);
+    const measure = values.get('measure');
+    const side = values.get('side');
+    const window = Number(values.get('lookback'));
+    const condition = values.get('condition');
+    const value = Number(values.get('value'));
+    const upper = Number(values.get('upper'));
+    const id = rangeFieldId(measure, side, window);
+    const submit = form.querySelector('[type="submit"]');
+    let filter;
+    try {
+      if (!form.reportValidity()) return;
+      submit.disabled = true;
+      if (condition === 'within') {
+        const limit = value / 100;
+        filter = { field: id, op: 'between', value: side === 'high' ? [-limit, 0] : [0, limit] };
+      } else if (condition !== 'none') {
+        if (condition === 'between' && upper < value) throw new Error('The upper age must be at least the lower age.');
+        filter = { field: id, op: condition, value: condition === 'between' ? [value, upper] : value };
+      }
+      await apply({ window, filter, columns: ['high', 'low'].map((kind) => rangeFieldId(measure, kind, window)) });
+      env.modal.close();
+    } catch (error) {
+      const output = target.querySelector('.form-error');
+      output.hidden = false;
+      output.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+    }
+  };
+}
 
 function periodEditor(env, state, apply) {
   const target = env.showDialog(env.modal, 'Custom periods', `<form class="stack">
@@ -118,7 +205,8 @@ function filterEditor(env, state, apply) {
   const target = env.showDialog(env.modal, 'Filter builder', '', 'Combine metric comparisons with nested groups and validated expressions.');
   const nodeAt = (path) => path === '' ? filter : path.split('.').reduce((current, segment) => current.filters[Number(segment)], filter);
   const input = (id, op, value) => {
-    const hint = fieldDetails(id).format === 'rate' ? 'Return as decimal, e.g. 0.05' : op === 'between' || op === 'in' ? 'Comma-separated values' : 'Value';
+    const hint = op === 'between' || op === 'in' ? 'Comma-separated values'
+      : fieldDetails(id).format === 'rate' ? 'Percentage as decimal, e.g. 0.05' : 'Value';
     return `<input data-rule-key="value" aria-label="Comparison value" placeholder="${hint}"${attr('value', Array.isArray(value) ? value.join(', ') : value)} ${valueLess.has(op) ? 'disabled' : ''}>`;
   };
   function html(node, path = '', depth = 0) {
@@ -205,9 +293,11 @@ function columnEditor(env, state, apply) {
   };
   const footer = target.querySelector('.actions');
   footer.innerHTML = '<button type="button" class="button primary">Apply columns</button>';
-  footer.firstElementChild.onclick = () => {
-    apply(columnSort([...chosen]));
-    env.modal.close();
+  footer.firstElementChild.onclick = async () => {
+    try {
+      await apply(columnSort([...chosen]));
+      env.modal.close();
+    } catch (error) { env.toast(error.message); }
   };
   show();
 }
@@ -233,11 +323,13 @@ function sortEditor(env, state, apply) {
     else if (drafts.length < 12) drafts.push({ field: 'return_1d', direction: 'desc' });
     show();
   };
-  target.onsubmit = (event) => {
+  target.onsubmit = async (event) => {
     event.preventDefault();
     if (new Set(drafts.map(({ field }) => field)).size !== drafts.length) return env.toast('Each sort metric can only appear once.');
-    apply(drafts);
-    env.modal.close();
+    try {
+      await apply(drafts);
+      env.modal.close();
+    } catch (error) { env.toast(error.message); }
   };
   show();
 }
@@ -271,7 +363,7 @@ function computedEditor(env, state, apply) {
   };
 }
 
-function saveEditor(env, state, saved) {
+function saveEditor(env, state, saved, prepareRanges) {
   const target = env.showDialog(env.modal, saved ? 'Save screen version' : 'Save a screen', `<form class="stack">
     ${field('Name', `<input name="name" required maxlength="100" value="${safe(saved?.name || '')}" placeholder="Emerging leaders">`)}
     <label class="checkbox-label"><input type="checkbox" name="fixed" ${env.context.date ? 'checked' : ''}> Pin the selected session</label>
@@ -290,6 +382,7 @@ function saveEditor(env, state, saved) {
     }
     const body = { name: form.get('name'), definition: definition(state, context) };
     try {
+      await prepareRanges(body.definition, { date: context.date || env.config.status.latestDate, followLatest: !form.has('fixed') });
       const result = await env.api(saved ? `screens/${pathPart(saved.id)}` : 'screens', { method: saved ? 'PUT' : 'POST', body, plain: true });
       env.modal.close();
       await env.reloadConfig();
@@ -372,7 +465,8 @@ export async function render(env) {
       sort: data.sort || structuredClone(defaultSort), sortCustomized: !!data.sort,
       columns: columnSort(data.columns || initialColumns(ranking)), columnsCustomized: !!data.columns, computed: data.computed || [],
       groupBy: data.groupBy || '', perPage: 50, page: 1, selected: new Set(), includeUntraded: !!data.includeUntraded,
-      customPeriods: Object.fromEntries(Object.keys(periodLabels).map((key) => [key, listPeriods(data.context?.[key])])) });
+      customPeriods: { ...Object.fromEntries(Object.keys(periodLabels).map((key) => [key, listPeriods(data.context?.[key])])),
+        rangeWindows: usedRangeWindows(data) } });
   }
   const selectedList = ranking ? params.rankList : saved?.definition?.rankingPeriod || saved?.definition?.rankingList;
   const period = config.rankingPeriods?.find(({ id }) => id === selectedList);
@@ -380,7 +474,7 @@ export async function render(env) {
   const topPercent = Number(ranking ? params.topPercent || 2 : saved?.definition?.topPercent ?? 2);
   if (state.rankingPeriod !== period?.id || state.rankingList !== rankList?.id || state.topPercent !== topPercent) state.page = 1;
   Object.assign(state, { rankingPeriod: period?.id, rankingList: rankList?.id, topPercent });
-  state.customPeriods ||= periodDefaults();
+  state.customPeriods = { ...periodDefaults(), ...state.customPeriods };
   registerPeriods(state.customPeriods);
   const contextKey = JSON.stringify(context);
   if (state.contextKey !== contextKey) {
@@ -395,6 +489,7 @@ export async function render(env) {
   }
   let request = 0;
   let queryController;
+  const registeredRanges = new Set();
   signal.addEventListener('abort',()=>queryController?.abort(),{once:true});
   let searchTimer = null;
 
@@ -439,7 +534,7 @@ export async function render(env) {
           <label class="search-field">${icon('search')}<span class="sr-only">Search stocks</span><input type="search" id="security-search" value="${safe(state.search)}" placeholder="Ticker, company, industry"></label>
           ${action(`Filters${activeRules(state.filter) ? ` (${activeRules(state.filter)})` : ''}`, 'filters', 'filter')}
           ${action('Sort', 'sort-editor', 'sort')}${action('Columns', 'columns', 'columns')}
-          ${action('Periods', 'periods', 'clock')}${action('Computed', 'computed', 'code')}${action('Compare dates', 'compare-date-editor', 'history')}${action('Export CSV', 'export-screen', 'download', { value: 'csv' })}
+          ${action('Highs & lows', 'range-filters', 'pulse')}${action('Periods', 'periods', 'clock')}${action('Computed', 'computed', 'code')}${action('Compare dates', 'compare-date-editor', 'history')}${action('Export CSV', 'export-screen', 'download', { value: 'csv' })}
           ${config.exportFormats?.includes('parquet') ? action('Export Parquet', 'export-screen', 'download', { value: 'parquet' }) : ''}
         </div>
         <div class="query-options"><label class="field">Group by<select data-change="screen-group">${groups.map(([id,label]) => option(id,label,state.groupBy)).join('')}</select></label>
@@ -501,6 +596,7 @@ export async function render(env) {
       bindVirtualTable(target);
   }
 
+  let requiredRangeDate;
   async function load({ report = true } = {}) {
     const run = ++request;
     const target = main.querySelector('#result-table');
@@ -524,13 +620,24 @@ export async function render(env) {
         main.querySelectorAll('[data-action="export-screen"]').forEach((button)=>{button.disabled=true;});
       });
       if (run !== request || !env.isActive()) return;
+      requiredRangeDate = result.materialization?.prepareAction === 'range' ? result.materialization.requiredDate : undefined;
+      if (usedRangeWindows(query).length && (result.materialization?.prepareAction === 'range' || result.pendingOnly || !Array.isArray(result.rows))) {
+        target.innerHTML = notice('High/low metrics need preparation', result.materialization?.error ||
+          (requiredRangeDate ? `Prepare the comparison inputs for ${dateLabel(requiredRangeDate)} before using this historical expression.`
+            : 'Prepare the selected lookbacks for this session before filtering or sorting.'),
+          action('Prepare high/low metrics', 'prepare-screen-ranges', 'refresh'));
+        main.querySelectorAll('[data-action="export-screen"]').forEach((button) => { button.disabled = true; });
+        return;
+      }
       const compareMetric = state.compareMetric || 'rsPercentile';
       if ((state.compareDate || (ranking && state.compareModel)) && result.rows.length) {
         const ids = result.rows.map(({ securityId }) => securityId);
         const chunks = [ids.slice(0, 200), ids.slice(200)].filter((group) => group.length);
-        const compare = (patch) => Promise.all(chunks.map((value) => env.api('screens/query', {
+        const range = rangeFieldDetails(compareMetric);
+        const compare = (patch) => Promise.all(chunks.map((value) => env.publishedSeries('screens/query', {
           body: { filter: { field: 'securityId', op: 'in', value }, context: { ...query.context, ...patch },
             ...(period ? { rankingPeriod: period.id, topPercent: 100 } : {}),
+            ...(range ? { columns: [compareMetric] } : {}),
             computed: state.computed, includeUntraded: state.includeUntraded, all: true }, signal:querySignal,
         })));
         const [models, dates] = await Promise.all([
@@ -538,7 +645,7 @@ export async function render(env) {
           state.compareDate ? compare({ date: state.compareDate }) : [],
         ]);
         if (run !== request || !env.isActive()) return;
-        const found = (pages) => new Map(pages.flatMap((page) => page.rows.map((row) => [row.securityId, row])));
+        const found = (pages) => new Map(pages.flatMap((page) => (page.rows || []).map((row) => [row.securityId, row])));
         const byModel = found(models);
         const byDate = found(dates);
         state.compareResolvedDate = dates[0]?.date;
@@ -570,8 +677,30 @@ export async function render(env) {
     if (redraw) draw();
     return load();
   }
+  async function prepareRanges(screen, { date, followLatest = !env.context.date, retry = false } = {}) {
+    const rangeWindows = usedRangeWindows(screen);
+    if (!rangeWindows.length) return;
+    if (rangeWindows.length > 16 || rangeWindows.some((day) => !Number.isInteger(day) || day < 1 || day > 7560)) {
+      throw new Error('Use up to 16 whole high/low lookbacks from 1 to 7,560 trading sessions.');
+    }
+    const preparation = { ...env.snapshotContext, ...screen.context,
+      date: date || screen.context?.date || env.snapshotContext.date || config.status.latestDate,
+      dataVersion: screen.context?.dataVersion ?? env.snapshotContext.dataVersion, rangeWindows, followLatest };
+    const key = JSON.stringify(preparation);
+    if (!retry && registeredRanges.has(key)) return;
+    await env.api('data/preparation', { body: { context: preparation, ...(retry ? { retry } : {}) }, signal, plain: true });
+    registeredRanges.add(key);
+  }
+
   async function validate(patch) {
-    await env.api('screens/query', { body: { ...definition({ ...state, ...patch }, context), perPage: 1 }, signal });
+    const screen = definition({ ...state, ...patch }, context);
+    const rangeWindows = usedRangeWindows(screen);
+    if (rangeWindows.length) {
+      await prepareRanges(screen);
+      patch.customPeriods = { ...(patch.customPeriods ?? state.customPeriods), rangeWindows };
+      registerPeriods(patch.customPeriods);
+    }
+    await env.api('screens/query', { body: { ...screen, perPage: 1 }, signal });
     return update(patch);
   }
   function compareDateEditor() {
@@ -585,27 +714,55 @@ export async function render(env) {
         ${state.compareDate ? '<button class="button" type="button" id="clear-date-compare">Clear comparison</button>' : ''}</div></form>`);
     const clear = target.querySelector('#clear-date-compare');
     if (clear) clear.onclick = () => { env.modal.close(); update({ compareDate: null, compareResolvedDate: null }); };
-    target.onsubmit = (event) => {
+    target.onsubmit = async (event) => {
       event.preventDefault();
       const data = new FormData(event.target);
-      env.modal.close();
-      update({ compareDate: data.get('date'), compareMetric: data.get('metric'), compareResolvedDate: null });
+      const date = data.get('date');
+      const metric = data.get('metric');
+      const range = rangeFieldDetails(metric);
+      try {
+        if (range) {
+          const next = definition(state, context);
+          next.columns = [...next.columns, metric];
+          await prepareRanges(next);
+          await prepareRanges(next, { date, followLatest: false });
+          state.customPeriods = { ...state.customPeriods, rangeWindows: usedRangeWindows(next) };
+        }
+        env.modal.close();
+        update({ compareDate: date, compareMetric: metric, compareResolvedDate: null });
+      } catch (error) { env.toast(error.message); }
     };
   }
   env.setActions({
     'compare-date-editor': compareDateEditor,
     filters: () => filterEditor(env, state, (filter) => validate({ filter })),
-    columns: () => columnEditor(env, { ...state, columns: visibleColumns(state) }, (columns) => update({ columns, columnsCustomized: true })),
+    'range-filters': () => rangeEditor(env, ({ window, filter, columns }) => {
+      const customPeriods = { ...state.customPeriods, rangeWindows: [...new Set([...(state.customPeriods.rangeWindows ?? []), window])] };
+      const existing = state.filter;
+      const filters = existing?.operator === 'and' ? [...existing.filters] : existing ? [existing] : [];
+      if (filter) filters.push(filter);
+      return validate({ customPeriods, columns: columnSort([...visibleColumns(state), ...columns]), columnsCustomized: true,
+        ...(filter ? { filter: { operator: 'and', filters } } : {}) });
+    }),
+    'prepare-screen-ranges': async () => {
+      await prepareRanges(definition(state, context), { retry: true,
+        ...(requiredRangeDate && { date: requiredRangeDate, followLatest: false }) });
+      return load();
+    },
+    columns: () => columnEditor(env, { ...state, columns: visibleColumns(state) }, (columns) => validate({ columns, columnsCustomized: true })),
     periods: () => periodEditor(env, state, (customPeriods) => validate({ customPeriods })),
-    'sort-editor': () => sortEditor(env, { ...state, sort: sortOrder() }, (sort) => update({ sort, sortCustomized: true })),
+    'sort-editor': () => sortEditor(env, { ...state, sort: sortOrder() }, (sort) => validate({ sort, sortCustomized: true })),
     computed: () => computedEditor(env, state, (computed, removed, added) => validate({ computed,
       columns: [...state.columns.filter((id) => id !== removed), ...(added ? [added] : [])], sort: state.sort.filter(({ field }) => field !== removed) })),
     sort(field, element, event) {
       if (field.startsWith('compare')) return env.toast('Comparison values are shown for the active result set.');
       const activeSort = sortOrder();
       const active = activeSort.find((item) => item.field === field);
+      const range = rangeFieldDetails(field);
+      const ascending = range ? range.metric !== 'distance' || range.side === 'low'
+        : ['symbol', 'name', 'rsRank', 'periodRank', 'subsetRank', 'groupRank'].includes(field);
       const first = { field, direction: active?.direction === 'asc' ? 'desc' : active?.direction === 'desc' ? 'asc'
-        : ['symbol', 'name', 'rsRank', 'periodRank', 'subsetRank', 'groupRank'].includes(field) ? 'asc' : 'desc' };
+        : ascending ? 'asc' : 'desc' };
       const sort = event.shiftKey ? active ? activeSort.map((item) => item.field === field ? first : item) : [...activeSort, first] : [first];
       return update({ sort, sortCustomized: true });
     },
@@ -614,7 +771,7 @@ export async function render(env) {
     'new-model': () => modelEditor(env),
     'edit-model': () => modelEditor(env, model),
     'ranking-list': (value) => env.go('rankings', { rankList: value || null }),
-    'save-screen': () => saveEditor(env, state, saved),
+    'save-screen': () => saveEditor(env, state, saved, prepareRanges),
     'export-screen': (format = 'csv') => env.exportFile('screens/query', { body: { ...definition(state, context), export: format } }, `stock-screener.${format}`),
     'add-selected': () => env.openAddWatchlist([...state.selected]),
     'clear-selected'() { state.selected.clear(); selection(); return load(); },

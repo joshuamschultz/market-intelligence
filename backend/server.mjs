@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -6,10 +6,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bulkSessionStatus, CALCULATION_VERSION, dailyPublication, openDatabase } from './database.mjs';
 import { expectedSessions, latestFinalizableSession, shiftDate } from './calendar.mjs';
 import { journalDueDate } from './journal.mjs';
-import { createService, scheduledJournalReadiness, scheduledPrecomputeKey } from './service.mjs';
+import { createService, dailyCaptureAvailability, defaultMarketSyncAfter, marketSyncAfter, scheduledJournalReadiness, scheduledPrecomputeKey } from './service.mjs';
+import { runningRelease } from '../scripts/release.mjs';
 
 const publicDir = fileURLToPath(new URL('../frontend/', import.meta.url));
 const backendDir = fileURLToPath(new URL('./', import.meta.url));
+const codeRoot = fileURLToPath(new URL('../', import.meta.url));
+const packagePath = resolve(codeRoot, 'package.json');
+const release = runningRelease(resolve(codeRoot));
 const contentTypes = new Map([
   ['html', 'text/html; charset=utf-8'],
   ['css', 'text/css; charset=utf-8'],
@@ -55,13 +59,29 @@ function authorized(request, token) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-async function staticVersion() {
-  const modified = await Promise.all([publicDir, backendDir].map(async (folder) => {
-    const files = await readdir(folder);
-    const times = await Promise.all(files.map((filename) => stat(resolve(folder, filename)).then((result) => result.mtimeMs)));
-    return Math.max(0, ...times);
-  }));
-  return [CALCULATION_VERSION, Math.floor(Math.max(...modified))].join('.');
+let workspaceBuild;
+export async function buildInformation() {
+  if (release) {
+    const { releaseId, appVersion, buildHash, builtAt, deployment } = release;
+    return { appVersion, releaseId, buildHash, calculationVersion: CALCULATION_VERSION, deployment, builtAt,
+      version: `${CALCULATION_VERSION}.${buildHash}` };
+  }
+  const folders = await Promise.all([publicDir, backendDir].map(async (folder) => (await readdir(folder, { withFileTypes: true }))
+    .filter((entry) => entry.isFile()).map((entry) => resolve(folder, entry.name))));
+  const files = [packagePath, ...folders.flat()].sort();
+  const modified = await Promise.all(files.map((file) => stat(file).then(({ mtimeMs, size }) => [mtimeMs, size])));
+  const signature = JSON.stringify([files, modified]);
+  if (workspaceBuild?.signature === signature) return workspaceBuild.metadata;
+  const contents = await Promise.all(files.map((file) => readFile(file)));
+  const hash = createHash('sha256');
+  for (const [index, file] of files.entries()) {
+    hash.update(file.slice(codeRoot.length)).update(':').update(String(contents[index].length)).update(':').update(contents[index]);
+  }
+  const buildHash = hash.digest('hex');
+  const metadata = { appVersion: JSON.parse(contents[files.indexOf(packagePath)]).version, releaseId: null, buildHash,
+    calculationVersion: CALCULATION_VERSION, deployment: 'workspace', builtAt: null, version: `${CALCULATION_VERSION}.${buildHash}` };
+  workspaceBuild = { signature, metadata };
+  return metadata;
 }
 
 export function createHandler({ service, token = '', host = '127.0.0.1' }) {
@@ -82,10 +102,12 @@ export function createHandler({ service, token = '', host = '127.0.0.1' }) {
           const remote = new URL(req.headers.origin).host;
           if (remote !== req.headers.host) return json(403, { error: 'Cross-origin mutation is denied' });
         }
-        if (pathname === '/api/v1/build' && ['GET', 'HEAD'].includes(req.method)) return json(200, { version: await staticVersion() });
+        if (pathname === '/api/v1/build' && ['GET', 'HEAD'].includes(req.method)) return json(200, await buildInformation());
         const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : {};
         const outcome = await service.dispatch({ method: req.method === 'HEAD' ? 'GET' : req.method, url: req.url, body });
-        return send(outcome.status, outcome.headers, typeof outcome.body === 'string' || Buffer.isBuffer(outcome.body) ? outcome.body : JSON.stringify(outcome.body));
+        const result = pathname === '/api/v1/config' && outcome.status === 200
+          ? { ...outcome.body, build: await buildInformation() } : outcome.body;
+        return send(outcome.status, outcome.headers, typeof result === 'string' || Buffer.isBuffer(result) ? result : JSON.stringify(result));
       }
       if (!['GET', 'HEAD'].includes(req.method)) return json(405, { error: 'Method not allowed' });
       const filename = pathname === '/' ? 'index.html' : pathname.slice(1);
@@ -102,15 +124,17 @@ export function createHandler({ service, token = '', host = '127.0.0.1' }) {
   };
 }
 
-export function createDailyTick(service, db, { after = '20:30', providerEnabled = false,
+export function createDailyTick(service, db, { after = defaultMarketSyncAfter, providerEnabled = false,
   config = process.env, now = () => new Date() } = {}) {
+  after = marketSyncAfter(after);
   const eligible = (date) => bulkSessionStatus(db, date, { verifiedOnly: true });
   const active = db.prepare("SELECT 1 FROM jobs WHERE type=? AND status IN ('queued','running') LIMIT 1");
   const completedNasdaq = db.prepare(`SELECT 1 FROM jobs WHERE type='nasdaq-refresh' AND status='complete'
     AND json_extract(result, '$.captureDate')>=? UNION ALL SELECT 1 FROM ingestion_runs WHERE provider='nasdaq'
     AND dataset LIKE 'stocks-screener:%' AND status='complete' AND json_extract(detail, '$.catalogDate')>=? LIMIT 1`);
   const completedReference = db.prepare("SELECT 1 FROM jobs WHERE type='provider-reference' AND status='complete' AND json_extract(result, '$.referenceDate')>=? LIMIT 1");
-  const scheduledBackup = db.prepare("SELECT 1 FROM jobs WHERE type='backup' AND json_extract(payload, '$.scheduledFor')=? LIMIT 1");
+  const scheduledBackups = db.prepare(`SELECT status,updated_at FROM jobs WHERE type='backup'
+    AND json_extract(payload,'$.scheduledFor')=? ORDER BY rowid`);
   let lastAttempt = 0;
   let lastReferenceAttempt = 0;
   let lastJournalAttempt = 0;
@@ -124,13 +148,23 @@ export function createDailyTick(service, db, { after = '20:30', providerEnabled 
     const nasdaqEnabled = config.MARKET_NASDAQ_SYNC === '1';
     const referenceEnabled = providerEnabled && config.MARKET_REFERENCE_SYNC === '1';
     const precomputeEnabled = config.MARKET_PRECOMPUTE === '1';
-    const pending = expectedSessions(shiftDate(date, -5), date).slice(-3).filter((session) => {
-      const raw = eligible(session);
-      return !raw || !dailyPublication(db, session, raw.version);
-    });
-    if (providerEnabled && pending.length && !active.get('provider-import') && stamp - lastAttempt > retryInterval) {
-      lastAttempt = stamp;
-      service.enqueue('provider-import', { bulk: true, from: pending[0], to: date, verifiedOnly: true });
+    const availability = dailyCaptureAvailability(db, date, clock, after);
+    if (providerEnabled && !active.get('provider-import')) {
+      if (availability.due) {
+        const captureAttempt = availability.attempts + 1;
+        service.enqueue('provider-import', { bulk: true, date, scheduledFor: date, captureAttempt, verifiedOnly: true,
+          skipCaptured: true, force: !!availability.receipt }, `daily-capture:${date}:${captureAttempt}`);
+      } else if (stamp - lastAttempt > retryInterval) {
+        const recovery = expectedSessions(shiftDate(date, -5), date).slice(-3).find((session) => {
+          const receipt = eligible(session);
+          return receipt && !dailyPublication(db, session, receipt.version);
+        });
+        if (recovery) {
+          lastAttempt = stamp;
+          service.enqueue('provider-import', { bulk: true, date: recovery, verifiedOnly: true, skipCaptured: true, localOnly: true },
+            `daily-publication:${recovery}:${eligible(recovery).version}`);
+        }
+      }
     }
     const publication = dailyPublication(db, date, eligible(date)?.version);
     if (publication && referenceEnabled && !completedReference.get(date) && !active.get('provider-reference')
@@ -161,25 +195,39 @@ export function createDailyTick(service, db, { after = '20:30', providerEnabled 
         model: scope.analysisModel, modelVersion: scope.analysisModelVersion, classification: scope.classification,
         reference: scope.referenceMode }, includeNotes: false });
     }
-    if (readiness?.state === 'ready' && config.MARKET_BACKUP === '1' && !scheduledBackup.get(date) &&
+    const backups = config.MARKET_BACKUP === '1' ? scheduledBackups.all(date) : [];
+    const backupAttempt = backups.length + 1;
+    const backupDue = !backups.some(({ status }) => ['complete', 'queued', 'running'].includes(status))
+      && backupAttempt <= 3 && (backupAttempt === 1 || stamp - Date.parse(backups.at(-1).updated_at) >= retryInterval);
+    if (readiness?.state === 'ready' && config.MARKET_BACKUP === '1' && backupDue &&
         !['backup', 'provider-bootstrap', 'provider-import', 'production-precompute', 'workspace-precompute', 'rank-materialize', 'materialize',
           'provider-reference', 'nasdaq-refresh', 'journal-generate'].some((type) => active.get(type))) {
-      service.enqueue('backup', { format: 'sqlite', scheduledFor: date, retain: config.MARKET_BACKUP_RETAIN ?? null }, `backup:${date}`);
+      service.enqueue('backup', { format: 'sqlite', scheduledFor: date, backupAttempt, retain: config.MARKET_BACKUP_RETAIN ?? null },
+        backupAttempt === 1 ? `backup:${date}` : `backup:${date}:${backupAttempt}`);
+    }
+    if (precomputeEnabled && readiness?.state === 'ready') service.prepareStandard?.({ date, version: readiness.dataVersion });
+    else if (precomputeEnabled && !publication && (!providerEnabled || availability.state === 'exhausted') &&
+      !['provider-import', 'provider-bootstrap', 'provider-reference', 'nasdaq-refresh'].some((type) => active.get(type))) {
+      service.prepareStandard?.({ date });
     }
   };
 }
 
 function schedule(service, db, after, providerEnabled) {
   const tick = createDailyTick(service, db, { after, providerEnabled });
-  const timer = setInterval(() => {
+  const run = () => {
     try { tick(); } catch (error) { console.error('Daily workspace update failed:', error.message); }
-  }, 60_000);
+  };
+  const timer = setInterval(run, 60_000);
+  run();
   timer.unref();
   return timer;
 }
 
 export function startServer() {
   try { process.loadEnvFile(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const cutoff = marketSyncAfter(process.env.MARKET_SYNC_AFTER);
+  process.env.MARKET_SYNC_AFTER = cutoff;
   const host = process.env.HOST || '127.0.0.1';
   const port = Number(process.env.PORT || 4173);
   const token = process.env.MARKET_ACCESS_TOKEN || '';
@@ -188,7 +236,7 @@ export function startServer() {
   db.prepare("UPDATE jobs SET status='failed', error='Workspace stopped before job completion' WHERE status='running'").run();
   const service = createService({ db });
   const server = createServer(createHandler({ service, token, host }));
-  const timer = schedule(service, db, process.env.MARKET_SYNC_AFTER || '20:30',
+  const timer = schedule(service, db, cutoff,
     process.env.MARKET_SYNC === '1' && Boolean(process.env.EODHD_API_KEY));
   server.on('close', () => { clearInterval(timer); db.close(); });
   server.listen(port, host, () => console.log(`Market Intelligence at http://${host.includes(':') ? `[${host}]` : host}:${port}`));

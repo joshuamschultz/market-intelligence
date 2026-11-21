@@ -12,6 +12,9 @@ const listColumns = ['symbol', 'name', ...rateKeys];
 const jobTitles = {
   'provider-import': 'Import prices', 'provider-probe': 'Check provider access', 'event-study': 'Breadth event study',
   'provider-bootstrap': 'Load market history', 'provider-reference': 'Refresh current reference data', 'rank-materialize': 'Archive stock rankings', 'workspace-precompute': 'Precompute workspace history',
+  'prepare-context': 'Prepare universe analytics', 'prepare-range': 'Prepare rolling highs and lows',
+  'prepare-range-history': 'Prepare rolling high and low history', 'production-precompute': 'Publish daily analytics',
+  'health-precompute': 'Prepare market health',
   'journal-generate': 'Generate market update', 'journal-backtest': 'Backtest journal signals',
   cohort: 'Cohort analysis', materialize: 'Materialize history', backup: 'Warehouse backup',
 };
@@ -26,6 +29,27 @@ const splitValues = (value) => String(value || '').split(',').map((item) => item
 const timestamp = (value) => value ? `${dateLabel(value)} ${String(value).slice(11,16)} UTC` : '—';
 const itemPath = (area, id) => `${area}/${pathPart(id)}`;
 const braceJSON = (data) => JSON.stringify(data, null, 2);
+
+function importRows(runs = []) {
+  return runs.map((run) => {
+    const [first, last] = [...new Set((run.dates || []).filter(Boolean))].sort();
+    const session = [first, last].filter(Boolean).map((date) => dateLabel(date)).join(' to ');
+    const daily = run.dataset === 'bulk-eod' || run.dataset?.startsWith('bootstrap-current-coverage:');
+    const scope = run.scope === 'full' ? 'Market-wide capture' : run.scope === 'sample' ? 'Selected coverage' : run.scope;
+    const ignored = [run.detail?.invalid, run.detail?.unresolved];
+    const unchanged = [run.rows, run.imported, ...ignored].every(Number.isInteger)
+      ? Math.max(0, run.rows - run.imported - ignored.reduce((total, value) => total + value, 0)) : null;
+    const outcome = run.status === 'duplicate' ? 'Duplicate capture · no changes'
+      : run.status === 'complete' && run.rows > 0 && Number.isInteger(run.imported)
+        ? [`${count(run.imported)} new or updated`, ...(unchanged == null ? [] : [`${count(unchanged)} unchanged`])].join(' · ') : '';
+    return `<tr><th scope="row">${safe(session || '—')}</th>
+      <td><strong>${safe(daily ? 'Daily prices (all tickers)' : run.dataset)}</strong>
+        <div class="muted">${safe([run.provider?.toUpperCase(), daily && run.dataset].filter(Boolean).join(' · '))}</div></td>
+      <td>${safe(scope || '—')}</td><td>${chip(run.status, run.status === 'complete' ? 'accent' : 'warning')}</td>
+      <td class="numeric">${count(run.rows)}${outcome ? `<div class="muted">${safe(outcome)}</div>` : ''}</td>
+      <td>${safe(timestamp(run.finishedAt))}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="no-rows">No imports recorded.</td></tr>';
+}
 
 function saveError(target, error) {
   const output = target.querySelector('.form-error');
@@ -564,7 +588,7 @@ async function renderSettings(env) {
           ['Unresolved identifiers',count(data.unresolvedIdentifiers)],['Invalid source rows',count(data.invalidRows)],
           ['Latest finalized session',dateLabel(data.lastFinalizableSession)],['Selected session coverage',data.stale?'Stale':data.coverage?.state || 'Unknown'],
           ['Latest bulk capture',coverage ? `${dateLabel(coverage.date)} · ${count(coverage.eligibleReceived)} / ${count(coverage.expected)} eligible` : 'Unavailable'],
-          ['Latest verified analytics',publication ? `${dateLabel(publication.date)} · revision ${count(publication.data_revision)}` : 'No publication record'],
+          ['Latest verified analytics',publication ? `${dateLabel(publication.date)} · revision ${count(publication.data_version)}` : 'No publication record'],
           ['Reference through',data.referenceDate ? dateLabel(data.referenceDate) : 'Unavailable'],
           ['Classification system',data.classificationSystem || 'Unclassified']].map(([label,value])=>`<div><span>${safe(label)}</span><strong class="mono">${safe(value)}</strong></div>`).join('')}
         </div>
@@ -572,10 +596,9 @@ async function renderSettings(env) {
     </div>
     ${universeCoverage(data.coverage)}
     <div id="quality-source-audit-mount"></div>
-    <section class="panel panel-body section-space">${panelHead('Import history','Source datasets and scope')}
-      <div class="table-scroll" tabindex="0" role="region" aria-label="Recent ingestion runs"><table><thead><tr><th>Provider</th><th>Dataset</th><th>Scope</th><th>Status</th><th>Price rows</th><th>Completed</th></tr></thead>
-      <tbody>${(data.runs || []).map((run)=>`<tr><td>${safe(run.provider)}</td><td>${safe(run.dataset)}</td><td>${safe(run.scope)}</td><td>${chip(run.status,run.status==='complete'?'accent':'warning')}</td>
-      <td class="numeric">${count(run.rows)}</td><td>${safe(timestamp(run.finishedAt))}</td></tr>`).join('') || '<tr><td colspan="6" class="no-rows">No imports recorded.</td></tr>'}</tbody></table></div></section>`;
+    <section class="panel panel-body section-space">${panelHead('Import history','Session dates show the price period imported. Capture coverage shows which securities were included.')}
+      <div class="table-scroll" tabindex="0" role="region" aria-label="Recent ingestion runs"><table><thead><tr><th>Price session or range</th><th>Dataset</th><th>Capture coverage</th><th>Status</th><th>Price rows</th><th>Completed</th></tr></thead>
+      <tbody id="import-rows">${importRows(warehouse.runs)}</tbody></table></div></section>`;
   }
   function configurations() {
     return `<div class="stack"><section class="panel panel-body">${panelHead('Universes','Versioned membership and eligibility rules',action('Create universe','new-universe','plus'))}
@@ -619,10 +642,36 @@ async function renderSettings(env) {
         <strong>${count(capture.stages?.[key]?.complete || 0)}</strong><small>${count(capture.stages?.[key]?.retry || 0)} to retry</small></div>`).join('')}</div>
       ${capture.active ? `<p class="muted section-space">Current stage · ${safe(stageLabels[capture.phase] || capture.phase || 'Preparing')}</p>` : ''}</section>`;
   }
+  function preparationPanel() {
+    const plan = warehouse.preparation;
+    if (!plan?.total) return `<section class="panel panel-body">${panelHead('After-import preparation', 'See which universes have current stock metrics, recent charts, and full history.')}
+      <p class="muted">No preparation plan is recorded for this warehouse revision.</p></section>`;
+    const phases = [['current','Current stocks'], ['recent','Recent charts'], ['history','Full history']];
+    const current = plan.current;
+    return `<section class="panel panel-body">${panelHead('After-import preparation',
+      `Raw warehouse revision ${count(plan.dataVersion)} · ${count(plan.complete)} of ${count(plan.total)} tasks prepared`)}
+      ${current ? `<p><strong>${safe(config.universes.find(({id})=>id===current.universe)?.name || current.universe)}</strong>
+        · ${safe(current.phaseLabel)} · ${percent(current.progress,0)}
+        ${current.totalSessions ? ` · ${count(current.completedSessions)}/${count(current.totalSessions)} session calculations` : ''}
+        ${current.estimatedRemainingSeconds > 0 ? ` · about ${count(Math.max(1,Math.ceil(current.estimatedRemainingSeconds/60)))} min for this task` : ''}</p>` : ''}
+      ${plan.failed ? `<p class="muted">${count(plan.failed)} failed. Completed data remains available. Review the job errors before retrying.</p>` : ''}
+      <div class="table-scroll" role="region" aria-label="Universe preparation" tabindex="0"><table><thead><tr><th>Universe</th>
+        ${phases.map(([,label])=>`<th>${label}</th>`).join('')}</tr></thead><tbody>
+        ${plan.universes.map((item)=>`<tr><th>${safe(config.universes.find(({id})=>id===item.universe)?.name || item.universe)}</th>
+          ${phases.map(([phase])=>`<td>${item.stages[phase] ? `${count(item.stages[phase].complete)}/${count(item.stages[phase].total)} ready` : '—'}</td>`).join('')}</tr>`).join('')}
+      </tbody></table></div>
+      ${['current','history'].filter((phase)=>plan.ranges?.[phase]).map((phase)=>{
+        const stages = plan.ranges[phase];
+        const total = Object.values(stages).reduce((sum,value)=>sum+value,0);
+        return total ? `<p class="muted section-space">Rolling high/low ${phase} · ${count(stages.complete||0)} of ${count(total)} tasks complete</p>` : '';
+      }).join('')}
+      <p class="muted section-space">Preparation and provider coverage are separate. A prepared calculation can still have missing source data.</p></section>`;
+  }
   function jobList() {
-    return `<div class="stack"><div id="bootstrap-progress"${warehouse.bootstrap ? '' : ' hidden'}>${capturePanel()}</div><section class="panel panel-body">${panelHead('Background jobs', 'Warehouse imports, calculations, and research', [
+    return `<div class="stack"><div id="bootstrap-progress"${warehouse.bootstrap ? '' : ' hidden'}>${capturePanel()}</div><div id="preparation-progress">${preparationPanel()}</div><section class="panel panel-body">${panelHead('Background jobs', 'Warehouse imports, calculations, and research', [
       action('Check provider access', 'provider-probe', 'pulse'), action('Load market history', 'bootstrap-data', 'history'),
       action('Refresh reference data', 'reference-data', 'refresh'), action('Materialize history', 'materialize', 'chart'),
+      action('Prepare standard analytics', 'prepare-standard', 'chart'), action('Prepare selected context', 'prepare-selected', 'settings'),
       action('Back up SQLite', 'backup', 'download'), ...(config.exportFormats?.includes('parquet') ? [action('Back up Parquet', 'backup-parquet', 'download')] : []),
     ].join(''))}<div class="table-scroll" tabindex="0" role="region" aria-label="Background jobs"><table><thead><tr>
       <th>Job</th><th>Status</th><th>Progress</th><th>Updated</th></tr></thead><tbody id="job-rows">${jobRows()}</tbody></table></div></section></div>`;
@@ -648,6 +697,13 @@ async function renderSettings(env) {
     if (target) {
       target.hidden = !warehouse.bootstrap;
       target.innerHTML = capturePanel();
+    }
+    const preparation = main.querySelector('#preparation-progress');
+    if (preparation) preparation.innerHTML = preparationPanel();
+    const imports = main.querySelector('#import-rows');
+    if (imports) {
+      const next = importRows(warehouse.runs);
+      if (imports.innerHTML !== next) imports.innerHTML = next;
     }
   };
   document.addEventListener('warehouse:jobs', receiveJobs);
@@ -690,6 +746,15 @@ async function renderSettings(env) {
     'reference-data':()=>referenceEditor(env),
     backup:()=>launch('data/backup'),
     'backup-parquet':()=>launch('data/backup', { format: 'parquet' }),
+    async 'prepare-standard'() {
+      const plan = await env.api('data/preparation', { plain:true, body:{ retry:true } });
+      env.toast(plan.waitingForCapture ? 'Preparation is waiting for the current import.' : `${count(plan.queued)} preparation tasks queued`);
+    },
+    async 'prepare-selected'() {
+      const plan = await env.api('data/preparation', { plain:true, body:{ retry:true,
+        context:{ ...env.snapshotContext, followLatest:!env.context.date && !env.context.dataVersion } } });
+      env.toast(plan.waitingForCapture ? 'Preparation is waiting for the current import.' : `${count(plan.queued)} preparation tasks queued`);
+    },
     materialize() {
       const target=env.showDialog(env.modal,'Materialize historical analytics',`<form class="stack">
         ${field('Calculation','<select name="kind"><option value="breadth">Market breadth and industries</option><option value="rankings">Stock rankings</option><option value="workspace">Core workspace history</option></select>')}

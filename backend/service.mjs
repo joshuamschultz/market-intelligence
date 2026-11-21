@@ -1,14 +1,16 @@
 import { createHash } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { referenceArchiveScopes, reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import {
   bulkSessionStatus, CALCULATION_VERSION, createJob, dailyPublication, dataVersion, getWorkspace, importDataset, isoDate, jobById, listWorkspace, storeWorkspace,
-  qualityOverrides, recordDailyPublication, today, updateJob, warehouseStatus,
+  normalizeSymbol, qualityOverrides, recordDailyPublication, today, updateJob, warehouseStatus,
 } from './database.mjs';
 import { expectedSessions, isMarketSession, latestFinalizableSession, shiftDate, weekEnd } from './calendar.mjs';
 import { backupRetention, createCompressedBackup } from './backup.mjs';
 import { BREADTH_METRICS, breadthMetric, binaryMetric } from './breadth.mjs';
 import { createEngine, UNIVERSES, validateUniverse } from './engine.mjs';
-import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, quantile, volumeRatio } from './metrics.mjs';
+import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, volumeRatio } from './metrics.mjs';
 import {
   generateJournal, getJournalDate, getJournalSettings, journalFactorSelection, journalNoteDates,
   listJournalEntries, listJournalPrompts, runJournalBacktest, saveJournalNote, saveJournalPrompt, saveJournalSettings,
@@ -16,21 +18,82 @@ import {
 import { parquetAvailable, parquetBackup, parquetRows } from './parquet.mjs';
 import { materializeHistory, readMaterializedHistory } from './materialization.mjs';
 import { precomputeProduction, precomputeWorkspace } from './precompute.mjs';
+import { createPreparedDetailWriter, detailRiskWindows, prepareDetailsBatch, readPreparedDetail, riskMetrics } from './prepared-details.mjs';
+import { hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot } from './prepared-snapshots.mjs';
+import { enqueuePreparation, preparationInput, preparationSpecs, preparationStatus, preparationSuperseded, preparationType, readPreparedRanks,
+  recentPreparationSessions, registerPreparation, registeredPreparations, requirePreparationSpace, runPreparation } from './preparation.mjs';
+import { applyPreparedRangeMetrics, prepareRangeMetrics, rangeWindowsForScreen, readPreparedRangeMetrics } from './range-metrics.mjs';
 import { BENCHMARKS, EodhdProvider, importProviderData, importProviderReference, providerDates, providerOptions } from './provider.mjs';
 import { BUILTIN_MODELS, RANKING_METHODS, rankBy, validateModel } from './ranking.mjs';
 import { readRankArchive, writeRankArchive } from './rank-archive.mjs';
 import { analyzeCohort, calculateMarketHealth, DEFAULT_HEALTH_MODEL, findHistoricalAnalogs, leadershipTransitionMatrix,
   marketHealthHistory, runEventStudy } from './research.mjs';
 import { csvRows, screenStocks, validateFilter, validateScreen } from './screener.mjs';
+import { prepareSummation, readPreparedSummation } from './summation.mjs';
 
 const collections = {
   screens: 'screen', watchlists: 'watchlist', 'ranking-models': 'ranking-model',
   universes: 'universe', 'health-models': 'health-model', themes: 'theme',
   'alert-rules': 'alert-rule', cohorts: 'cohort',
 };
+const resolvedSnapshot = Symbol('prepared snapshot');
+const resolvedHistory = Symbol('prepared history reader');
 
 export function scheduledPrecomputeKey(date, version) {
   return `production-precompute:${CALCULATION_VERSION}:${date}:${version}`;
+}
+
+export const defaultMarketSyncAfter = '16:30';
+export const dailyCaptureOffsets = [0, 10, 25, 50];
+const dailyAvailabilityMinutes = 90;
+const easternClock = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
+
+export function marketSyncAfter(value) {
+  const after = value || defaultMarketSyncAfter;
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(after)) throw new Error('MARKET_SYNC_AFTER must be an Eastern time in HH:MM format');
+  return after;
+}
+
+export function rawBulkReceipt(db, date) {
+  return db.prepare(`SELECT s.date,s.version,s.received,s.expected FROM session_imports s JOIN ingestion_runs r ON r.id=s.run_id
+    WHERE s.date=? AND s.scope='full' AND r.provider='eodhd' AND r.status='complete'
+      AND (r.dataset='bulk-eod' OR r.dataset LIKE 'bootstrap-current-coverage:%')
+    ORDER BY s.version DESC LIMIT 1`).get(date) || null;
+}
+
+function availabilityClock(date, now, after) {
+  const clock = Object.fromEntries(easternClock.formatToParts(now).map(({ type, value }) => [type, value]));
+  const today = `${clock.year}-${clock.month}-${clock.day}`;
+  const [hours, minutes] = marketSyncAfter(after).split(':').map(Number);
+  const elapsed = 60 * Number(clock.hour) + Number(clock.minute) - 60 * hours - minutes;
+  return { today, elapsed, inWindow: today === date && elapsed >= 0 && elapsed <= dailyAvailabilityMinutes };
+}
+
+export function dailyCaptureAvailability(db, date, now, after = defaultMarketSyncAfter) {
+  const raw = rawBulkReceipt(db, date);
+  const verified = bulkSessionStatus(db, date, { verifiedOnly: true });
+  const jobs = db.prepare(`SELECT status,updated_at FROM jobs WHERE type='provider-import'
+    AND json_extract(payload,'$.scheduledFor')=? AND json_type(payload,'$.captureAttempt')='integer' ORDER BY rowid`).all(date);
+  const previous = jobs.at(-1);
+  const { today, elapsed, inWindow } = availabilityClock(date, now, after);
+  const attempts = jobs.length;
+  const record = { date, after, timezone: 'America/New_York', retryOffsetsMinutes: dailyCaptureOffsets,
+    availabilityMinutes: dailyAvailabilityMinutes, attempts, maxAttempts: dailyCaptureOffsets.length, receipt: raw, due: false };
+  if (verified) return { ...record, state: 'verified' };
+  if (jobs.some(({ status }) => status === 'running' || status === 'queued')) return { ...record, state: 'capturing' };
+  if (inWindow && attempts < dailyCaptureOffsets.length) {
+    const offset = dailyCaptureOffsets[attempts];
+    const delay = attempts ? dailyCaptureOffsets[attempts] - dailyCaptureOffsets[attempts - 1] : 0;
+    const eligibleAt = previous ? Date.parse(previous.updated_at) + delay * 60_000 : 0;
+    const due = elapsed >= offset && now.getTime() >= eligibleAt;
+    return { ...record, state: due ? 'due' : 'waiting', due };
+  }
+  if (!raw && !attempts && (today > date || today === date && elapsed >= 0)) {
+    return { ...record, state: 'due', due: true, catchUp: true };
+  }
+  return { ...record, state: 'exhausted' };
 }
 
 export function scheduledJournalReadiness(db, { date, nasdaqEnabled = process.env.MARKET_NASDAQ_SYNC === '1',
@@ -441,20 +504,83 @@ function sessionsBetween(from, end) {
   return expectedSessions(from, end);
 }
 
-function historicalScreen(engine, config, input, snapshot) {
+const velocityField = /^(?:rsStatus|rankChange(?:1|4|12)w|velocity(?:1|4|12)w|rsScoreChange|rsAcceleration|rsNewHigh|leadingWeeks|leadingWeekCoverage|topDecile(?:Weeks|Persistence)(?:4|8|12)w|enteredTop(?:1|5|10|20)|rsHighBeforePrice|deterioratingOnPriceStrength|momentumImproving|udvChange4w|upVolumeShareChange4w|volumeDemandImproving|priceAndVolumeStrength|lifecycle|industryVelocity|industryImproving|industryEmerging)$/;
+const rangeFieldWindow = (field) => Number(/^range_(?:distance|since|age)_(?:high|low)_(\d+)d$/.exec(field)?.[1]) || null;
+
+function previousSession(date, lag) {
+  return expectedSessions(shiftDate(date, -2 * lag - 8), date).at(-lag - 1);
+}
+
+function knownRangeDependencies(definition, point) {
+  if (point.basis !== 'known' || !point.date) return [];
+  const { filter, computed } = validateScreen(definition);
+  const dates = new Map();
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (['previous', 'change'].includes(node.fn)) {
+      const window = rangeFieldWindow(node.args[0]?.field);
+      const lag = node.args[1] ? node.args[1].literal : 20;
+      if (window && Number.isInteger(lag) && lag >= 1 && lag <= 1008) {
+        const date = previousSession(point.date, lag);
+        if (date && date >= point.earliestDate) dates.set(date, [...new Set([...(dates.get(date) || []), window])]);
+      }
+    }
+    for (const entry of Object.values(node)) {
+      if (Array.isArray(entry)) entry.forEach(visit);
+      else if (entry && typeof entry === 'object') visit(entry);
+    }
+  }
+  visit(filter);
+  computed.forEach(visit);
+  return [...dates].map(([date, rangeWindows]) => ({ date, rangeWindows }));
+}
+
+function screenNeedsVelocity(input) {
+  const { columns, sort, computed, filter } = validateScreen(input);
+  const usesField = (node) => node && (velocityField.test(node.field || '') || usesField(node.ast)
+    || usesField(node.arg) || usesField(node.left) || usesField(node.right)
+    || node.args?.some(usesField) || node.filters?.some(usesField));
+  return Boolean(input.rankingList && rankingList(input).needsVelocity
+    || [...columns, ...sort.map(({ field }) => field)].some((field) => velocityField.test(field))
+    || computed.some(usesField) || usesField(filter));
+}
+
+function missingScreenHistory(config, point, field, dependency) {
+  return Object.assign(new Error(dependency?.prepareAction === 'range'
+    ? 'Historical rolling high/low metrics are not prepared for the comparison session'
+    : 'A historical comparison snapshot is not prepared'), {
+    preparation: { date: config.date, dataVersion: config.dataVersion, rows: [], total: null, pendingOnly: true,
+      pendingReason: 'Historical comparison metrics', materialization: { preparationState: 'unregistered', ...dependency,
+        requiredDate: point.date, requiredField: field } },
+  });
+}
+
+function historicalScreen(db, engine, config, input, snapshot, historyReader) {
   if (input.rankingPeriod && input.rankingList) throw asError('Choose a period or an RS signal list');
   const list = input.rankingPeriod ? periodScreen(snapshot, input) : input.rankingList ? signalScreen(snapshot, input) : null;
   if (list) ({ snapshot, input } = list);
   const lags = new Map();
   function previous(field, id, period) {
     const lag = Number(period);
-    if (!Number.isInteger(lag) || lag < 1 || lag > 1008 || lags.size >= 12 && !lags.has(lag)) return null;
-    if (!lags.has(lag)) {
-      const dates = expectedSessions(shiftDate(config.date, -2 * lag - 8), config.date);
-      const date = dates.at(-lag - 1);
-      lags.set(lag, date ? new Map(engine.snapshot({ ...config, date }).stocks.map((row) => [row.securityId, row])) : new Map());
+    const velocity = velocityField.test(field);
+    const rangeWindow = rangeFieldWindow(field);
+    const cacheKey = `${lag}:${velocity}:${rangeWindow ?? ''}`;
+    if (!Number.isInteger(lag) || lag < 1 || lag > 1008 || lags.size >= 24 && !lags.has(cacheKey)) return null;
+    if (!lags.has(cacheKey)) {
+      const date = previousSession(config.date, lag);
+      const point = { ...config, date, requestedDate: date };
+      let prior = date && date >= config.earliestDate ? historyReader
+        ? historyReader(point, { velocity }) : engine.snapshot(point, { velocity }) : null;
+      if (date && date >= config.earliestDate && historyReader && !prior) throw missingScreenHistory(config, point, field);
+      if (prior && rangeWindow) {
+        const rangePoint = rangeContext(engine, point);
+        const prepared = readPreparedRangeMetrics(db, rangePoint, [rangeWindow]);
+        if (!prepared.ready) throw missingScreenHistory(config, point, field, rangePendingStatus(db, engine, rangePoint, prepared));
+        prior = applyPreparedRangeMetrics(prior, prepared);
+      }
+      lags.set(cacheKey, new Map((prior?.stocks || []).map((row) => [row.securityId, row])));
     }
-    return lags.get(lag).get(id)?.[field] ?? null;
+    return lags.get(cacheKey).get(id)?.[field] ?? null;
   }
   const result = screenStocks(snapshot, input, { previous, all: exportFormats.includes(input.export) || input.all === true });
   return { ...result, ...(list?.period ? { period: list.period } : {}), ...(list?.list ? { rankingList: list.list } : {}), referenceDate: snapshot.referenceDate,
@@ -480,9 +606,10 @@ function screenDataNeeds(body) {
   };
 }
 
-function resolveScreen(engine, config, body, { velocity = true } = {}) {
-  const snapshot = engine.snapshot(config, { velocity });
-  return historicalScreen(engine, config, body, snapshot);
+function resolveScreen(db, engine, config, body, options = {}) {
+  const { velocity = true, rangeMetrics } = options;
+  const snapshot = options[resolvedSnapshot] || engine.snapshot(config, { velocity });
+  return historicalScreen(db, engine, config, body, rangeMetrics ? applyPreparedRangeMetrics(snapshot, rangeMetrics) : snapshot, options[resolvedHistory]);
 }
 
 function bootstrapProgress(db, { activeOnly = false } = {}) {
@@ -527,9 +654,279 @@ function workspaceDefaults(db) {
     classification: classificationStatus(db).defaultClassification, reference: 'latest' };
 }
 
+function summationContext(db, engine, config) {
+  const sec = db.prepare("SELECT 1 FROM classifications WHERE system='sec-sic' AND industry IS NOT NULL AND version<=? LIMIT 1").get(config.dataVersion);
+  return engine.context({ ...workspaceDefaults(db), date: config.date, dataVersion: config.dataVersion,
+    universe: 'nyse', universeVersion: 1, reference: 'as-of', ...(sec ? { classification: 'sec-sic' } : {}) });
+}
+
+function prepareNyseSummation(db, engine, config) {
+  const sessions = expectedSessions(config.earliestDate, config.date);
+  const observations = [];
+  for (let index = 0; index < sessions.length; index += 120) {
+    const dates = sessions.slice(index, index + 120);
+    const stored = readMaterializedHistory(db, engine, config, { from: dates[0], to: dates.at(-1), limit: dates.length });
+    if (!stored.complete) throw new Error('NYSE advancing and declining breadth is still being prepared');
+    for (const row of stored.rows) observations.push({
+      date: row.date, advancers: row.breadth.advancers?.numerator, decliners: row.breadth.decliners?.numerator,
+      comparable: row.breadth.advancers?.denominator, traded: row.coverage.traded,
+    });
+  }
+  return prepareSummation(db, config, sessions, observations);
+}
+
+const rangeType = 'prepare-range';
+const rangeHistoryType = 'prepare-range-history';
+const detailType = 'prepare-stock-details';
+function rangeContext(engine, config) {
+  return engine.context({ ...preparationInput(config), universe: 'us-all', universeVersion: 1, model: 'composite', modelVersion: 1,
+    benchmark: 'SPY', breadthKeys: [], windows: [], averages: [], volumeWindows: [], includeAllTimeHigh: false });
+}
+
+function rangeSpec(engine, input, windows) {
+  const config = rangeContext(engine, input);
+  const context = preparationInput(config);
+  const reference = config.referenceMode === 'latest' && config.date === config.latestDate ? config.observedReferenceDate : null;
+  const prefix = createHash('sha256').update(JSON.stringify([CALCULATION_VERSION, config.date, config.dataVersion,
+    config.basis, reference])).digest('hex').slice(0, 24);
+  return { type: rangeType, context, windows, prefix, jobKey: `${rangeType}:${prefix}:${windows.join(',')}` };
+}
+
+function rangeHistoryPrefix(config) {
+  return createHash('sha256').update(JSON.stringify([CALCULATION_VERSION, config.latestDate, config.dataVersion,
+    config.basis, rangeHistoryType])).digest('hex').slice(0, 24);
+}
+
+function rangePendingStatus(db, engine, point, rangeMetrics) {
+  const { prefix } = rangeSpec(engine, point, rangeMetrics.windows);
+  const historyPrefix = rangeHistoryPrefix(point);
+  const attempts = db.prepare(`SELECT id,status,progress,error,payload FROM jobs WHERE
+    (type=? AND json_extract(payload,'$.prefix')=?) OR (type=? AND json_extract(payload,'$.prefix')=?)
+    ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,rowid DESC`).all(rangeType, prefix, rangeHistoryType, historyPrefix);
+  const relevant = attempts.find((row) => JSON.parse(row.payload).windows.some((window) => rangeMetrics.missingWindows.includes(window)));
+  const waiting = relevant && ['queued','running'].includes(relevant.status);
+  return { preparationState: relevant?.status === 'complete' ? 'unregistered' : relevant?.status ?? 'unregistered',
+    prepareAction: 'range', missingWindows: rangeMetrics.missingWindows, error: relevant?.error ?? null,
+    ...(waiting ? pendingJob(relevant) : {}) };
+}
+
+function detailSpec(engine, config, { securityIds, benchmarks, riskWindows, followLatest = false } = {}) {
+  const point = rangeContext(engine, config);
+  const context = preparationInput(point);
+  const symbols = [...new Set(benchmarks || ['SPY', 'VTI', config.benchmark])].sort();
+  const windows = riskWindows?.length ? [...new Set(riskWindows)].sort((a, b) => a - b) : undefined;
+  const ids = securityIds?.length ? [...new Set(securityIds)].sort() : undefined;
+  const key = createHash('sha256').update(JSON.stringify([CALCULATION_VERSION, point.date, point.dataVersion, point.basis, symbols, windows, ids])).digest('hex');
+  return { type: detailType, context, ...(ids && { securityIds: ids }), benchmarks: symbols,
+    ...(windows && { riskWindows: windows }), followLatest, calculationVersion: CALCULATION_VERSION, jobKey: `${detailType}:${key}` };
+}
+
+function detailJobs(db, config, securityId, { exact = false, benchmark, lookback } = {}) {
+  const riskScope = benchmark ? `AND ? IN (SELECT value FROM json_each(json_extract(payload,'$.benchmarks')))
+    AND ? IN (SELECT value FROM json_each(coalesce(json_extract(payload,'$.riskWindows'),?)))` : '';
+  const active = db.prepare(`SELECT id,status,progress,error FROM jobs WHERE type=?
+    AND json_extract(payload,'$.context.basis')=? AND json_extract(payload,'$.context.dataVersion')=?
+    AND json_extract(payload,'$.context.date')${exact ? '=' : '>='}?
+    AND (json_type(payload,'$.securityIds') IS NULL OR ? IN (SELECT value FROM json_each(json_extract(payload,'$.securityIds'))))
+    ${riskScope}
+    ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,rowid DESC LIMIT 1`)
+    .get(detailType, config.basis, config.dataVersion, config.date, securityId,
+      ...(benchmark ? [benchmark, lookback, JSON.stringify(detailRiskWindows)] : []));
+  return active && ['queued', 'running'].includes(active.status) ? { preparationState: active.status, ...pendingJob(active) }
+    : { preparationState: active?.status === 'failed' ? 'failed' : 'unregistered', ...(active?.error && { error: active.error }) };
+}
+
+function schedulePreparation(db, engine, { date, version = dataVersion(db), requested, retry } = {}) {
+  if (bootstrapProgress(db, { activeOnly: true })) return { jobs: [], queued: 0, waitingForCapture: true };
+  const base = { ...workspaceDefaults(db), date, dataVersion: version };
+  const basePoint = engine.context(base);
+  const savedScreens = listWorkspace(db, 'screen').map(({ definition }) => ({ definition,
+    context: { ...savedScreenContext(definition), ...screenDataNeeds(definition), rangeWindows: rangeWindowsForScreen(definition) } }));
+  const custom = [...registeredPreparations(db), ...savedScreens.map(({ context }) => context)];
+  const historicalScreenRanges = savedScreens.flatMap(({ definition, context }) => {
+    if (context.basis !== 'known' || !context.rangeWindows.length) return [];
+    let point;
+    try { point = engine.context({ ...base, ...context }); } catch { return []; }
+    return knownRangeDependencies(definition, point).map((dependency) => ({ ...context, ...dependency }));
+  });
+  const alertRangeContexts = listWorkspace(db, 'alert-rule').flatMap(({ definition }) => {
+    if (definition.active === false || !['stocks', 'screen'].includes(definition.type)) return [];
+    const screen = definition.type === 'screen' ? getWorkspace(db, 'screen', definition.screenId)?.definition : definition;
+    const rangeWindows = rangeWindowsForScreen(screen ?? {});
+    if (!rangeWindows.length) return [];
+    const context = { ...definition.context, ...savedScreenContext(screen) };
+    const point = engine.context({ ...base, ...context, date, dataVersion: version });
+    if (!point.date) return [];
+    const prior = previousSession(point.date, 1);
+    const dates = [point, ...(prior ? [{ ...point, date: prior }] : [])];
+    return dates.flatMap((entry) => [{ ...context, date: entry.date, rangeWindows },
+      ...knownRangeDependencies(screen, entry).map((dependency) => ({ ...context, ...dependency }))]);
+  });
+  const requestedRanges = requested?.rangeWindows?.length > 0;
+  const rangeScopes = new Map();
+  const rangeHistoryScopes = new Map();
+  for (const input of requested ? [requested] : [{ rangeWindows: [20, 252] }, ...custom, ...historicalScreenRanges, ...alertRangeContexts]) {
+    if (!input.rangeWindows?.length) continue;
+    let point;
+    try { point = engine.context({ ...base, ...input }); } catch { continue; }
+    if (!point.date) continue;
+    const spec = rangeSpec(engine, point, input.rangeWindows);
+    const existing = rangeScopes.get(spec.prefix);
+    const missing = readPreparedRangeMetrics(db, rangeContext(engine, point), input.rangeWindows).missingWindows;
+    if (missing.length) rangeScopes.set(spec.prefix, { ...spec, windows: [...new Set([...(existing?.windows || []), ...missing])].sort((a,b) => a-b) });
+    if (point.basis === 'reconstructed' && point.date === point.latestDate) {
+      const prefix = rangeHistoryPrefix(point);
+      const history = rangeHistoryScopes.get(prefix);
+      rangeHistoryScopes.set(prefix, { ...spec, prefix, type: rangeHistoryType,
+        windows: [...new Set([...(history?.windows || []), ...input.rangeWindows])].sort((a,b) => a-b) });
+    }
+  }
+  const ranges = [...rangeScopes.values(), ...rangeHistoryScopes.values()].flatMap((spec) => {
+    const batches = [];
+    for (let index = 0; index < spec.windows.length; index += 16) {
+      const windows = spec.windows.slice(index, index + 16);
+      batches.push({ ...spec, windows, followLatest: !requested && spec.context.dataVersion === version,
+        ...(!requested && spec.type === rangeType && spec.context.date === basePoint.date && { persistDetails: true }),
+        calculationVersion: CALCULATION_VERSION, jobKey: `${spec.type}:${spec.prefix}:${windows.join(',')}` });
+    }
+    return batches;
+  });
+  const detail = [];
+  if (!requested) {
+    if (basePoint.date) {
+      detail.push(detailSpec(engine, basePoint, { followLatest: true }));
+      for (const { definition } of listWorkspace(db, 'stock-detail-preparation')) {
+        const { securityId, benchmark, basis, lookback } = definition;
+        const registered = engine.context({ ...base, basis, benchmark });
+        detail.push(detailSpec(engine, registered, { followLatest: true, securityIds: [securityId],
+          benchmarks: [benchmark], riskWindows: [lookback] }));
+      }
+    }
+  }
+  return enqueuePreparation(db, [...ranges, ...detail, ...(requestedRanges ? [] : preparationSpecs(db, engine, base, { custom, requested }))],
+    { retry, supersedeBefore: requested ? undefined : version });
+}
+
+const preparationPhaseLabels = { current: 'Current stock metrics', recent: 'Recent breadth and ranks', history: 'Full history' };
+
+function preparationSummary(db, version) {
+  const records = db.prepare(`SELECT id,status,progress,error,payload,result FROM jobs WHERE type=?
+    AND json_extract(payload,'$.context.dataVersion')=? ORDER BY rowid DESC`).all(preparationType, version);
+  const entries = new Map();
+  for (const row of records) {
+    const { jobKey, context, label, phase } = JSON.parse(row.payload);
+    if (entries.has(jobKey)) continue;
+    const detail = row.result ? JSON.parse(row.result) : {};
+    entries.set(jobKey, { id: row.id, universe: context.universe, universeVersion: context.universeVersion,
+      model: context.model, modelVersion: context.modelVersion, basis: context.basis, benchmark: context.benchmark, classification: context.classification,
+      reference: context.reference, date: context.date, phase, phaseLabel: preparationPhaseLabels[phase], label,
+      status: row.status, progress: row.progress, completedSessions: detail.completedSessions ?? 0, totalSessions: detail.totalSessions ?? null,
+      error: row.error, estimatedRemainingSeconds: detail.estimatedRemainingSeconds ?? null });
+  }
+  const targets = [...entries.values()];
+  const result = { dataVersion: version, total: targets.length, complete: 0, running: 0, queued: 0, failed: 0, superseded: 0, universes: [] };
+  const groups = new Map();
+  const contexts = new Map();
+  for (const target of targets) {
+    result[target.status]++;
+    const group = groups.get(target.universe) || { universe: target.universe, complete: 0, total: 0, stages: {} };
+    group.total++;
+    group.complete += Number(target.status === 'complete');
+    const stage = group.stages[target.phase] ||= { complete: 0, total: 0 };
+    stage.total++;
+    stage.complete += Number(target.status === 'complete');
+    groups.set(target.universe, group);
+    if (target.label !== 'Registered calculation') {
+      const key = JSON.stringify([target.universe, target.universeVersion, target.model, target.modelVersion,
+        target.basis, target.benchmark, target.classification, target.reference, target.date]);
+      const point = contexts.get(key) || { universe: target.universe, universeVersion: target.universeVersion,
+        model: target.model, modelVersion: target.modelVersion, basis: target.basis, benchmark: target.benchmark, classification: target.classification,
+        reference: target.reference, date: target.date, stages: {} };
+      point.stages[target.phase] = target.status;
+      contexts.set(key, point);
+    }
+  }
+  result.universes = [...groups.values()];
+  const rangeRows = db.prepare(`SELECT type,status,count(*) AS total FROM jobs WHERE type IN (?,?)
+    AND json_extract(payload,'$.context.dataVersion')=? GROUP BY type,status`).all(rangeType, rangeHistoryType, version);
+  const detailRows = db.prepare(`SELECT status,count(*) AS total FROM jobs WHERE type=?
+    AND json_extract(payload,'$.context.dataVersion')=? GROUP BY status`).all(detailType, version);
+  const detailCurrent = db.prepare(`SELECT id,status,progress,updated_at AS updatedAt,result FROM jobs WHERE type=?
+    AND json_extract(payload,'$.context.dataVersion')=? AND status='running' ORDER BY rowid DESC LIMIT 1`).get(detailType, version);
+  return { ...result, contexts: [...contexts.values()], current: targets.find(({ status }) => status === 'running') ?? null,
+    failures: targets.filter(({ status }) => status === 'failed').slice(0, 8),
+    stockDetails: { ...Object.fromEntries(detailRows.map(({ status, total }) => [status, total])),
+      current: detailCurrent ? { ...detailCurrent, result: detailCurrent.result ? JSON.parse(detailCurrent.result) : null } : null },
+    ranges: { current: Object.fromEntries(rangeRows.filter(({ type }) => type === rangeType).map(({ status, total }) => [status, total])),
+      history: Object.fromEntries(rangeRows.filter(({ type }) => type === rangeHistoryType).map(({ status, total }) => [status, total])) } };
+}
+
 function localStatus(db) {
   const status = warehouseStatus(db);
-  return { ...status, bootstrap: bootstrapProgress(db), latestAnalysis: latestAnalysis(db, status.dataVersion) };
+  const now = new Date();
+  const after = marketSyncAfter(process.env.MARKET_SYNC_AFTER);
+  const session = latestFinalizableSession(now, after);
+  const backup = db.prepare(`SELECT id,updated_at,result FROM jobs WHERE type='backup' AND status='complete'
+    AND json_extract(result,'$.quickCheck')='ok' ORDER BY updated_at DESC LIMIT 1`).get();
+  const verified = backup && JSON.parse(backup.result);
+  return { ...status, bootstrap: bootstrapProgress(db), latestAnalysis: latestAnalysis(db, status.dataVersion),
+    lastVerifiedBackup: backup ? { jobId: backup.id, completedAt: verified.completedAt ?? backup.updated_at,
+      dataVersion: verified.dataVersion, latestDate: verified.latestDate, bytes: verified.bytes, sha256: verified.sha256 } : null,
+    preparation: preparationSummary(db, status.dataVersion), captureSchedule: { enabled: process.env.MARKET_SYNC === '1' && !!process.env.EODHD_API_KEY,
+      ...dailyCaptureAvailability(db, session, now, after) } };
+}
+
+function securitySearch(db, config, search, limit) {
+  if (!config.date || !search) return [];
+  const upper = search.toUpperCase();
+  const literal = upper.replace(/[!%_]/g, '!$&');
+  const prefix = literal + '%';
+  const match = '%' + literal + '%';
+  return db.prepare(`WITH refs AS (
+    SELECT s.id, r.definition FROM securities s JOIN reference_revisions r ON r.security_id=s.id AND r.version=(
+      SELECT version FROM reference_revisions WHERE security_id=s.id AND version<=? AND (?=0 OR known_at<=?)
+      ORDER BY version DESC LIMIT 1)
+  ), aliases AS (
+    SELECT refs.id AS securityId,json_extract(definition,'$.name') AS name,json_extract(definition,'$.type') AS type,
+      json_extract(a.value,'$.symbol') AS symbol,json_extract(a.value,'$.exchange') AS exchange,
+      (SELECT json_extract(old.value,'$.symbol') FROM json_each(json_extract(definition,'$.identifiers')) old
+        WHERE json_extract(old.value,'$.valid_from')<=? AND json_extract(old.value,'$.symbol')<>json_extract(a.value,'$.symbol')
+          AND upper(json_extract(old.value,'$.symbol')) LIKE ? ESCAPE '!'
+        ORDER BY (upper(json_extract(old.value,'$.symbol'))=?) DESC,json_extract(old.value,'$.valid_from') DESC LIMIT 1) AS matchedAlias,
+      row_number() OVER (PARTITION BY refs.id ORDER BY json_extract(a.value,'$.valid_from') DESC,json_extract(a.value,'$.symbol')) AS position
+    FROM refs,json_each(json_extract(definition,'$.identifiers')) a
+    WHERE json_extract(a.value,'$.valid_from')<=? AND (json_extract(a.value,'$.valid_to') IS NULL OR json_extract(a.value,'$.valid_to')>=?)
+      AND (json_extract(definition,'$.listing_date') IS NULL OR json_extract(definition,'$.listing_date')<=?)
+      AND (json_extract(definition,'$.delisting_date') IS NULL OR json_extract(definition,'$.delisting_date')>=?)
+  )
+  SELECT securityId,symbol,name,exchange,type,matchedAlias FROM aliases
+  WHERE position=1 AND (upper(symbol) LIKE ? ESCAPE '!' OR upper(name) LIKE ? ESCAPE '!' OR matchedAlias IS NOT NULL)
+  ORDER BY CASE WHEN upper(symbol)=? THEN 0 WHEN upper(matchedAlias)=? THEN 1
+    WHEN upper(symbol) LIKE ? ESCAPE '!' THEN 2 ELSE 3 END,symbol,securityId LIMIT ?`)
+    .all(config.dataVersion, Number(config.basis === 'known'), config.date, config.date, match, upper,
+      config.date, config.date, config.date, config.date, match, match, upper, upper, prefix, limit);
+}
+
+function stockIdentity(db, config, raw) {
+  const read = db.prepare(`SELECT definition FROM reference_revisions WHERE security_id=? AND version<=?
+    AND (?=0 OR known_at<=?) ORDER BY version DESC LIMIT 1`);
+  const lookup = (id) => read.get(id, config.dataVersion, Number(config.basis === 'known'), config.date);
+  let reference = lookup(raw);
+  if (!reference) {
+    const symbol = normalizeSymbol(raw);
+    const matches = securitySearch(db, config, symbol, 25).filter((row) => row.symbol === symbol);
+    if (matches.length !== 1) return null;
+    reference = lookup(matches[0].securityId);
+  }
+  return reference ? JSON.parse(reference.definition) : null;
+}
+
+function requireStockIdentity(db, config, id) {
+  const identity = stockIdentity(db, config, id);
+  if (!identity && config.basis === 'known') {
+    throw asError('No matching security identifier was known for the selected trading session and revision.', 404);
+  }
+  return exists(identity, 'Security');
 }
 
 function latestAnalysis(db, version) {
@@ -554,10 +951,9 @@ function latestAnalysis(db, version) {
   return ready && { ...ready, calculationVersion: CALCULATION_VERSION };
 }
 
-function quality(db, engine, config) {
+function quality(db, engine, config, snapshot = engine.snapshot(config)) {
   const status = localStatus(db);
-  const snapshot = engine.snapshot(config);
-  const last = latestFinalizableSession();
+  const last = latestFinalizableSession(new Date(), marketSyncAfter(process.env.MARKET_SYNC_AFTER));
   const sessionDates = config.earliestDate && config.date ? expectedSessions(config.earliestDate, config.date) : [];
   const observedDates = config.currentVersion
     ? db.prepare('SELECT DISTINCT date FROM daily_prices').all()
@@ -588,51 +984,32 @@ function quality(db, engine, config) {
   };
 }
 
-function riskMetrics(detail, benchmark) {
-  const bars = detail.chartBars || detail.bars;
-  const benchmarkDates = new Map(benchmark?.map((row) => [row.date, row.close]) || []);
-  const returns = [];
-  const pairing = [];
-  let peak = 0;
-  let drawdown = 0;
-  let previous;
-  let priced = 0;
-  for (const bar of bars) {
-    if (!bar.traded || !(bar.close > 0) || bar.unverifiedSplit) {
-      previous = null;
-      if (bar.unverifiedSplit || bar.priceQuarantined) peak = 0;
-      continue;
-    }
-    priced++;
-    peak = Math.max(peak, bar.close);
-    drawdown = Math.min(drawdown, bar.close / peak - 1);
-    if (previous) {
-      const value = bar.close / previous.close - 1;
-      returns.push(value);
-      if (benchmarkDates.get(previous.date) > 0 && benchmarkDates.get(bar.date) > 0) {
-        pairing.push([value, benchmarkDates.get(bar.date) / benchmarkDates.get(previous.date) - 1]);
-      }
-    }
-    previous = bar;
-  }
-  const x = mean(pairing.map((item) => item[0]));
-  const y = mean(pairing.map((item) => item[1]));
-  const covariance = mean(pairing.map(([a, b]) => (a - x) * (b - y)));
-  const stockVariance = mean(pairing.map(([a]) => (a - x) ** 2));
-  const benchmarkVariance = mean(pairing.map(([, b]) => (b - y) ** 2));
-  return {
-    observations: returns.length, benchmarkObservations: pairing.length,
-    maximumDrawdown: priced ? drawdown : null,
-    beta: pairing.length >= 20 && benchmarkVariance > 0 ? covariance / benchmarkVariance : null,
-    correlation: pairing.length >= 20 && stockVariance > 0 && benchmarkVariance > 0 ? covariance / Math.sqrt(stockVariance * benchmarkVariance) : null,
-    dailyHistoricalReturn5pct: returns.length >= 20 ? quantile(returns, 0.05) : null,
-    dailyHistoricalVaR95: returns.length >= 20 ? Math.max(0, -quantile(returns, 0.05)) : null,
-    annualizedVolatility: detail.volatility_20d, atr14: detail.atr_14d,
-  };
+function preparedStockDetail(db, config, security, snapshot, archive) {
+  const stock = snapshot?.stocks.find((row) => row.securityId === security.id);
+  const stored = archive.detail || {};
+  const current = stored.chartBars?.find((bar) => bar.date === config.date);
+  const quality = stored.quality || qualityOverrides(db, { version: config.dataVersion, knownThrough: config.basis === 'known' ? config.date : undefined })
+    .filter((item) => item.security_id === security.id && item.effective_from <= config.date);
+  const identity = security.identifiers?.filter((alias) => alias.valid_from <= config.date && (!alias.valid_to || alias.valid_to >= config.date))
+    .sort((a, b) => b.valid_from.localeCompare(a.valid_from) || a.symbol.localeCompare(b.symbol))[0];
+  const fallback = { symbol: identity?.symbol || security.identifiers?.at(-1)?.symbol || security.id, name: security.name,
+    exchange: identity?.exchange || security.exchange, type: security.type, isin: security.isin, listingDate: security.listing_date,
+    delistingDate: security.delisting_date, close: current?.close ?? null, traded: current?.traded ?? null };
+  return { ...fallback, ...stored, ...stock,
+    securityId: security.id, date: config.date, referenceDate: snapshot?.referenceDate || config.date, referenceMode: snapshot?.referenceMode || 'as-of',
+    classificationSystem: snapshot?.classificationSystem || config.classification, dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION,
+    ...(snapshot?.sourceDataVersion != null ? { sourceDataVersion: snapshot.sourceDataVersion } : {}),
+    aliases: security.identifiers, quality, bars: stored.bars || [], chartBars: stored.chartBars || [],
+    warnings: [...(stored.warnings || []), snapshot && !stock && 'Security falls outside the prepared universe on this session.',
+      !Object.hasOwn(stored, 'loadedHistoryHigh') && (!stock || !Object.hasOwn(stock, 'loadedHistoryHigh'))
+        ? 'Lifetime highs are unavailable for this prepared stock view.' : null,
+      ...quality.map(({ reason }) => reason)].filter(Boolean) };
 }
 
-function updateAlerts(db, engine, params = {}) {
+function updateAlerts(db, engine, params = {}, { rangeOnly = false } = {}) {
   let fired = 0;
+  let evaluated = 0;
+  const deferred = [];
   const at = new Date().toISOString();
   const persist = db.prepare('INSERT OR IGNORE INTO alert_events VALUES (?, ?, ?, ?)');
   const rules = listWorkspace(db, 'alert-rule');
@@ -641,8 +1018,12 @@ function updateAlerts(db, engine, params = {}) {
     if (def.active === false) continue;
     const saved = def.type === 'screen' ? getWorkspace(db, 'screen', def.screenId) : null;
     if (def.type === 'screen' && !saved) continue;
+    const screen = saved?.definition ?? { filter: def.filter, context: def.context };
+    const stockRule = def.type === 'screen' || def.type === 'stocks';
+    const windows = stockRule ? rangeWindowsForScreen(screen) : [];
+    if (rangeOnly && !windows.length) continue;
     const config = engine.context({ ...params, ...def.context, ...saved?.definition.context,
-      ...(saved ? { date: params.date, dataVersion: params.dataVersion } : {}),
+      ...(params.date ? { date: params.date } : {}), ...(params.dataVersion != null ? { dataVersion: params.dataVersion } : {}),
       ...(def.type === 'breadth' ? { breadthKeys: [def.metric] } : screenDataNeeds(saved?.definition ?? def)) });
     if (!config.date) continue;
     const lag = def.type === 'breadth' && def.trigger === 'surge' ? def.lookback : 1;
@@ -650,7 +1031,11 @@ function updateAlerts(db, engine, params = {}) {
     const previousDate = dates.at(-1 - lag);
     if (!previousDate) continue;
     const beforeConfig = { ...config, date: previousDate, requestedDate: previousDate };
-    const stockRule = def.type === 'screen' || def.type === 'stocks';
+    const ranges = windows.length ? [config, beforeConfig].map((point) => readPreparedRangeMetrics(db, rangeContext(engine, point), windows)) : [];
+    if (ranges.some((entry) => !entry.ready)) {
+      deferred.push({ ruleId: rule.id, reason: 'Rolling range metrics are not prepared', windows });
+      continue;
+    }
     const current = engine.snapshot(config, { velocity: stockRule });
     const before = engine.snapshot(beforeConfig, { velocity: stockRule });
     const base = { ruleId: rule.id, name: rule.name, rule: def, date: config.date,
@@ -675,19 +1060,27 @@ function updateAlerts(db, engine, params = {}) {
       }
     }
     if (stockRule) {
-      const screen = saved?.definition ?? { filter: def.filter };
       const expression = def.type === 'stocks' ? screen.filter?.expression : null;
       const options = expression ? { all: true, computed: [{ field: 'custom_alert_condition', expression }] } : { ...screen, all: true };
-      const latest = historicalScreen(engine, config, options, current).rows;
-      const previous = historicalScreen(engine, beforeConfig, options, before).rows;
+      const currentRowsWithRange = ranges.length ? applyPreparedRangeMetrics(current, ranges[0]) : current;
+      const beforeRowsWithRange = ranges.length ? applyPreparedRangeMetrics(before, ranges[1]) : before;
+      let latest, previous;
+      try {
+        latest = historicalScreen(db, engine, config, options, currentRowsWithRange).rows;
+        previous = historicalScreen(db, engine, beforeConfig, options, beforeRowsWithRange).rows;
+      } catch (error) {
+        if (!error.preparation) throw error;
+        deferred.push({ ruleId: rule.id, reason: error.message, ...error.preparation.materialization });
+        continue;
+      }
       const comparable = (snapshot) => new Set(snapshot.stocks.filter((row) => row.traded && alertComparable(def.filter, row)).map((row) => row.securityId));
       const states = (selected, snapshot) => {
         if (expression) return new Map(selected.map((row) => [row.securityId, row.custom_alert_condition]));
         const comparableIds = def.type === 'stocks' ? comparable(snapshot) : new Set();
         return new Map([...comparableIds].map((id) => [id, false]).concat(selected.map((row) => [row.securityId, true])));
       };
-      const active = states(latest, current);
-      const older = states(previous, before);
+      const active = states(latest, currentRowsWithRange);
+      const older = states(previous, beforeRowsWithRange);
       const priorRows = new Map(previous.map((row) => [row.securityId, row]));
       const currentRows = new Map(latest.map((row) => [row.securityId, row]));
       for (const [id, state] of active) if (state === true && (saved ? !older.has(id) : older.get(id) === false) && def.direction !== 'leaves') {
@@ -712,8 +1105,9 @@ function updateAlerts(db, engine, params = {}) {
         event('market', { regime: health[1].regime, previousRegime: health[0].regime });
       }
     }
+    evaluated++;
   }
-  return { evaluated: rules.length, fired };
+  return { evaluated, fired, deferred };
 }
 
 function alertComparable(filter, row) {
@@ -725,10 +1119,35 @@ function alertComparable(filter, row) {
     || /^udv_/.test(filter.field) && row[filter.field.replace(/^udv_/, 'udv_state_')] === 'infinity';
 }
 
-function divergenceLedger(db, engine, config, model, events, from, coverage = { coverageMode: 'verified' }) {
-  const recipe = createHash('sha256').update(JSON.stringify([
+function healthRecipe(engine, config, model, coverage) {
+  return createHash('sha256').update(JSON.stringify([
     engine.definitionKey(config), config.universe.id, config.universe.version, config.model.id, config.model.version, model, coverage,
   ])).digest('hex');
+}
+
+function healthArchiveRows(db, engine, table, config, model, coverage, dates) {
+  if (!dates.length || !db.prepare("SELECT 1 FROM sqlite_schema WHERE name=?").get(table)) return [];
+  return referenceArchiveScopes(config, dates).flatMap((scope) => {
+    const recipe = healthRecipe(engine, scope.config, model, coverage);
+    const args = [recipe, CALCULATION_VERSION];
+    const versions = db.prepare(`SELECT DISTINCT data_version FROM ${table} WHERE recipe=? AND calculation_version=? AND data_version<=?`)
+      .all(...args, config.dataVersion).map(({ data_version }) => data_version);
+    const bounds = reusableArchiveVersions(db, scope.config, versions);
+    const previousVersions = new Map();
+    const order = table === 'divergence_events' ? ',event' : '';
+    return db.prepare(`SELECT * FROM ${table} WHERE recipe=? AND calculation_version=?
+      AND data_version IN (SELECT value FROM json_each(?)) AND date IN (SELECT value FROM json_each(?))
+      ORDER BY date,data_version DESC${order}`).all(...args, JSON.stringify([...bounds.keys()]), JSON.stringify(scope.dates))
+      .filter((row) => {
+        if (!usableArchiveRow(bounds, row)) return false;
+        if (!previousVersions.has(row.date)) previousVersions.set(row.date, row.data_version);
+        return previousVersions.get(row.date) === row.data_version;
+      });
+  }).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function writeDivergences(db, engine, config, model, events, coverage) {
+  const recipe = healthRecipe(engine, config, model, coverage);
   const key = [recipe, config.dataVersion, CALCULATION_VERSION];
   if (events.length) {
     db.exec(`CREATE TABLE IF NOT EXISTS divergence_events (
@@ -740,11 +1159,82 @@ function divergenceLedger(db, engine, config, model, events, from, coverage = { 
     const observedAt = new Date().toISOString();
     for (const event of events) record.run(...key, event.date, event.id, observedAt, JSON.stringify(event));
   }
-  if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE name='divergence_events'").get()) return [];
-  return db.prepare(`SELECT payload,observed_at FROM divergence_events
-    WHERE recipe=? AND data_version=? AND calculation_version=? AND date BETWEEN ? AND ? ORDER BY date,event`)
-    .all(...key, from || config.date, config.date).map(({ payload, observed_at }) => ({ ...JSON.parse(payload), observedAt: observed_at,
-      dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION }));
+}
+
+function divergenceLedger(db, engine, config, model, from, coverage) {
+  const dates = config.date ? expectedSessions(from || config.date, config.date) : [];
+  const covered = new Map(healthArchiveRows(db, engine, 'prepared_health', config, model, coverage, dates)
+    .map((row) => [row.date, row.data_version]));
+  return healthArchiveRows(db, engine, 'divergence_events', config, model, coverage, dates)
+    .filter((row) => covered.get(row.date) === row.data_version)
+    .map(({ payload, observed_at, data_version }) => ({ ...JSON.parse(payload), observedAt: observed_at,
+      dataVersion: data_version, requestedDataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION }));
+}
+
+function readPreparedHealth(db, engine, config, model, coverage, from, limit) {
+  const dates = config.date && config.earliestDate ? expectedSessions(from || config.earliestDate, config.date).slice(-limit) : [];
+  return healthArchiveRows(db, engine, 'prepared_health', config, model, coverage, dates)
+    .map(({ payload, data_version }) => ({ ...JSON.parse(typeof payload === 'string' ? payload : gunzipSync(payload).toString('utf8')),
+      dataVersion: data_version, requestedDataVersion: config.dataVersion }));
+}
+
+function prepareHealth(db, engine, config, { model, coverage, from, limit = 315, allowCompute = false }) {
+  if (!config.earliestDate) return { prepared: 0, date: config.date };
+  const warmup = healthBaseline(model);
+  const seed = from ? shiftDate(from, -2 * warmup - 16) : null;
+  const count = Math.min(7560, limit + warmup);
+  const archived = readMaterializedHistory(db, engine, config, { from: seed, limit: count });
+  const source = archived.rows.length || !allowCompute ? archived.rows
+    : engine.history(config, { from: seed, limit: count, project });
+  if (!source.length) return { prepared: 0, date: config.date, missingDates: archived.missingDates };
+  const sessions = expectedSessions(seed && seed >= config.earliestDate ? seed : config.earliestDate, config.date).slice(-count);
+  const present = new Set(source.map(({ date }) => date));
+  const supported = new Set();
+  let consecutive = 0;
+  for (const [index, date] of sessions.entries()) {
+    consecutive = present.has(date) ? consecutive + 1 : 0;
+    if (consecutive >= Math.min(warmup + 1, index + 1)) supported.add(date);
+  }
+  const targetDates = sessions.filter((date) => (!from || date >= from) && supported.has(date)).slice(-limit);
+  const reused = healthArchiveRows(db, engine, 'prepared_health', config, model, coverage, targetDates);
+  const available = new Set(reused.map(({ date }) => date));
+  const latestPrepared = targetDates.at(-1) ?? null;
+  if (available.size === targetDates.length) {
+    return { prepared: available.size, reused: available.size, date: config.date, dataVersion: config.dataVersion,
+      latestPrepared, missingDates: archived.missingDates };
+  }
+  const targets = new Set(targetDates);
+  const rows = marketHealthHistory(source, { model, sessions, ...coverage })
+    .filter(({ date }) => targets.has(date) && !available.has(date));
+  db.exec(`CREATE TABLE IF NOT EXISTS prepared_health (
+    recipe TEXT NOT NULL, data_version INTEGER NOT NULL, calculation_version TEXT NOT NULL, date TEXT NOT NULL, payload BLOB NOT NULL,
+    PRIMARY KEY (recipe,data_version,calculation_version,date)
+  ) WITHOUT ROWID`);
+  const write = db.prepare('INSERT OR REPLACE INTO prepared_health VALUES (?,?,?,?,?)');
+  const byDate = new Map(rows.map((row) => [row.date, row]));
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const scope of referenceArchiveScopes(config, rows.map(({ date }) => date))) {
+      const key = [healthRecipe(engine, scope.config, model, coverage), config.dataVersion, CALCULATION_VERSION];
+      const scoped = scope.dates.map((date) => byDate.get(date));
+      for (const row of scoped) write.run(...key, row.date, gzipSync(JSON.stringify(row), { level: 3 }));
+      writeDivergences(db, engine, scope.config, model, scoped.flatMap((row) => row.divergences), coverage);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  return { prepared: rows.length + reused.length, reused: reused.length, date: config.date, dataVersion: config.dataVersion, latestPrepared,
+    missingDates: archived.missingDates };
+}
+
+function prepareStandardHealth(db, engine, config, slice = {}) {
+  for (const model of [DEFAULT_HEALTH_MODEL, ...listWorkspace(db, 'health-model').map(({ id, name, version, definition }) => ({ ...definition, id, name, version }))]) {
+    for (const coverage of [researchCoverage(), researchCoverage({ coverageMode: 'observed' })]) {
+      prepareHealth(db, engine, config, { model, coverage, ...slice });
+    }
+  }
 }
 
 function materializationContext(config) {
@@ -756,6 +1246,17 @@ function materializationContext(config) {
     averages: config.averages, windows: config.windows, volumeWindows: config.volumeWindows,
     breadthKeys: config.breadthKeys, themes: config.themes, includeAllTimeHigh: config.includeAllTimeHigh,
   };
+}
+
+function pairedBreadthContext(engine, config) {
+  const keys = new Set(config.breadthKeys);
+  for (const key of config.breadthKeys) {
+    if (!/^(?:up|down)_\d+(?:\.\d+)?pct(?:_\d+d)?$/.test(key)) continue;
+    const opposite = key.startsWith('up_') ? 'down_' + key.slice(3) : 'up_' + key.slice(5);
+    if (breadthMetric(opposite)) keys.add(opposite);
+  }
+  if (keys.size === config.breadthKeys.length) return null;
+  return engine.context({ ...materializationContext(config), breadthKeys: [...keys] });
 }
 
 function queueHistory(engine, config, options, enqueue) {
@@ -781,14 +1282,21 @@ function blockedCapture() {
   return { status: 'waiting_for_capture', captureInProgress: true };
 }
 
-function rankSeries(db, engine, config, options, enqueue, { supplyDemand = false } = {}) {
+function rankSeries(db, engine, config, options, enqueue, { supplyDemand = false, preparedOnly = false } = {}) {
   const archive = readRankArchive(db, engine, config, options);
+  if (archive.observed.size < archive.dates.length) {
+    const compact = readPreparedRanks(db, config, archive.dates.filter((date) => !archive.observed.has(date)), options);
+    for (const date of compact.observed) archive.observed.add(date);
+    archive.rows.push(...compact.rows);
+  }
   const stored = new Map(archive.rows.map((row) => [row.date, row]));
   const require = requiresArchive(db);
-  const visible = options.materializedOnly === '1' || require ? archive.dates.filter((date) => archive.observed.has(date)) : archive.dates.slice(-260);
+  const visible = options.materializedOnly === '1' || require || preparedOnly
+    ? archive.dates.filter((date) => archive.observed.has(date)) : archive.dates.slice(-260);
   let materialization;
-  if (require && archive.observed.size < archive.dates.length && options.materializedOnly !== '1') {
+  if ((require || preparedOnly) && archive.observed.size < archive.dates.length && options.materializedOnly !== '1') {
     if (bootstrapProgress(db, { activeOnly: true })) materialization = blockedCapture();
+    else if (preparedOnly) materialization = preparationStatus(db, engine, config, ['recent', 'history']);
     else {
       const context = materializationContext(config);
       const { from, to, limit, cadence } = options;
@@ -797,7 +1305,10 @@ function rankSeries(db, engine, config, options, enqueue, { supplyDemand = false
     }
   }
   let daily;
-  if (supplyDemand && visible.length && config.basis === 'reconstructed' && options.securityId) {
+  const demandDates = supplyDemand && preparedOnly && options.securityId
+    ? preparedSnapshotDates(db, engine, config, visible) : null;
+  const demandPrepared = [];
+  if (supplyDemand && !preparedOnly && visible.length && config.basis === 'reconstructed' && options.securityId) {
     const start = shiftDate(visible[0], -110);
     const dates = expectedSessions(start, visible.at(-1));
     const bars = engine.studyPrices(config, [options.securityId], start, visible.at(-1)).get(options.securityId) || [];
@@ -812,18 +1323,44 @@ function rankSeries(db, engine, config, options, enqueue, { supplyDemand = false
       const stock = snapshot.stocks.find((item) => item.securityId === options.securityId || item.symbol === options.symbol);
       row = { date, rank: stock?.rsRank ?? null, percentile: stock?.rsPercentile ?? null, score: stock?.rsScore ?? null, udv_50d: stock?.udv_50d ?? null };
     }
+    if (demandDates) {
+      const point = { ...config, date, requestedDate: date };
+      const compact = demandDates.has(date) ? readPreparedSnapshot(db, engine, point, { securityIds: [options.securityId] }) : null;
+      const snapshot = compact || (date === config.date && engine.snapshotAvailable(point)
+        ? engine.snapshot(point, { persist: false, cache: true }) : null);
+      const stock = snapshot?.stocks.find(({ securityId }) => securityId === options.securityId);
+      if (snapshot) demandPrepared.push(date);
+      return { ...row, udv_50d: stock?.udv_50d ?? null, udv_state_50d: stock?.udv_state_50d ?? null,
+        supplyDemandPrepared: !!snapshot };
+    }
     return daily ? { ...row, udv_50d: volumeRatio(daily.bars, daily.dates.get(date), 50).value } : row;
   });
-  return { date: config.date, materialization, rows, archived: archive.observed.size, requested: archive.dates.length };
+  const supplyDemandStatus = demandDates && { state: demandPrepared.length === archive.dates.length ? 'ready' : 'partial',
+    preparedSessions: demandPrepared.length, requestedSessions: archive.dates.length,
+    missingSessions: archive.dates.length - demandPrepared.length,
+    ...(demandPrepared.length !== archive.dates.length && { reason: 'Some sessions do not yet have prepared stock volume readings for this context.' }) };
+  return { date: config.date, materialization, rows, archived: archive.observed.size, requested: archive.dates.length,
+    ...(demandDates && { supplyDemand: supplyDemandStatus }) };
 }
 
-function thinHistory(db, engine, config, options = {}, enqueue = null) {
-  const stored = readMaterializedHistory(db, engine, config, options);
+function thinHistory(db, engine, config, options = {}, enqueue = null, preparedOnly = false) {
+  let stored = readMaterializedHistory(db, engine, config, options);
+  const paired = !stored.complete && pairedBreadthContext(engine, config);
+  if (paired) {
+    const superset = readMaterializedHistory(db, engine, paired, options);
+    if (superset.rows.length > stored.rows.length) stored = superset;
+  }
   const { rows, ...status } = stored;
   const materialization = { ...status, visibleRequested: options.visibleRequested ?? status.requested };
   if (stored.complete || options.materializedOnly) return { rows, materialization };
   if (bootstrapProgress(db, { activeOnly: true })) {
     return { rows, materialization: { ...materialization, ...blockedCapture() } };
+  }
+  if (preparedOnly) {
+    const phases = stored.requested > recentPreparationSessions ? ['history'] : ['recent', 'history'];
+    const exact = preparationStatus(db, engine, config, phases);
+    const status = exact.preparationState === 'unregistered' && paired ? preparationStatus(db, engine, paired, phases) : exact;
+    return { rows, materialization: { ...materialization, ...status } };
   }
 
   const coldCap = requiresArchive(db) ? 0 : 520;
@@ -859,7 +1396,7 @@ function healthBaseline(model = DEFAULT_HEALTH_MODEL) {
   return Math.max(44, ...calibration, Number(model.changeLookback ?? 0), Number(model.benchmarkLookback ?? 0), Number(model.weaknessLookback ?? 0));
 }
 
-function marketHealth(db, engine, config, { model, history, snapshot = engine.snapshot(config), ...coverage } = {}) {
+function marketHealth(db, engine, config, { model, history, snapshot = engine.snapshot(config), preparedOnly = false, ...coverage } = {}) {
   const eligible = snapshot.coverage.state === 'complete' || coverage.coverageMode === 'observed';
   let prior = history ?? (eligible
     ? thinHistory(db, engine, config, { limit: healthBaseline(model) + 1, materializedOnly: true }).rows : []);
@@ -868,7 +1405,7 @@ function marketHealth(db, engine, config, { model, history, snapshot = engine.sn
   if (eligible && config.date) {
     const priorWeek = weekEnd(shiftDate(config.date, -28));
     const exact = expectedSessions(shiftDate(priorWeek, -4), priorWeek).at(-1);
-    if (exact && !prior.some((row) => row.date === exact)) {
+    if (exact && !prior.some((row) => row.date === exact) && (!preparedOnly || engine.snapshotAvailable({ ...config, date: exact }))) {
       prior = [...prior, project(engine.snapshot({ ...config, date: exact }))];
     }
   }
@@ -916,16 +1453,29 @@ async function research(db, engine, kind, payload) {
   if (kind === 'cohort') {
     const date = dateString(payload.date, config.date);
     if (!date || date < start || date > end || !isMarketSession(date)) throw asError('Cohort date is outside the trading session range');
-    const dateConfig = { ...config, date };
-    const selection = resolveScreen(engine, dateConfig, { ...(payload.screen || {}), all: true });
-    const chosen = Array.isArray(payload.members) ? new Set(payload.members) : null;
-    const members = (chosen ? selection.rows.filter((row) => chosen.has(row.securityId)) : selection.rows).map((row) => ({
-      securityId: row.securityId, industry: row.industry, industryKnownAt: row.classificationKnownAt,
-      delistingDate: row.delistingDate,
-    }));
-    const securityPrices = researchPrices(engine, config, members.map(({ securityId }) => securityId), date, end);
-    return { ...analyzeCohort({ sessions, date, members, securityPrices, horizons: payload.horizons, asOf: end, maePrice: payload.maePrice }),
-      priceAvailabilityBasis: config.basis, dataVersion: config.dataVersion };
+    let frozen = payload.frozen;
+    if (!frozen) {
+      const dateConfig = { ...config, date, requestedDate: date };
+      const windows = rangeWindowsForScreen(payload.screen ?? {});
+      const rangeMetrics = windows.length ? readPreparedRangeMetrics(db, rangeContext(engine, dateConfig), windows) : null;
+      if (rangeMetrics && !rangeMetrics.ready) throw asError('Prepare the saved rolling high/low metrics for the cohort entry session');
+      const selection = resolveScreen(db, engine, dateConfig, { ...(payload.screen || {}), all: true }, { rangeMetrics });
+      const chosen = Array.isArray(payload.members) ? new Set(payload.members) : null;
+      const members = (chosen ? selection.rows.filter((row) => chosen.has(row.securityId)) : selection.rows).map((row) => ({
+        securityId: row.securityId, symbol: row.symbol, industry: row.industry, industryKnownAt: row.classificationKnownAt,
+        delistingDate: row.delistingDate,
+      }));
+      frozen = { context: materializationContext(dateConfig), members, calculationVersion: CALCULATION_VERSION };
+    }
+    const { members } = frozen;
+    const ids = members.map(({ securityId }) => securityId);
+    const securityPrices = researchPrices(engine, config, ids, date, end);
+    const result = analyzeCohort({ sessions, date, members, securityPrices, horizons: payload.horizons, asOf: end, maePrice: payload.maePrice });
+    const saved = payload.name && !payload.frozen ? storeWorkspace(db, 'cohort', { name: payload.name, definition: {
+      date, screen: payload.screen, horizons: payload.horizons, maePrice: payload.maePrice, frozen,
+    } }) : null;
+    return { ...result, frozenMemberCount: members.length, selectionContext: frozen.context, selectionCalculationVersion: frozen.calculationVersion,
+      ...(saved && { cohortId: saved.id }), priceAvailabilityBasis: config.basis, dataVersion: config.dataVersion };
   }
   const dates = sessions.filter((date) => date <= dateString(payload.end, end));
   const symbols = Array.isArray(payload.benchmarks) ? payload.benchmarks.slice(0, 10).map(String) : [config.benchmark, 'QQQ', 'IWM'];
@@ -1021,7 +1571,7 @@ function journalCsv(entries) {
   return csvRows(rows, columns.length ? columns : ['asOfDate', 'availableAt', 'tradableDate', 'sentimentScore']);
 }
 
-export async function performJob(db, type, payload, { provider = EodhdProvider(), progress = () => {}, journalClient } = {}) {
+export async function performJob(db, type, payload, { provider = EodhdProvider(), progress = () => {}, journalClient, now = () => new Date() } = {}) {
   const engine = createEngine(db);
   if (type === 'leadership-transitions') {
     const config = engine.context(payload.context || {});
@@ -1080,11 +1630,23 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
       ORDER BY started_at DESC LIMIT 1`).get(dataset, date)?.records,
   });
   if (type === 'provider-import') {
+    if (Number.isInteger(payload.captureAttempt)) {
+      const clock = now();
+      const after = marketSyncAfter(process.env.MARKET_SYNC_AFTER);
+      const obsolete = payload.scheduledFor !== latestFinalizableSession(clock, after);
+      const expired = payload.captureAttempt > 1 && !availabilityClock(payload.scheduledFor, clock, after).inWindow;
+      if (obsolete || expired) return { imported: 0, dates: [], published: [], alreadyPublished: [], stillPending: [payload.scheduledFor],
+        downloadSkipped: true, sourceAvailability: obsolete ? 'superseded' : 'exhausted',
+        warnings: [obsolete ? 'A newer finalized session became available before this automatic request started.'
+          : 'The source availability retry window ended before this automatic request started.'] };
+      if (bulkSessionStatus(db, payload.scheduledFor, { verifiedOnly: true })) payload = { ...payload, localOnly: true };
+    }
     const options = providerOptions(payload);
     const dates = providerDates(payload, options);
     if (options.bulk && !dates.length) throw new Error('No exchange sessions in the selected range');
-    const captureStatus = (date) => bulkSessionStatus(db, date, { verifiedOnly: !!payload.verifiedOnly });
-    const shouldFetch = !options.bulk || payload.force || dates.some((date) => !captureStatus(date));
+    const captureStatus = (date) => payload.skipCaptured ? rawBulkReceipt(db, date)
+      : bulkSessionStatus(db, date, { verifiedOnly: !!payload.verifiedOnly });
+    const shouldFetch = !payload.localOnly && (!options.bulk || payload.force || dates.some((date) => !captureStatus(date)));
     let result = { provider: 'eodhd', scope: 'full', dates: [], imported: 0, warnings: [] };
     let sourceError;
     if (shouldFetch) {
@@ -1117,23 +1679,71 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
     }
     const hasPublication = published.length > 0 || alreadyPublished.length > 0;
     if (!hasPublication && sourceError) throw sourceError;
-    if (payload.verifiedOnly && !hasPublication && stillPending.length) {
+    const partialScheduled = Number.isInteger(payload.captureAttempt) && stillPending.length > 0 && !!rawBulkReceipt(db, dates.at(-1));
+    if (payload.verifiedOnly && !hasPublication && stillPending.length && !partialScheduled) {
       throw new Error('Finalized price response was too incomplete to publish analytics');
     }
     if (sourceError) result.warnings.push(sourceError.message);
     if (stillPending.length) {
       result.warnings.push(`Verified analytics remain pending for ${stillPending.length} requested trading session${stillPending.length === 1 ? '' : 's'} with incomplete coverage.`);
     }
-    return { ...result, published, alreadyPublished, stillPending };
+    return { ...result, published, alreadyPublished, stillPending, ...(partialScheduled ? { sourceAvailability: 'partial' } : {}),
+      ...(!shouldFetch ? { downloadSkipped: true } : {}) };
+  }
+  if (type === 'health-precompute') {
+    const config = engine.context(payload.context);
+    const model = chooseHealthModel(db, payload.healthModel);
+    const result = prepareHealth(db, engine, config, { model, coverage: researchCoverage(payload),
+      limit: parseCount(payload.limit, 1, 7560, 315), from: dateString(payload.from, null), allowCompute: !payload.preparedOnly });
+    if (!result.prepared || result.latestPrepared !== config.date) throw asError('Prepare the market history for this exact context before preparing health');
+    return result;
   }
   if (type === 'workspace-precompute') return precomputeWorkspace(db, engine, engine.context(payload.context || {}), { ...payload, progress });
+  if (type === preparationType) {
+    const result = runPreparation(db, engine, payload, progress);
+    const point = engine.context(payload.context);
+    if (payload.phase === 'history' && !payload.baseComplete && (result.batch?.baseComplete || !result.continuation) && point.universe.id === 'nyse' && point.model.id === 'composite'
+      && point.basis === 'reconstructed' && point.referenceMode === 'as-of' && !point.breadthKeys.length
+      && point.classification === summationContext(db, engine, point).classification) {
+      result.summation = prepareNyseSummation(db, engine, point);
+    }
+    if (payload.phase === 'history') result.baseComplete = !!(result.batch?.baseComplete || payload.baseComplete);
+    if (result.batch?.standard && result.batch.sessions) {
+      const { from, to, sessions } = result.batch;
+      prepareStandardHealth(db, engine, { ...point, date: to, requestedDate: to }, { from, limit: sessions });
+    }
+    if (payload.phase === 'recent' && payload.recentOrder && !result.continuation) prepareStandardHealth(db, engine, point);
+    return result;
+  }
+  if (type === rangeType) {
+    requirePreparationSpace(db);
+    const point = engine.context(payload.context);
+    const onSecurity = payload.persistDetails ? createPreparedDetailWriter(db, engine, point) : undefined;
+    const result = prepareRangeMetrics(db, engine, point, payload.windows, { progress, onSecurity });
+    if (point.dataVersion === dataVersion(db)) {
+      result.alerts = updateAlerts(db, engine, { date: point.latestDate, dataVersion: point.dataVersion }, { rangeOnly: true });
+    }
+    return result;
+  }
+  if (type === detailType) {
+    requirePreparationSpace(db);
+    const config = engine.context(payload.context);
+    const result = prepareDetailsBatch(db, engine, config, { cursor: payload.cursor, securityIds: payload.securityIds,
+      benchmarks: payload.benchmarks, riskWindows: payload.riskWindows, progress });
+    return { ...result, completedSessions: result.processedSecurities, totalSessions: result.totalSecurities,
+      ...(result.done ? {} : { continuation: { cursor: result.cursor } }) };
+  }
+  if (type === rangeHistoryType) {
+    requirePreparationSpace(db, 60);
+    const { prepareRangeHistoryBatch } = await import('./range-metrics.mjs');
+    const result = prepareRangeHistoryBatch(db, engine, engine.context(payload.context), payload.windows, { cursor: payload.cursor, progress });
+    return { ...result, completedSessions: result.processedSecurities, totalSessions: result.totalSecurities,
+      ...(result.done ? {} : { continuation: { cursor: result.cursor } }) };
+  }
   if (type === 'production-precompute') {
     const config = engine.context({ ...workspaceDefaults(db), ...payload.context });
     const result = precomputeProduction(db, engine, config, { ...payload, progress });
-    const history = readMaterializedHistory(db, engine, config, { limit: 45 }).rows;
-    const sessions = history.length ? expectedSessions(history[0].date, config.date) : [];
-    divergenceLedger(db, engine, config, DEFAULT_HEALTH_MODEL,
-      marketHealthHistory(history, { sessions }).flatMap((day) => day.divergences), history[0]?.date);
+    prepareStandardHealth(db, engine, config);
     return result;
   }
   if (type === 'rank-materialize') return writeRankArchive(db, engine, engine.context(payload.context || {}), { ...payload, progress });
@@ -1163,9 +1773,24 @@ function checkpointJobWrites(db) {
 
 export async function runQueuedJob(db, job, { provider, journalClient } = {}) {
   try {
-    const progress = (step) => updateJob(db, job.id, 'running', Math.max(1, Math.min(99, Math.round(step * 99))));
+    const progress = (step) => db.prepare('UPDATE jobs SET updated_at=?,progress=? WHERE id=? AND status=\'running\'')
+      .run(new Date().toISOString(), Math.max(1, Math.min(99, Math.round(step * 99))), job.id);
     const result = await performJob(db, job.type, job.payload, { provider, journalClient, progress });
-    updateJob(db, job.id, 'complete', 100, result);
+    if ([preparationType, rangeHistoryType, detailType].includes(job.type) && result.continuation) {
+      const { continuation, ...checkpoint } = result;
+      const payload = JSON.stringify({ ...job.payload, ...continuation, ...(checkpoint.baseComplete && { baseComplete: true }) });
+      const superseded = preparationSuperseded(db, job.payload);
+      db.prepare("UPDATE jobs SET status=?,updated_at=?,progress=?,payload=?,result=?,error=? WHERE id=?")
+        .run(superseded ? 'superseded' : 'queued', new Date().toISOString(), Math.floor(100 * checkpoint.completedSessions / checkpoint.totalSessions),
+          payload, JSON.stringify(checkpoint), superseded ? 'A newer warehouse revision superseded remaining preparation' : null, job.id);
+    } else {
+      updateJob(db, job.id, 'complete', 100, result);
+      if (process.env.MARKET_PRECOMPUTE === '1' && (job.type === 'provider-bootstrap' && result.state === 'complete'
+        || job.type === 'provider-import' && !job.payload.verifiedOnly && result.imported > 0)) {
+        try { schedulePreparation(db, createEngine(db)); }
+        catch (error) { console.error('Unable to plan post-import preparation:', error.message); }
+      }
+    }
   } catch (error) {
     if (db.isTransaction) db.exec('ROLLBACK');
     updateJob(db, job.id, 'failed', 0, null, error.message);
@@ -1174,7 +1799,7 @@ export async function runQueuedJob(db, job, { provider, journalClient } = {}) {
   }
 }
 
-export function createService({ db, provider, journalClient, workers = true } = {}) {
+export function createService({ db, provider, journalClient, workers = true, preparedOnly = process.env.MARKET_PRECOMPUTE === '1' } = {}) {
   const engine = createEngine(db);
   const workerPath = new URL('./job-worker.mjs', import.meta.url);
   let pumpScheduled = false;
@@ -1214,9 +1839,27 @@ export function createService({ db, provider, journalClient, workers = true } = 
     if (db.isTransaction) { schedulePump(1000); return; }
     let job;
     try {
-      const waiting = db.prepare("SELECT id FROM jobs WHERE status='queued' ORDER BY rowid LIMIT 1").get();
+      const waiting = db.prepare(`WITH queued AS (
+          SELECT id,type,updated_at,rowid, result, json_extract(payload,'$.phase') AS phase,
+            json_extract(payload,'$.context.universe') AS universe,json_extract(payload,'$.context.model') AS model,
+            json_extract(payload,'$.context.basis') AS basis,json_extract(payload,'$.context.reference') AS reference,
+            json_type(payload,'$.securityIds')='array' AS selected_details
+          FROM jobs WHERE status='queued'
+        )
+        SELECT id FROM queued ORDER BY CASE
+          WHEN type IN ('provider-import','provider-bootstrap','provider-reference','nasdaq-refresh','backup','production-precompute') THEN -1
+          WHEN type=? THEN 7
+          WHEN type=? THEN 2
+          WHEN type=? THEN CASE WHEN selected_details THEN 0 ELSE 2 END
+          WHEN type<>? THEN 0
+          WHEN (phase='current' OR phase='recent') AND universe IN ('us-core','us-all') AND model='composite'
+            AND basis='reconstructed' AND reference='latest' THEN CASE phase WHEN 'current' THEN 1 ELSE 3 END
+          WHEN phase='history' AND universe='nyse' AND model='composite' AND basis='reconstructed'
+            AND reference='as-of' AND coalesce(json_extract(result,'$.baseComplete'),0)=0 THEN 4
+          WHEN phase='current' THEN 5
+          WHEN phase='recent' THEN 6 ELSE 7 END, updated_at, rowid LIMIT 1`).get(rangeHistoryType, rangeType, detailType, preparationType);
       if (!waiting) return;
-      const claimed = db.prepare(`UPDATE jobs SET status='running',progress=1,updated_at=?
+      const claimed = db.prepare(`UPDATE jobs SET status='running',progress=max(progress,1),updated_at=?
         WHERE id=? AND status='queued' AND NOT EXISTS (SELECT 1 FROM jobs WHERE status='running') RETURNING id`)
         .get(new Date().toISOString(), waiting.id);
       if (!claimed) { schedulePump(1000); return; }
@@ -1247,7 +1890,7 @@ export function createService({ db, provider, journalClient, workers = true } = 
     if (key) {
       db.exec('BEGIN IMMEDIATE');
       try {
-        const retainAttempt = type === 'backup' && payload.scheduledFor != null;
+        const retainAttempt = type === 'backup' && payload.scheduledFor != null || type === 'provider-import' && Number.isInteger(payload.captureAttempt);
         const existing = db.prepare(`SELECT id FROM jobs WHERE type=? AND (status IN ('queued','running') OR ?)
           AND json_extract(payload, '$.jobKey')=? ORDER BY created_at DESC LIMIT 1`).get(type, Number(retainAttempt), key);
         if (existing) {
@@ -1268,7 +1911,77 @@ export function createService({ db, provider, journalClient, workers = true } = 
 
   if (db.prepare("SELECT 1 FROM jobs WHERE status='queued' LIMIT 1").get()) schedulePump();
 
+  let scheduledPreparation;
+  function prepareStandard({ date, version, requested, retry = false } = {}) {
+    const identity = JSON.stringify([date, version ?? dataVersion(db)]);
+    if (!requested && !retry && scheduledPreparation === identity) return { jobs: [], queued: 0 };
+    const result = schedulePreparation(db, engine, { date, version, requested, retry });
+    if (!requested && !retry && !result.waitingForCapture) scheduledPreparation = identity;
+    if (result.queued) schedulePump();
+    return result;
+  }
+
+  const historyFor = (config, options) => thinHistory(db, engine, config, options, enqueue, preparedOnly);
+  function pendingPreparation(config, phase = 'current') {
+    if (bootstrapProgress(db, { activeOnly: true })) return blockedCapture();
+    const status = preparationStatus(db, engine, config, phase);
+    if (phase === 'current' && status.preparationState === 'unregistered' && config.date < config.latestDate) {
+      return preparationStatus(db, engine, config, ['recent', 'history']);
+    }
+    return status;
+  }
+
+  function preparedView(config, options = {}) {
+    const result = readPreparedSnapshot(db, engine, config, options);
+    if (result) return { ...result, requestedDate: config.requestedDate };
+    const superset = pairedBreadthContext(engine, config);
+    if (superset) {
+      const compact = readPreparedSnapshot(db, engine, superset, options);
+      if (compact) return { ...compact, requestedDate: config.requestedDate };
+      if (engine.snapshotAvailable(superset, options)) {
+        const wide = engine.snapshot(superset, { ...options, persist: false });
+        const ids = options.securityIds == null ? null : new Set(options.securityIds);
+        return { ...wide, requestedDate: config.requestedDate, ...(ids && { stocks: wide.stocks.filter(({ securityId }) => ids.has(securityId)) }) };
+      }
+    }
+    return null;
+  }
+
+  function preparedTickerSnapshot(config, securityId, velocity) {
+    const flags = { velocity, securityIds: [securityId] };
+    const compact = preparedView(config, flags);
+    if (compact) return compact;
+    if (!engine.snapshotAvailable(config, { velocity })) return null;
+    const wide = engine.snapshot(config, { velocity, persist: false, cache: true });
+    return { ...wide, stocks: wide.stocks.filter((row) => row.securityId === securityId) };
+  }
+
+  function readSnapshot(config, { velocity = false, summary = false } = {}) {
+    if (!preparedOnly || engine.snapshotAvailable(config, { velocity })) {
+      return { snapshot: engine.snapshot(config, { velocity, persist: !preparedOnly }) };
+    }
+    const compact = preparedView(config, { velocity });
+    if (compact) return { snapshot: compact };
+    const preparation = pendingPreparation(config);
+    if (summary) {
+      const [archived] = readMaterializedHistory(db, engine, config, { limit: 1 }).rows;
+      if (archived?.date === config.date) return { snapshot: { ...archived, stocks: [] }, preparation };
+    }
+    return { snapshot: { date: config.date, universe: config.universe, model: config.model, dataVersion: config.dataVersion,
+      coverage: { state: 'unprepared', listed: null, traded: null }, stocks: [], groups: [], breadth: {}, aggregates: {} }, preparation };
+  }
+
   function velocityOptions(config) {
+    if (preparedOnly) {
+      const history = (point, flags = {}) => engine.snapshotAvailable(point, flags)
+        ? engine.snapshot(point, { ...flags, persist: false }) : preparedView(point, flags);
+      if (engine.snapshotAvailable(config, { velocity: true })) return { velocity: true, [resolvedHistory]: history };
+      const velocity = preparedView(config, { velocity: true });
+      if (velocity) return { velocity: true, [resolvedSnapshot]: velocity, [resolvedHistory]: history };
+      const base = engine.snapshotAvailable(config) ? null : preparedView(config);
+      return { velocity: false, ...(base ? { [resolvedSnapshot]: base } : engine.snapshotAvailable(config) ? {} : { unprepared: true }),
+        [resolvedHistory]: history, materialization: pendingPreparation(config) };
+    }
     if (!requiresArchive(db) || engine.snapshotAvailable(config, { velocity: true })) return { velocity: true };
     if (!config.date || !config.earliestDate) return { velocity: false };
     if (bootstrapProgress(db, { activeOnly: true })) return { velocity: false, materialization: blockedCapture() };
@@ -1278,11 +1991,21 @@ export function createService({ db, provider, journalClient, workers = true } = 
   }
 
   function pendingScreen(config, options, body = {}) {
-    const needsSignal = body.rankingList && rankingList(body).needsVelocity;
-    if (!(config.includeAllTimeHigh || needsSignal) || !options.materialization) return null;
+    const needsSignal = screenNeedsVelocity(body);
+    if (!(config.includeAllTimeHigh || needsSignal || options.unprepared) || !options.materialization) return null;
     return response({ date: config.date, dataVersion: config.dataVersion, rows: [], total: null,
       columns: validateScreen(body).columns, pendingOnly: true,
-      pendingReason: needsSignal ? 'Weekly RS signals' : 'Verified high history', ...options }, 202);
+      pendingReason: needsSignal ? 'Weekly RS signals' : config.includeAllTimeHigh ? 'Verified high history' : 'Prepared stock calculations', ...options }, 202);
+  }
+
+  function preparedScreenOptions(config, body) {
+    const options = velocityOptions(config);
+    const windows = rangeWindowsForScreen(body);
+    if (!windows.length) return options;
+    const point = rangeContext(engine, config);
+    const rangeMetrics = readPreparedRangeMetrics(db, point, windows);
+    if (rangeMetrics.ready) return { ...options, rangeMetrics };
+    return { ...options, unprepared: true, materialization: rangePendingStatus(db, engine, point, rangeMetrics) };
   }
 
   async function dispatch({ method = 'GET', url = '/', body = {} } = {}) {
@@ -1298,6 +2021,11 @@ export function createService({ db, provider, journalClient, workers = true } = 
       const listContext = (extra = {}) => {
         const requested = { ...query, ...extra };
         if (requested.date || requested.dataVersion) return asContext(extra);
+        if (preparedOnly) {
+          const current = asContext(extra);
+          if ((engine.snapshotAvailable(current) || hasPreparedSnapshot(db, engine, current)) &&
+            preparationStatus(db, engine, current, 'recent').preparationState === 'complete') return current;
+        }
         const ready = latestAnalysis(db, dataVersion(db));
         return asContext(ready ? { ...extra, date: ready.date, dataVersion: ready.dataVersion } : extra);
       };
@@ -1308,7 +2036,7 @@ export function createService({ db, provider, journalClient, workers = true } = 
           if (method === 'GET' || method === 'PUT' || method === 'POST') {
             const settings = method === 'GET' ? getJournalSettings(db) : saveJournalSettings(db, body);
             const scheduleEffective = settings.configured && settings.enabled;
-            const date = latestFinalizableSession(new Date(), process.env.MARKET_SYNC_AFTER || '20:30');
+            const date = latestFinalizableSession(new Date(), marketSyncAfter(process.env.MARKET_SYNC_AFTER));
             const scheduleState = scheduleEffective ? scheduledJournalReadiness(db, { date })
               : { state: settings.configured ? 'disabled' : 'key_required', date };
             return response({ ...settings, schedulerAvailable: true, scheduleEffective, scheduleState });
@@ -1367,6 +2095,14 @@ export function createService({ db, provider, journalClient, workers = true } = 
       }
       if (area === 'data') {
         if (method === 'GET' && item === 'status') return response(localStatus(db));
+        if (item === 'preparation' && method === 'GET') return response(preparationSummary(db, asContext().dataVersion));
+        if (item === 'preparation' && method === 'POST') {
+          const context = body.context && Object.keys(body.context).length ? body.context : null;
+          const rangeWindows = context ? rangeWindowsForScreen({ context }) : [];
+          if (context && body.register !== false) registerPreparation(db, asContext(context), { followLatest: context.followLatest === true, rangeWindows });
+          return response(prepareStandard({ ...(context ? { requested: { ...context, rangeWindows }, version: context.dataVersion } : {}),
+            retry: body.retry === true || !!context }), 202);
+        }
         if (item === 'quality' && action === 'overrides') {
           if (method === 'GET') {
             const config = asContext();
@@ -1378,11 +2114,21 @@ export function createService({ db, provider, journalClient, workers = true } = 
           if (method === 'POST') {
             const rows = Array.isArray(body.overrides) ? body.overrides : [body];
             if (!rows.length || rows.length > 50 || rows.some((row) => !row?.securityId)) throw asError('Supply 1–50 overrides with permanent security IDs');
-            return response(importDataset(db, { provider: 'reviewed-operator', dataset: 'quality-overrides', qualityOverrides: rows }), 201);
+            const receipt = importDataset(db, { provider: 'reviewed-operator', dataset: 'quality-overrides', qualityOverrides: rows });
+            if (preparedOnly && !receipt.duplicate) prepareStandard();
+            return response(receipt, 201);
           }
         }
-        if (method === 'GET' && item === 'quality') return response(quality(db, engine, asContext()));
-        if (method === 'POST' && item === 'import') return response(importDataset(db, body), 201);
+        if (method === 'GET' && item === 'quality') {
+          const point = asContext();
+          const { snapshot } = readSnapshot(point, { summary: true });
+          return response(quality(db, engine, point, snapshot));
+        }
+        if (method === 'POST' && item === 'import') {
+          const receipt = importDataset(db, body);
+          if (preparedOnly && !receipt.duplicate) prepareStandard();
+          return response(receipt, 201);
+        }
         if (method === 'POST' && item === 'refresh') {
           providerOptions(body);
           return response(enqueue('provider-import', body), 202);
@@ -1404,7 +2150,7 @@ export function createService({ db, provider, journalClient, workers = true } = 
       }
       if (area === 'jobs' && method === 'GET') {
         if (item) return response(exists(jobById(db, item), 'Job'));
-        return response(db.prepare('SELECT id,type,status,created_at,updated_at,progress,error FROM jobs ORDER BY created_at DESC LIMIT 30').all());
+        return response(db.prepare("SELECT id,type,status,created_at,updated_at,progress,error FROM jobs ORDER BY status='running' DESC,rowid DESC LIMIT 30").all());
       }
       if (area === 'config' && method === 'GET') {
         const observedBenchmarks = availableBenchmarks(db);
@@ -1413,19 +2159,37 @@ export function createService({ db, provider, journalClient, workers = true } = 
           models: [...BUILTIN_MODELS, ...listWorkspace(db, 'ranking-model')],
           healthModels: [DEFAULT_HEALTH_MODEL, ...listWorkspace(db, 'health-model')],
           rankingMethods: RANKING_METHODS, rankingPeriods, rankingLists, breadthMetrics: BREADTH_METRICS, columns: defaultColumns,
+          automaticPreparation: preparedOnly,
           benchmarks: [...new Set([...BENCHMARKS, ...observedBenchmarks])], availableBenchmarks: observedBenchmarks,
           ...classificationStatus(db),
           status: localStatus(db), exportFormats: await parquetAvailable() ? exportFormats : ['csv'],
         });
       }
+      if (area === 'market' && item === 'health' && action === 'prepare' && method === 'POST') {
+        const config = asContext(body.context);
+        const coverage = researchCoverage(body);
+        const model = chooseHealthModel(db, body.healthModel);
+        const limit = parseCount(body.limit, 1, 7560, 315);
+        const from = dateString(body.from, null);
+        const recipe = healthRecipe(engine, config, model, coverage);
+        const healthKey = `health:${recipe}:${config.dataVersion}:${config.date}`;
+        return response(enqueue('health-precompute', { context: preparationInput(config), ...coverage, healthModel: model.id,
+          limit, from, preparedOnly, healthKey }, `${healthKey}:${limit}:${from || ''}`), 202);
+      }
       if (area === 'market' && method === 'GET') {
         const requestedMetrics = query.metrics ? String(query.metrics).split(',').filter((key) => breadthMetric(key) || key === 'adSpread') : [];
         const keys = [...new Set(requestedMetrics.length ? requestedMetrics : item === 'monitor' ? monitorMetrics : [])].slice(0, 24);
         const config = asContext({ breadthKeys: [item === 'breadth' ? action : null, ...keys].filter(Boolean) });
+        if (item === 'summation') {
+          const point = summationContext(db, engine, config);
+          const result = readPreparedSummation(db, point, { from: query.from, to: query.to,
+            limit: parseCount(query.limit, 1, 7560, 252) });
+          return response({ ...result, ...(!result.rows.length ? pendingPreparation(point, 'history') : {}) });
+        }
         if (item === 'analogs') {
           const coverage = researchCoverage(query);
           const horizon = parseCount(query.horizon, 1, 126, 20);
-          const source = thinHistory(db, engine, config, { cadence: 'daily', limit: parseCount(query.historyLimit, 30, 2600, 252) }, enqueue);
+          const source = historyFor(config, { cadence: 'daily', limit: parseCount(query.historyLimit, 30, 2600, 252) });
           const sessions = source.rows.length ? expectedSessions(source.rows[0].date, config.date) : [];
           if (source.materialization?.pending || sessions.length < 2) {
             return response({ matches: [], materialization: source.materialization, asOf: config.date,
@@ -1442,11 +2206,11 @@ export function createService({ db, provider, journalClient, workers = true } = 
             return summary;
           });
           const limit = parseCount(query.limit, 1, 252, 63);
-          const source = thinHistory(db, engine, config, { to: query.to, cadence: 'daily',
+          const source = historyFor(config, { to: query.to, cadence: 'daily',
             from: query.from ? shiftDate(dateString(query.from), -2 * extremeDefinition.lookback - 16) : undefined,
             limit: limit + extremeDefinition.lookback,
             materializedOnly: query.materializedOnly === '1',
-            visibleRequested: limit }, enqueue);
+            visibleRequested: limit });
           const rows = formatHistory(source.rows, keys, true)
             .filter((row) => !query.from || row.date >= query.from).slice(-limit);
           if (exportFormats.includes(query.export) && source.materialization?.pending) return response({ materialization: source.materialization }, 202);
@@ -1454,30 +2218,34 @@ export function createService({ db, provider, journalClient, workers = true } = 
             ['date', ...historyColumns(keys), ...keys.map((key) => `${key}_extreme_percentile`),
               ...ratioDefinitions.flatMap(({ key }) => [key, `${key}_state`, `${key}_numerator`, `${key}_denominator`]), 'coverage', 'eligible', 'traded'],
             'market-monitor', query.export, config);
-          const snapshot = engine.snapshot(config);
+          const { snapshot, preparation } = readSnapshot(config, { summary: true });
           return response({ date: config.date, coverage: snapshot.coverage, metrics, rows, ratioDefinitions, extremeDefinition,
-            currentReading: snapshot.date ? formatHistory([snapshot], keys, true)[0] : null,
-            materialization: source.materialization, dataVersion: config.dataVersion });
+            currentReading: snapshot.date && snapshot.coverage.state !== 'unprepared' ? formatHistory([snapshot], keys, true)[0] : null,
+            materialization: source.materialization, preparation, dataVersion: config.dataVersion });
         }
         if (item === 'overview') {
-          const snapshot = engine.snapshot(config);
+          const { snapshot, preparation } = readSnapshot(config, { summary: true });
           const { stocks, ...thin } = snapshot;
           const traded = stocks.filter((row) => row.traded);
           const leaders = traded.filter(({ rsRank }) => rsRank != null).sort((a, b) => a.rsRank - b.rsRank).slice(0, 8);
           const movers = traded.filter((row) => finite(row.return_1d)).sort((a, b) => b.return_1d - a.return_1d);
           const model = chooseHealthModel(db, query.healthModel);
-          const support = snapshot.coverage.state === 'complete' && healthBaseline(model) > 44
-            ? thinHistory(db, engine, config, { limit: healthBaseline(model) + 1, cadence: 'daily' }, enqueue) : null;
+          const support = !preparedOnly && snapshot.coverage.state === 'complete' && healthBaseline(model) > 44
+            ? historyFor(config, { limit: healthBaseline(model) + 1, cadence: 'daily' }) : null;
           return response({ ...thin, groups: thin.groups.slice(0, 12).map(({ memberIds, ...group }) => group), leaders,
             movers: { gainers: movers.slice(0, 5), losers: movers.slice(-5).reverse() },
-            ...(support?.materialization ? { materialization: support.materialization } : {}),
-            health: marketHealth(db, engine, config, { snapshot, model, history: support?.rows }) });
+            materialization: preparation?.pending || preparation?.captureInProgress ? preparation : support?.materialization, preparation,
+            health: preparedOnly ? readPreparedHealth(db, engine, config, model, researchCoverage(), config.date, 1)[0]
+              || { date: config.date, score: null, state: 'unprepared', reason: 'Market health calculations are not yet prepared for this context', components: [] }
+              : marketHealth(db, engine, config, { snapshot, model, history: support?.rows }) });
         }
         if (item === 'breadth') {
           if (sub === 'contributors') {
             const [page, perPage] = rowPage();
             const exportRequested = exportFormats.includes(query.export);
-            const result = breadthContributors(engine.snapshot(config), action, query.include, page, perPage, exportRequested);
+            const { snapshot, preparation } = readSnapshot(config);
+            if (preparation) return response({ date: config.date, materialization: preparation, rows: [], total: null, pendingOnly: true }, 202);
+            const result = breadthContributors(snapshot, action, query.include, page, perPage, exportRequested);
             if (exportRequested) return await exportTable(result.rows,
               ['symbol', 'name', 'exchange', 'close', 'breadthSelection', ...(action === 'adSpread' ? ['contribution'] : [])],
               'market-breadth-contributors', query.export, config);
@@ -1490,10 +2258,10 @@ export function createService({ db, provider, journalClient, workers = true } = 
             const dailyLimit = query.cadence === 'weekly' ? Math.min(7560, limit * 5) : limit;
             const requestedFrom = dateString(query.from, null);
             const onlyStored = query.materializedOnly === '1';
-            const history = thinHistory(db, engine, config, { ...query,
+            const history = historyFor(config, { ...query,
               from: requestedFrom && !onlyStored ? shiftDate(requestedFrom, -2 * extremeDefinition.lookback - 16) : requestedFrom,
               cadence: 'daily', limit: Math.min(7560, dailyLimit + (onlyStored ? 0 : extremeDefinition.lookback)),
-              materializedOnly: onlyStored, visibleRequested: limit }, enqueue);
+              materializedOnly: onlyStored, visibleRequested: limit });
             const mapped = formatHistory(history.rows, keys).filter((row) => !requestedFrom || row.date >= requestedFrom);
             const rows = marketHistoryRows(mapped, { cadence: query.cadence, limit,
               from: requestedFrom, to: query.to && query.to < config.date ? query.to : config.date });
@@ -1506,100 +2274,187 @@ export function createService({ db, provider, journalClient, workers = true } = 
             }
             return response({ date: config.date, metrics: keys, rows, materialization: history.materialization, dataVersion: config.dataVersion });
           }
-          const snap = engine.snapshot(config);
+          const { snapshot: snap, preparation } = readSnapshot(config, { summary: true });
           return response({ date: snap.date, referenceDate: snap.referenceDate, referenceMode: snap.referenceMode,
-            classificationSystem: snap.classificationSystem, coverage: snap.coverage, metrics: action ? { [action]: snap.breadth[action] } : snap.breadth });
+            classificationSystem: snap.classificationSystem, coverage: snap.coverage, metrics: action ? { [action]: snap.breadth[action] } : snap.breadth,
+            preparation });
         }
         if (item === 'health' || item === 'events') {
           const coverage = researchCoverage(query);
-          const snapshot = engine.snapshot(config);
+          const { snapshot, preparation } = readSnapshot(config, { summary: true });
           const model = chooseHealthModel(db, query.healthModel);
           const visible = parseCount(query.limit, 1, 260, 45);
-          const warmup = healthBaseline(model);
           const requestedFrom = dateString(query.from, null);
+          const stored = readPreparedHealth(db, engine, config, model, coverage, requestedFrom, visible);
+          const latest = stored.at(-1);
+          if (preparedOnly || latest?.date === config.date) {
+            const healthKey = `health:${healthRecipe(engine, config, model, coverage)}:${config.dataVersion}:${config.date}`;
+            const job = db.prepare(`SELECT id,status,error,progress FROM jobs WHERE type='health-precompute'
+              AND json_extract(payload,'$.healthKey')=? ORDER BY rowid DESC LIMIT 1`).get(healthKey);
+            const archived = latest?.date === config.date;
+            const startsAt = requestedFrom && requestedFrom > config.earliestDate ? requestedFrom : config.earliestDate;
+            const requestedSessions = startsAt && config.date ? expectedSessions(startsAt, config.date).slice(-visible) : [];
+            const fullyStored = archived && (item !== 'events' && query.series !== '1'
+              || stored.length === requestedSessions.length && stored.every((row, index) => row.date === requestedSessions[index]));
+            const events = divergenceLedger(db, engine, config, model, stored[0]?.date, coverage);
+            const activeHealth = job && ['queued', 'running'].includes(job.status);
+            const contextPreparation = !fullyStored && !activeHealth ? pendingPreparation(config, 'recent') : undefined;
+            const materialization = !fullyStored ? activeHealth ? pendingJob(job)
+              : { preparationState: job?.status === 'failed' ? 'failed' : 'unregistered', error: job?.error || null, prepareAction: 'health' } : undefined;
+            const health = archived ? latest : { date: config.date, score: null, state: 'unprepared', components: [],
+              reason: 'Prepare market health for this context and coverage policy', descriptive: coverage.coverageMode === 'observed', ...coverage };
+            return response(item === 'events' ? { date: config.date, events, ...coverage, materialization, contextPreparation }
+              : { ...health, events, history: query.series === '1' ? stored : [], materialization, preparation, contextPreparation });
+          }
+          const warmup = healthBaseline(model);
           const source = snapshot.coverage.state === 'complete' || coverage.coverageMode === 'observed' || query.series === '1' || item === 'events'
-            ? thinHistory(db, engine, config, { ...query, cadence: 'daily', limit: visible + warmup, visibleRequested: visible,
-              from: requestedFrom && shiftDate(requestedFrom, -2 * warmup - 16) }, enqueue) : { rows: [] };
-          const health = marketHealth(db, engine, config, { model, history: source.rows, snapshot, ...coverage });
+            ? historyFor(config, { ...query, cadence: 'daily', limit: visible + warmup, visibleRequested: visible,
+              from: requestedFrom && shiftDate(requestedFrom, -2 * warmup - 16) }) : { rows: [] };
+          const health = marketHealth(db, engine, config, { model, history: source.rows, snapshot, preparedOnly, ...coverage });
           const sessions = source.rows.length ? expectedSessions(source.rows[0].date, source.rows.at(-1).date) : [];
           const all = query.series === '1' || item === 'events' ? marketHealthHistory(source.rows, { model, sessions, ...coverage }) : [];
           const series = all.filter((row) => !requestedFrom || row.date >= requestedFrom).slice(-visible);
-          const events = divergenceLedger(db, engine, config, model, series.flatMap((day) => day.divergences), series[0]?.date, coverage);
+          const events = divergenceLedger(db, engine, config, model, series[0]?.date, coverage);
           return response(item === 'events' ? { date: config.date, events, ...coverage, materialization: source.materialization }
-            : { ...health, events, history: series, materialization: source.materialization });
+            : { ...health, events, history: series, materialization: source.materialization, preparation });
         }
       }
       if (area === 'rankings' && method === 'GET') {
         const config = query.series === '1' ? asContext() : listContext();
         if (query.series === '1') {
           return response(rankSeries(db, engine, config, { ...query, cadence: query.cadence || 'weekly',
-            limit: parseCount(query.limit, 1, 7560, 60) }, enqueue));
+            limit: parseCount(query.limit, 1, 7560, 60) }, enqueue, { preparedOnly }));
         }
         const options = velocityOptions(config);
         const pending = pendingScreen(config, options, query);
         if (pending) return pending;
-        const result = resolveScreen(engine, config, query, options);
+        const result = resolveScreen(db, engine, config, query, options);
         return response({ ...result, ...options, model: config.model, universe: config.universe, dataVersion: config.dataVersion });
       }
       if (area === 'screens' && item === 'query' && method === 'POST') {
         const config = listContext({ ...body.context, ...screenDataNeeds(body) });
-        const options = velocityOptions(config);
+        const options = preparedScreenOptions(config, body);
         const pending = pendingScreen(config, options, body);
         if (pending) return pending;
-        const result = resolveScreen(engine, config, body, options);
+        const result = resolveScreen(db, engine, config, body, options);
         if (exportFormats.includes(body.export)) return await exportTable(result.rows, result.columns.length ? result.columns : defaultColumns, 'market-screen', body.export, config);
         return response({ ...result, ...options, dataVersion: config.dataVersion });
       }
+      if (area === 'stocks' && method === 'POST' && item && action === 'prepare') {
+        const config = asContext(body.context);
+        const security = requireStockIdentity(db, config, item);
+        if (!config.date || !config.earliestDate) throw asError('Load a price session before preparing ticker details');
+        const lookback = parseCount(body.lookback, 1, 2600, 126);
+        const spec = detailSpec(engine, config, { securityIds: [security.id], benchmarks: [config.benchmark], riskWindows: [lookback],
+          followLatest: body.followLatest === true });
+        if (body.followLatest === true) {
+          const kind = 'stock-detail-preparation';
+          const definition = { securityId: security.id, basis: config.basis, benchmark: config.benchmark, lookback };
+          const id = createHash('sha256').update(JSON.stringify(definition)).digest('hex').slice(0, 24);
+          if (!getWorkspace(db, kind, id)) storeWorkspace(db, kind, { name: security.id, definition }, id);
+        }
+        return response(enqueue(detailType, spec, spec.jobKey), 202);
+      }
       if (area === 'stocks' && method === 'GET' && item) {
         const config = asContext();
+        if (item === 'search' && !action) return response({ date: config.date, dataVersion: config.dataVersion,
+          rows: securitySearch(db, config, String(query.q || '').trim().slice(0, 100), parseCount(query.limit, 1, 25, 12)) });
         if (action === 'screens') {
-          const security = exists(engine.findSecurity(config, item), 'Security');
+          const security = requireStockIdentity(db, config, item);
           const saved = listWorkspace(db, 'screen');
           const matched = [];
           for (const screen of saved) {
             const screenConfig = engine.context({ ...query, ...savedScreenContext(screen.definition), ...screenDataNeeds(screen.definition),
               date: config.date, dataVersion: config.dataVersion });
-            const options = velocityOptions(screenConfig);
+            const options = preparedScreenOptions(screenConfig, screen.definition);
             const pending = pendingScreen(screenConfig, options, screen.definition);
             if (pending) return response({ date: config.date, screens: matched, evaluated: null,
               pendingOnly: true, materialization: options.materialization }, 202);
-            const snapshot = engine.snapshot(screenConfig, options);
+            const snapshot = options[resolvedSnapshot] || engine.snapshot(screenConfig, options);
             const filters = [screen.definition.filter, { field: 'securityId', op: 'eq', value: security.id }].filter(Boolean);
-            const results = historicalScreen(engine, screenConfig, { ...screen.definition, page: 1, perPage: 1,
-              filter: { operator: 'and', filters } }, snapshot);
+            const results = historicalScreen(db, engine, screenConfig, { ...screen.definition, page: 1, perPage: 1,
+              filter: { operator: 'and', filters } }, options.rangeMetrics ? applyPreparedRangeMetrics(snapshot, options.rangeMetrics) : snapshot,
+            options[resolvedHistory]);
             if (results.total) matched.push({ id: screen.id, name: screen.name, version: screen.version,
               universe: screenConfig.universe.id, model: screenConfig.model.id });
           }
           return response({ date: config.date, securityId: security.id, evaluated: saved.length, screens: matched });
         }
         if (action === 'rankings') {
-          const security = exists(engine.findSecurity(config, item), 'Security');
+          const security = requireStockIdentity(db, config, item);
           return response({ securityId: security.id, ...rankSeries(db, engine, config, { ...query, securityId: security.id,
-            cadence: query.cadence || 'weekly', limit: parseCount(query.limit, 1, 260, 44) }, enqueue, { supplyDemand: true }) });
+            cadence: query.cadence || 'weekly', limit: parseCount(query.limit, 1, 260, 44) }, enqueue, { supplyDemand: true, preparedOnly }) });
         }
-        const options = velocityOptions(config);
-        const detail = exists(engine.detail(config, item, parseCount(query.lookback, 1, 2600, 252), options), 'Security');
+        const lookback = parseCount(query.lookback, 1, 2600, 252);
+        const directMembership = (id) => listWorkspace(db, 'watchlist').filter((list) => list.definition.members?.includes(id)).map(({ name }) => name);
+        let detail, risk, options;
+        if (preparedOnly) {
+          const security = requireStockIdentity(db, config, item);
+          const weekly = preparedTickerSnapshot(config, security.id, true);
+          const snapshot = weekly || preparedTickerSnapshot(config, security.id, false);
+          const archive = readPreparedDetail(db, config, security.id, { lookback, benchmark: config.benchmark });
+          detail = preparedStockDetail(db, config, security, snapshot, archive);
+          const chartsReady = archive.state === 'ready';
+          const riskReady = archive.riskState === 'ready';
+          detail.detailPreparation = { state: chartsReady && riskReady && snapshot && weekly ? 'ready' : 'partial',
+            chart: { state: archive.state, sourceDataVersion: archive.sourceDataVersion, anchorDate: archive.anchorDate,
+              ...(chartsReady && { priceAvailability: archive.detail?.bars.some((bar) => Number.isFinite(bar.close) && !bar.unverifiedSplit)
+                ? 'observations' : config.basis === 'known' ? 'no-known-observations' : 'no-price-observations' }),
+              projected: archive.projected, ...(!chartsReady && detailJobs(db, config, security.id, { exact: config.basis === 'known' || archive.state === 'requires-exact-date' })) },
+            risk: { state: archive.riskState, benchmark: config.benchmark, lookback,
+              ...(!riskReady && detailJobs(db, config, security.id, { exact: true, benchmark: config.benchmark, lookback })) },
+            metrics: { state: snapshot ? 'ready' : 'unprepared', ...(!snapshot && pendingPreparation(config)) },
+            weekly: { state: weekly ? 'ready' : 'unprepared', ...(!weekly && pendingPreparation(config)) },
+          };
+          risk = archive.detail?.risk ?? null;
+          options = { velocity: !!weekly };
+          if (exportFormats.includes(query.export) && !chartsReady) return response({ date: config.date, pendingOnly: true,
+            detailPreparation: detail.detailPreparation }, 202);
+        } else {
+          options = velocityOptions(config);
+          detail = exists(engine.detail(config, item, lookback, options), 'Security');
+          const benchmark = detail.bars.length ? engine.studyPrices(config, [config.benchmark], detail.bars[0].date, config.date).get(config.benchmark) : null;
+          risk = riskMetrics(detail, benchmark);
+        }
+        if (preparedOnly && detail.loadedHistoryHigh === undefined) {
+          const point = { ...config, includeAllTimeHigh: true };
+          const enriched = engine.snapshotAvailable(point) ? engine.snapshot(point, { persist: false })
+            : preparedView(point, { securityIds: [detail.securityId] });
+          const high = enriched?.stocks.find(({ securityId }) => securityId === detail.securityId);
+          if (high && Object.hasOwn(high, 'loadedHistoryHigh')) {
+            for (const key of ['allTimeHigh', 'loadedHistoryHigh', 'loadedHistoryHighFrom', 'loadedHistoryHighThrough',
+              'loadedHistoryHighObservations', 'loadedHistoryHighExpected', 'loadedHistoryHighBoundary',
+              'distance_all_time_high', 'distance_loaded_history_high']) detail[key] = high[key];
+            detail.warnings = detail.warnings.filter((message) => message !== 'Lifetime highs are unavailable for this prepared stock view.');
+          }
+        }
+        const ranges = readPreparedRangeMetrics(db, rangeContext(engine, config), [20, 252]);
+        if (ranges.values.size) Object.assign(detail, applyPreparedRangeMetrics({ stocks: [detail] }, ranges).stocks[0]);
+        detail.rangeMetrics = { windows: ranges.windows, missingWindows: ranges.missingWindows };
         if (action === 'metrics') return response({ ...detail, bars: undefined, chartBars: undefined, actions: undefined });
         if (exportFormats.includes(query.export)) return await exportTable(detail.bars, ['date', 'open', 'high', 'low', 'close', 'volume', 'dollarVolume'], 'stock-prices', query.export, config);
-        const bench = detail.bars.length ? engine.studyPrices(config, [config.benchmark], detail.bars[0].date, config.date).get(config.benchmark) : null;
-        const directMembership = listWorkspace(db, 'watchlist').filter((list) => list.definition.members?.includes(detail.securityId)).map(({ name }) => name);
-        return response({ ...detail, ...options, benchmark: config.benchmark, risk: riskMetrics(detail, bench), watchlists: directMembership });
+        return response({ ...detail, ...options, benchmark: config.benchmark, risk, watchlists: directMembership(detail.securityId) });
       }
       if (area === 'industries' && method === 'GET') {
         const config = asContext();
         const options = velocityOptions(config);
-        const snap = engine.snapshot(config, options);
+        const { snapshot: snap, preparation } = options[resolvedSnapshot] ? { snapshot: options[resolvedSnapshot] }
+          : readSnapshot(config, { velocity: options.velocity, summary: true });
         if (!item) return response({ date: snap.date, ...options, referenceDate: snap.referenceDate, referenceMode: snap.referenceMode,
-          classificationSystem: snap.classificationSystem, coverage: snap.coverage, groups: snap.groups.filter((group) => !query.level || group.level === query.level) });
+          classificationSystem: snap.classificationSystem, coverage: snap.coverage, preparation,
+          groups: snap.groups.filter((group) => !query.level || group.level === query.level) });
         if (item === 'compare') {
           const ids = String(query.ids || '').split(',').filter(Boolean).slice(0, 8);
           const limit = parseCount(query.limit, 1, 260, 80);
           const cadence = query.cadence === 'weekly' ? 'weekly' : 'daily';
-          const { rows: history, materialization } = thinHistory(db, engine, config, { ...query, cadence: 'daily',
-            limit: cadence === 'weekly' ? limit * 5 : limit, visibleRequested: limit }, enqueue);
+          const { rows: history, materialization } = historyFor(config, { ...query, cadence: 'daily',
+            limit: cadence === 'weekly' ? limit * 5 : limit, visibleRequested: limit });
           const rows = groupHistoryRows(history, ids, { cadence, limit, from: query.from,
             to: query.to && query.to < config.date ? query.to : config.date });
           return response({ date: snap.date, cadence, materialization, rows });
+        }
+        if (preparation && options.unprepared && action === 'members') {
+          return response({ date: config.date, materialization: preparation, rows: [], total: null, pendingOnly: true }, 202);
         }
         const group = exists(snap.groups.find((g) => g.id === item), 'Industry group');
         if (action === 'members') {
@@ -1612,15 +2467,10 @@ export function createService({ db, provider, journalClient, workers = true } = 
         if (item === 'event-studies') return response(enqueue('event-study', { ...body, ...researchCoverage(body) }), 202);
         if (item === 'leadership-transitions') return response(enqueue('leadership-transitions', body), 202);
         if (item === 'cohorts') {
-          const config = asContext({ ...body.screen?.context, ...body.context, ...screenDataNeeds(body.screen ?? {}) });
+          const config = asContext({ basis: 'known', ...body.screen?.context, ...body.context, ...screenDataNeeds(body.screen ?? {}) });
           const date = dateString(body.date, config.date);
-          if (body.name && date) {
-            const selected = resolveScreen(engine, { ...config, date }, { ...body.screen, all: true });
-            const requested = Array.isArray(body.members) ? new Set(body.members) : null;
-            body.members = selected.rows.filter((row) => !requested || requested.has(row.securityId)).map(({ securityId }) => securityId);
-            storeWorkspace(db, 'cohort', { name: body.name, definition: { ...body, date } });
-          }
-          return response(enqueue('cohort', body), 202);
+          const { frozen: _, ...input } = body;
+          return response(enqueue('cohort', { ...input, date, context: materializationContext(config) }), 202);
         }
       }
       if (area === 'alerts') {
@@ -1628,14 +2478,21 @@ export function createService({ db, provider, journalClient, workers = true } = 
         if (method === 'POST' && item === 'evaluate') return response(updateAlerts(db, engine, body.context));
       }
       if (area === 'scheduler' && method === 'POST' && item === 'sync') {
-        const date = latestFinalizableSession();
+        const date = latestFinalizableSession(new Date(), marketSyncAfter(process.env.MARKET_SYNC_AFTER));
         return response(enqueue('provider-import', { bulk: true, date, ...body }), 202);
       }
       if (collections[area]) {
         const kind = collections[area];
         const defaults = kind === 'ranking-model' ? BUILTIN_MODELS : kind === 'universe' ? UNIVERSES : [];
         if (!item && method === 'GET') return response([...defaults, ...listWorkspace(db, kind)]);
-        if (!item && method === 'POST') return response(storeWorkspace(db, kind, { name: body.name, definition: workspaceDefinition(kind, body) }), 201);
+        if (!item && method === 'POST') {
+          const saved = storeWorkspace(db, kind, { name: body.name, definition: workspaceDefinition(kind, body) });
+          if (preparedOnly && ['screen', 'universe', 'ranking-model', 'theme', 'alert-rule', 'health-model'].includes(kind)) {
+            scheduledPreparation = null;
+            prepareStandard();
+          }
+          return response(saved, 201);
+        }
         if (item) {
           const builtin = defaults.find(({ id }) => id === item);
           const saved = exists(builtin || getWorkspace(db, kind, item, query.version ? Number(query.version) : null), 'Saved item');
@@ -1645,29 +2502,41 @@ export function createService({ db, provider, journalClient, workers = true } = 
           }
           if (method === 'POST' && action === 'execute' && kind === 'screen') {
             const config = listContext({ ...savedScreenContext(saved.definition), ...body.context, ...screenDataNeeds({ ...saved.definition, ...body }) });
-            const options = velocityOptions(config);
+            const options = preparedScreenOptions(config, { ...saved.definition, ...body });
             const pending = pendingScreen(config, options, { ...saved.definition, ...body });
             if (pending) return pending;
-            const result = resolveScreen(engine, config, { ...saved.definition, ...body }, options);
+            const result = resolveScreen(db, engine, config, { ...saved.definition, ...body }, options);
             if (exportFormats.includes(body.export)) return await exportTable(result.rows, result.columns.length ? result.columns : defaultColumns, 'saved-screen', body.export, config);
             return response({ ...result, ...options, dataVersion: config.dataVersion });
           }
-          if (method === 'POST' && action === 'execute' && kind === 'cohort') return response(enqueue('cohort', { ...saved.definition, ...body }), 202);
+          if (method === 'POST' && action === 'execute' && kind === 'cohort') {
+            const definition = saved.definition;
+            const frozen = definition.frozen || (Array.isArray(definition.members) && {
+              context: definition.context, members: validMembers(definition.members).map((securityId) => ({ securityId })), calculationVersion: null,
+            });
+            if (!frozen) throw asError('This cohort has no recorded frozen membership');
+            const { basis, benchmark, universe, universeVersion, model, modelVersion, classification, reference } = frozen.context || {};
+            const { horizons, asOf, maePrice } = body;
+            const context = { basis, benchmark, universe, universeVersion, model, modelVersion, classification, reference,
+              dataVersion: body.context?.dataVersion ?? dataVersion(db) };
+            return response(enqueue('cohort', { ...definition, frozen, context, horizons: horizons ?? definition.horizons,
+              asOf, maePrice: maePrice ?? definition.maePrice }), 202);
+          }
           if (kind === 'watchlist' && action === 'members' && method === 'GET') {
             const screen = saved.definition.screenId && getWorkspace(db, 'screen', saved.definition.screenId);
             if (screen) {
               const screenConfig = listContext({ ...savedScreenContext(screen.definition), ...screenDataNeeds(screen.definition) });
-              const screenOptions = velocityOptions(screenConfig);
+              const screenOptions = preparedScreenOptions(screenConfig, screen.definition);
               const pending = pendingScreen(screenConfig, screenOptions, screen.definition);
               if (pending) return pending;
-              return response({ ...resolveScreen(engine, screenConfig, { ...screen.definition, page: query.page, perPage: query.perPage }, screenOptions),
+              return response({ ...resolveScreen(db, engine, screenConfig, { ...screen.definition, page: query.page, perPage: query.perPage }, screenOptions),
                 ...screenOptions, dataVersion: screenConfig.dataVersion });
             }
             const config = asContext();
             const options = velocityOptions(config);
             const pending = pendingScreen(config, options);
             if (pending) return pending;
-            const snapshot = engine.snapshot(config, options);
+            const snapshot = options[resolvedSnapshot] || engine.snapshot(config, options);
             const wanted = new Set(saved.definition.members);
             const list = snapshot.stocks.filter((stock) => wanted.has(stock.securityId));
             const included = new Set(list.map((stock) => stock.securityId));
@@ -1680,17 +2549,26 @@ export function createService({ db, provider, journalClient, workers = true } = 
             const members = validMembers([...(saved.definition.members || []), ...validMembers(body.add)]).filter((id) => !removed.has(id));
             return response(storeWorkspace(db, kind, { name: saved.name, definition: { members, mode: 'manual', screenId: null } }, saved.id));
           }
-          if (!builtin && method === 'PUT' && !action) return response(storeWorkspace(db, kind, { name: body.name, definition: workspaceDefinition(kind, body) }, item));
+          if (!builtin && method === 'PUT' && !action) {
+            const updated = storeWorkspace(db, kind, { name: body.name, definition: workspaceDefinition(kind, body) }, item);
+            if (preparedOnly && ['screen', 'universe', 'ranking-model', 'theme', 'alert-rule', 'health-model'].includes(kind)) {
+              scheduledPreparation = null;
+              prepareStandard();
+            }
+            return response(updated);
+          }
           if (!builtin && method === 'DELETE' && !action) return response(storeWorkspace(db, kind, saved, item, true));
         }
       }
       return response({ error: 'Route not found' }, 404);
     } catch (error) {
+      if (error.preparation) return response(error.preparation, 202);
       return response({ error: error.message }, error.status || 400);
     }
   }
 
   return { dispatch, enqueue, engine, workspaceConfiguration: () => workspaceDefaults(db),
+    prepareStandard: (options) => requiresArchive(db) ? prepareStandard(options) : { jobs: [], queued: 0 },
     journalConfiguration() {
       const { model, modelVersion, reference, ...context } = workspaceDefaults(db);
       return { ...context, analysisModel: model, analysisModelVersion: modelVersion, referenceMode: reference };

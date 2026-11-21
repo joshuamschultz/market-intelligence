@@ -26,6 +26,7 @@ const baseUrl = 'http://localhost:4173';
 const pageNames = {
   overview: 'Market Overview', monitor: 'Market Monitor', screener: 'Stock Screener', screens: 'Saved Screens', watchlists: 'Watchlists',
   rankings: 'RS Rankings', industries: 'Industries', history: 'Historical Explorer', journal: 'Market Journal', alerts: 'Alerts', settings: 'Settings & Data',
+  stock: 'Ticker',
 };
 
 function seedFixture(db) {
@@ -179,7 +180,10 @@ test('research workspace workflows use the published API and a copy of the local
   });
   if (!win.HTMLDialogElement.prototype.showModal) {
     win.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
-    win.HTMLDialogElement.prototype.close = function () { this.open = false; };
+    win.HTMLDialogElement.prototype.close = function () {
+      this.open = false;
+      queueMicrotask(() => this.dispatchEvent(new win.Event('close')));
+    };
   }
 
   const $ = (selector) => document.querySelector(selector);
@@ -279,8 +283,27 @@ test('research workspace workflows use the published API and a copy of the local
   submit('#health-coverage-form');
   await wait(() => $('#current-health')?.textContent.includes('Minimum 3 traded securities · 75.0% comparable coverage'),
     'observed health controls reach API and label coverage policy');
+  click('[data-action="overview-tab"][data-value="monitor"]');
+  await wait(() => $('#large-move-results [data-value="up_25pct_63d"]'), 'Overview fixed quarterly preset');
+  assert.equal($('#monitor-form').closest('details').open, false);
+  assert.ok($('#large-move-results [data-value="down_13pct_34d"]'));
 
   await route('monitor', '.monitor-table');
+  assert.equal($('#monitor-custom').open, false);
+  assert.ok($('#monitor-timeline [data-value="up_25pct_63d"]'));
+  const visibleHelp = $('button[aria-describedby="monitor-limit-help"]');
+  const visibleTip = $('#monitor-limit-help');
+  assert.equal(visibleTip.hidden, true);
+  visibleHelp.parentElement.dispatchEvent(new win.Event('pointerenter'));
+  assert.equal(visibleTip.hidden, false);
+  assert.match(visibleTip.textContent, /dated rows/);
+  visibleHelp.parentElement.dispatchEvent(new win.Event('pointerleave'));
+  assert.equal(visibleTip.hidden, true);
+  visibleHelp.focus();
+  assert.equal(visibleTip.hidden, false);
+  visibleHelp.dispatchEvent(new win.KeyboardEvent('keydown', {key:'Escape', bubbles:true}));
+  assert.equal(visibleTip.hidden, true);
+  visibleHelp.blur();
   assert.ok($$('.monitor-table tbody tr').length >= 20);
   click('.monitor-table [data-action="monitor-detail"][data-value="up_13pct_34d"]');
   await wait(() => $('#detail #breadth-list .pagination') && trendQueries.some((url)=>url.searchParams.get('metrics')==='up_13pct_34d'),'custom monitor contributors and exact trend');
@@ -294,10 +317,16 @@ test('research workspace workflows use the published API and a copy of the local
   assert.match($('.monitor-table thead').textContent, /0–100%/);
   click('[data-change="monitor-statistics"]');
   assert.match($('.monitor-table .with-statistics').textContent, /SMA.*Δ/s);
+  click('#monitor-custom > summary');
+  assert.equal($('#monitor-custom').open, true);
+  const thresholdHelp = document.getElementById($('#monitor-filter [name="magnitude"]').getAttribute('aria-describedby'));
+  assert.match(thresholdHelp.textContent, /34-session comparison at 13%.*counts a 34-session return of −15% and excludes −5%.*upside reading counts returns of \+13% or more/);
   set('#monitor-filter [name="sessions"]', '37');
   set('#monitor-filter [name="magnitude"]', '12.5');
   submit('#monitor-filter');
-  await wait(() => $('.monitor-table [data-value="up_12.5pct_37d"]'), 'custom numeric Monitor threshold and window');
+  await wait(() => $('#monitor-custom-results [data-value="up_12.5pct_37d"]'), 'custom numeric Monitor threshold and window');
+  assert.equal($('#monitor-timeline [data-value="up_12.5pct_37d"]'), null);
+  assert.ok($('#monitor-timeline [data-value="up_25pct_63d"]'));
   if (process.env.MARKET_FRONTEND_MONITOR_CAPTURE) {
     set('[data-change="monitor-scale"]', 'auto');
     const style = document.createElement('style');
@@ -312,34 +341,34 @@ test('research workspace workflows use the published API and a copy of the local
   assert.ok($('[data-action="export-screen"][data-value="csv"]'));
   if (config.exportFormats.includes('parquet')) assert.ok($('[data-action="export-screen"][data-value="parquet"]'));
   click('#result-table tbody .stock-link');
-  await wait(() => $('#detail [data-action="stock-style-local"]'), 'stock detail');
-  click('#detail [data-action="stock-style-local"][data-value="candles"]');
-  assert.ok($('#detail [data-plot] rect'));
-  click('#detail [data-action="stock-cadence-local"][data-value="weekly"]');
-  assert.ok($('#detail [data-plot] rect'));
-  const unzoomed = $('#detail [data-chart]').id;
-  click('#detail [data-chart-command="zoom"]');
-  assert.notEqual($('#detail [data-chart]').id, unzoomed);
+  await wait(() => location.hash.startsWith('#stock?') && $('#stock-price-panel [data-plot] rect'), 'ticker dashboard defaults to candles');
+  assert.ok($('#ticker-dashboard a[href*="tradingview.com"]'));
+  click('#stock-price-panel [data-action="stock-cadence-local"][data-value="weekly"]');
+  assert.ok($('#stock-price-panel [data-plot] rect'));
+  const unzoomed = $('#stock-price-panel [data-chart]').id;
+  click('#stock-price-panel [data-chart-command="zoom"]');
+  assert.notEqual($('#stock-price-panel [data-chart]').id, unzoomed);
   const originalObjectUrl = URL.createObjectURL;
   const originalAnchorClick = win.HTMLAnchorElement.prototype.click;
   let exported;
   try {
     URL.createObjectURL = (blob) => { exported = blob; return 'blob:weekly-fixture'; };
     win.HTMLAnchorElement.prototype.click = function () {};
-    click('#detail [data-action="stock-export-local"]');
+    click('#stock-price-panel [data-action="stock-export-local"]');
     const csv = await exported.text();
-    assert.match(csv, /^"date","open","high","low","close","volume","sma_20","sma_50","sma_200"\r?\n/);
+    assert.match(csv, /^"date","open","high","low","close","volume"(?:,.*)?\r?\n/);
     assert.ok(csv.trim().split(/\r?\n/).length > 2);
-    click('#detail [data-chart-command="reset"]');
-    click('#detail [data-action="stock-export-local"]');
+    click('#stock-price-panel [data-chart-command="reset"]');
+    click('#stock-price-panel [data-action="stock-export-local"]');
     assert.ok((await exported.text()).trim().split(/\r?\n/).length > csv.trim().split(/\r?\n/).length);
   } finally {
     URL.createObjectURL = originalObjectUrl;
     win.HTMLAnchorElement.prototype.click = originalAnchorClick;
   }
-  click('#detail [data-action="stock-tab-local"][data-value="rs"]');
+  click('#ticker-dashboard [data-action="stock-tab-local"][data-value="rs"]');
   await wait(() => $('#stock-rs-chart [data-plot]'), 'stock rank history');
-  click('#detail [data-action="close-dialog"]');
+  win.history.back();
+  await wait(() => location.hash.startsWith('#screener?') && $('#result-table .stock-link'), 'return to the originating screen');
 
   click('[data-action="compare-date-editor"]');
   set('#modal [name="date"]', savedDate(status.latestDate, 7));
@@ -349,6 +378,17 @@ test('research workspace workflows use the published API and a copy of the local
   click('[data-action="compare-date-editor"]');
   click('#clear-date-compare');
   await wait(() => $('#result-table thead') && !$('#result-table thead').textContent.includes('Past Close'), 'clear historical comparison');
+
+  for (const action of ['filters', 'sort-editor', 'columns']) {
+    const opener = $(`[data-action="${action}"]`);
+    opener.click();
+    assert.ok($('#modal').open);
+    $('#modal .dialog-body').click();
+    assert.ok($('#modal').open, 'clicking inside an editor leaves it open');
+    $('#modal').dispatchEvent(new win.MouseEvent('pointerdown', { bubbles: true, clientX: -2, clientY: -2 }));
+    $('#modal').dispatchEvent(new win.MouseEvent('click', { bubbles: true, clientX: -2, clientY: -2 }));
+    await wait(() => !$('#modal').open && document.activeElement === opener, `${action} backdrop closes and restores focus`);
+  }
 
   click('[data-action="filters"]');
   click('[data-editor="add-rule"]');
@@ -361,10 +401,11 @@ test('research workspace workflows use the published API and a copy of the local
   submit('#modal form');
   await wait(() => location.hash.includes('screen=') && $('#result-table tbody'), 'save screen');
   click('#result-table tbody .stock-link');
-  await wait(() => $('#detail').open && $('#detail [data-action="stock-tab-local"][data-value="screens"]'), 'screen membership tab');
-  click('#detail [data-action="stock-tab-local"][data-value="screens"]');
+  await wait(() => $('#ticker-dashboard [data-action="stock-tab-local"][data-value="screens"]'), 'screen membership tab');
+  click('#ticker-dashboard [data-action="stock-tab-local"][data-value="screens"]');
   await wait(() => $('#stock-screens')?.textContent.includes(savedScreen), 'point-in-time screen membership');
-  click('#detail [data-action="close-dialog"]');
+  win.history.back();
+  await wait(() => $('#result-table .stock-link') && location.hash.includes('screen='), 'saved filter remains after ticker navigation');
   click('#result-table tbody [data-change="select-stock"]');
   click('[data-action="add-selected"]');
   await wait(() => $('#modal [name="list"]'), 'watchlist chooser');
@@ -612,7 +653,7 @@ test('research workspace workflows use the published API and a copy of the local
     click('[data-action="refresh"]');
     await wait(() => $('[data-action="apply-data"]'), 'new revision notice');
     await route('monitor', '#monitor-timeline');
-    await wait(() => $('#monitor-timeline').textContent.includes('Calculating historical sessions'), 'queued timeline calculation');
+    await wait(() => /Queued for background preparation|Calculating historical sessions/.test($('#monitor-timeline').textContent), 'queued timeline calculation');
     assert.doesNotMatch($('#monitor-timeline').textContent, /No sessions in this range/);
     await wait(() => $$('.monitor-table tbody tr').length>1 && !$('#monitor-timeline .pending'), 'timeline republished after its job');
     assert.ok(jobPolls > pollsBefore);
@@ -637,7 +678,7 @@ test('research workspace workflows use the published API and a copy of the local
       draft.value=draft.defaultValue;
 
       await route('monitor', '.monitor-table');
-      const select=$('#monitor-filter [data-change="monitor-limit"]');
+      const select=$('[data-change="monitor-limit"]');
       select.focus();
       assert.equal(document.activeElement,select);
       await intervalHandlers[0]();
@@ -672,19 +713,20 @@ test('research workspace workflows use the published API and a copy of the local
   assert.ok(reviewedRevision > beforeReview);
   const overrideId = auditRow().dataset.qualityId;
   click('#quality-source-audit [data-action="stock"]');
-  await wait(() => $('#detail .stock-source-quality .quality-evidence'),'stock source quality warning');
-  assert.equal($('#detail .stock-source-quality .quality-evidence').href,evidence);
-  assert.match($('#detail .stock-source-quality').textContent,/Volume withheld/);
+  await wait(() => $('#ticker-dashboard .stock-source-quality .quality-evidence'),'stock source quality warning');
+  assert.equal($('#ticker-dashboard .stock-source-quality .quality-evidence').href,evidence);
+  assert.match($('#ticker-dashboard .stock-source-quality').textContent,/Volume withheld/);
   const inspectLastBar = () => {
-    $('#detail [data-plot]').dispatchEvent(new win.KeyboardEvent('keydown',{key:'End',bubbles:true}));
-    const tooltip = $('#detail .chart-tooltip:not([hidden])');
+    $('#stock-price-panel [data-plot]').dispatchEvent(new win.KeyboardEvent('keydown',{key:'End',bubbles:true}));
+    const tooltip = $('#stock-price-panel .chart-tooltip:not([hidden])');
     assert.match(tooltip?.textContent,/Close \$/);
     assert.match(tooltip?.textContent,/Share volume: Unavailable · reviewed source override/);
   };
   inspectLastBar();
-  click('#detail [data-action="stock-cadence-local"][data-value="weekly"]');
+  click('#stock-price-panel [data-action="stock-cadence-local"][data-value="weekly"]');
   inspectLastBar();
-  click('#detail [data-action="close-dialog"]');
+  win.history.back();
+  await wait(() => location.hash.startsWith('#settings?') && auditRow()?.dataset.qualityId === overrideId, 'return to the source review');
   click('#quality-source-audit [data-action="quality-clear"]');
   set('#quality-review-form [name="reason"]','Fixture evidence confirms the source correction.','input');
   set('#quality-review-form [name="evidenceUrl"]',correction,'input');

@@ -84,6 +84,7 @@ export async function openBreadthDrawer(env, { key, date, title, universe, readi
         `Coverage: ${row.coverage || 'unavailable'}`,
       ],
     }) : trendLoading ? '' : empty('No comparable observations','This metric has no stored readings in the chosen range.','chart'));
+    body.querySelector('[data-action="breadth-drawer-export-trend"]').disabled = !node.querySelector('[data-chart]');
     paintTrendStatus();
   }
 
@@ -124,17 +125,26 @@ export async function openBreadthDrawer(env, { key, date, title, universe, readi
   async function loadList() {
     const run = ++listingRun;
     const target = body.querySelector('#breadth-list');
+    const reading = body.querySelector('#breadth-reading');
     constituents = null;
     drawListHeader();
+    reading.innerHTML = pending('Loading breadth reading…');
     target.innerHTML = pending('Loading contributing securities…');
     const binary = signed && ['advancers','decliners'].includes(mode) ? mode : key;
     const include = signed && ['advancers','decliners'].includes(mode) ? 'numerator' : mode;
     try {
       const [result,aggregate] = await Promise.all([
-        env.api(`market/breadth/${pathPart(binary)}/contributors`,{signal,params:{...scoped,date:selectedDate,include,page,perPage:50}}),
+        env.publishedSeries(`market/breadth/${pathPart(binary)}/contributors`,{signal,params:{...scoped,date:selectedDate,include,page,perPage:50}},
+          (partial, job) => {
+            if (!active() || run !== listingRun) return;
+            reading.innerHTML = publishingHistory(job);
+            target.innerHTML = publishingHistory(job);
+          }),
         signed ? env.api('market/breadth',{signal,params:{...scoped,date:selectedDate,metrics:'adSpread'}}) : null,
       ]);
       if (!active() || run!==listingRun) return;
+      if (!result.metric || result.pendingOnly) throw new Error(result.materialization?.error ||
+        'This breadth reading has yet to be prepared for the selected session.');
       const changed = result.date && result.date !== selectedDate;
       selectedDate = result.date || selectedDate;
       if (!anchor) anchor = selectedDate;
@@ -146,7 +156,10 @@ export async function openBreadthDrawer(env, { key, date, title, universe, readi
       target.innerHTML = table(result.rows,visibleColumns,{selectable:true,selected,label:'Contributing securities',
         emptyText:'No securities in this selection.'}) + pagination(result,'breadth-drawer-page');
     } catch (error) {
-      if (active() && run===listingRun && error.name!=='AbortError') target.innerHTML=notice('Contributors unavailable',error.message,'',true);
+      if (active() && run === listingRun && error.name !== 'AbortError') {
+        reading.innerHTML = notice('Breadth reading unavailable', error.message, '', true);
+        target.innerHTML = empty('Contributors unavailable', 'No constituent table is available for this reading.', 'screens');
+      }
     }
   }
 
@@ -196,6 +209,12 @@ export async function openBreadthDrawer(env, { key, date, title, universe, readi
   }
 
   body.onclick = (event)=>{
+    const ticker = event.target.closest('[data-action="stock"]');
+    if (ticker) {
+      event.stopPropagation();
+      env.openStock(ticker.dataset.value, { ...scoped, date: selectedDate }).catch((error) => env.toast(error.message));
+      return;
+    }
     const button = event.target.closest('[data-action^="breadth-drawer-"]');
     if (!button) return;
     const {action: id,value} = button.dataset;

@@ -4,7 +4,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { activeRelease, setActiveRelease } from './release.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const id = createHash('sha256').update(root).digest('hex').slice(0, 10);
@@ -20,21 +21,27 @@ const service = `${domain}/${label}`;
 const xml = (value) => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const arg = (value) => `<string>${xml(value)}</string>`;
 
-function propertyList() {
-  const argumentsList = [process.execPath, resolve(root, 'backend/server.mjs')];
+export function serviceConfiguration(workspace = root) {
+  const release = activeRelease(workspace);
+  return { workspace, entry: resolve(release?.root || workspace, 'backend/server.mjs'), release };
+}
+
+export function propertyList({ workspace, entry } = serviceConfiguration()) {
+  const argumentsList = [process.execPath, entry];
+  const workspaceLogs = resolve(workspace, 'data', 'logs');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 <key>Label</key>${arg(label)}
 <key>ProgramArguments</key><array>${argumentsList.map(arg).join('')}</array>
-<key>WorkingDirectory</key>${arg(root)}
+<key>WorkingDirectory</key>${arg(workspace)}
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>10</integer>
 <key>Umask</key><integer>63</integer>
-<key>StandardOutPath</key>${arg(stdout)}
-<key>StandardErrorPath</key>${arg(stderr)}
+<key>StandardOutPath</key>${arg(resolve(workspaceLogs, 'preview.stdout.log'))}
+<key>StandardErrorPath</key>${arg(resolve(workspaceLogs, 'preview.stderr.log'))}
 </dict>
 </plist>
 `;
@@ -72,7 +79,7 @@ function inspect() {
     pid: pid ? Number(pid) : null, state: state || 'unloaded', plist, logs, workspace: root };
 }
 
-function setup() {
+function setup(configuration) {
   mkdirSync(launchAgents, { recursive: true });
   mkdirSync(logs, { recursive: true, mode: 0o700 });
   chmodSync(logs, 0o700);
@@ -80,7 +87,7 @@ function setup() {
     writeFileSync(file, '', { flag: 'a', mode: 0o600 });
     chmodSync(file, 0o600);
   }
-  const content = propertyList();
+  const content = propertyList(configuration);
   if (existsSync(plist) && readFileSync(plist, 'utf8') === content) return false;
   const temporary = `${plist}.${process.pid}.tmp`;
   writeFileSync(temporary, content, { flag: 'wx', mode: 0o600 });
@@ -88,18 +95,23 @@ function setup() {
   return true;
 }
 
-try {
-  const command = process.argv[2] || 'status';
+async function main(command = 'status', selector) {
   if (command === 'help' || command === '--help') {
-    console.log('Usage: npm run service -- start|stop|restart|status');
+    console.log('Usage: npm run service -- start|stop|restart|status|activate <release-id|workspace>');
   } else {
     if (process.platform !== 'darwin') throw new Error('The launchd local service is available on macOS');
-    if (!['start', 'stop', 'restart', 'status'].includes(command)) throw new Error('Choose start, stop, restart, or status');
-    if (command === 'start' || command === 'restart') {
-      const changed = setup();
+    if (!['start', 'stop', 'restart', 'status', 'activate'].includes(command)) throw new Error('Choose start, stop, restart, status, or activate');
+    if (command === 'activate') {
+      if (!selector) throw new Error('Choose a validated release ID or workspace');
+      setActiveRelease(root, selector);
+    }
+    if (['start', 'restart', 'activate'].includes(command)) {
+      const configuration = serviceConfiguration();
+      const changed = setup(configuration);
       const current = inspect();
-      if (current.loaded && (changed || command === 'restart')) required('bootout', service);
-      if (!current.loaded || changed || command === 'restart') {
+      const reload = changed || command !== 'start';
+      if (current.loaded && reload) required('bootout', service);
+      if (!current.loaded || reload) {
         required('enable', service);
         await bootstrap();
       }
@@ -107,9 +119,13 @@ try {
       required('bootout', service);
       required('disable', service);
     }
-    console.log(JSON.stringify(inspect(), null, 2));
+    const status = inspect();
+    const configuration = command === 'stop' ? null : serviceConfiguration();
+    console.log(JSON.stringify({ ...status, ...(configuration && { entry: configuration.entry, release: configuration.release }) }, null, 2));
   }
-} catch (error) {
-  console.error(error.message);
-  process.exitCode = 1;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  try { await main(...process.argv.slice(2)); }
+  catch (error) { console.error(error.message); process.exitCode = 1; }
 }

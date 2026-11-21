@@ -1,7 +1,8 @@
 import {
-  action, attr, blobDownload, count, dateLabel, empty, field, heading, icon, iconButton, names, notice, option, pathPart, pending, safe, savedScreenRoute, stockLink,
+  action, attr, blobDownload, count, dateLabel, empty, field, heading, icon, iconButton, names, notice, option, pathPart, pending, safe, savedScreenRoute,
 } from './ui.js';
 import { exportChart } from './charts.js';
+import { helpTopic, loadHelp, searchHelp } from './help.js';
 
 const viewModules = {
   overview: () => import('./overview.js'),
@@ -13,6 +14,7 @@ const viewModules = {
   journal: () => import('./journal.js'),
   screens: () => import('./library.js'),
   watchlists: () => import('./library.js'),
+  stock: () => import('./ticker.js'),
   alerts: () => import('./library.js'),
   settings: () => import('./library.js'),
 };
@@ -20,12 +22,15 @@ const main = document.querySelector('#main');
 const contextBar = document.querySelector('#context-bar');
 const modal = document.querySelector('#modal');
 const detail = document.querySelector('#detail');
+const help = document.querySelector('#help');
 const feedback = document.querySelector('#feedback');
 const store = {};
+const registrations = new Map();
 let config = null;
 let configError = '';
 let analysisStatus = null;
 let activeImport = null;
+let activePreparation = null;
 let lastStatusCheck = 0;
 let lastInteraction = Date.now();
 const batchRefreshMs = 30 * 60 * 1000;
@@ -39,31 +44,42 @@ let activeView = null;
 let generation = 0;
 let feedbackTimer;
 let buildVersion;
+let buildInfo;
 let nextBuildVersion;
 let checkRunning = false;
+const routePreparations = new Map();
 const contextKeys = ['universe', 'date', 'model', 'benchmark', 'basis', 'classification', 'universeVersion', 'modelVersion', 'dataVersion', 'healthModel', 'reference'];
+const recipeKeys = ['universe', 'universeVersion', 'model', 'modelVersion', 'benchmark', 'basis', 'classification', 'reference'];
 
 for (const element of document.querySelectorAll('[data-icon]')) element.insertAdjacentHTML('afterbegin', icon(element.dataset.icon));
 
-function routeFromUrl() {
-  const [target, query] = location.hash.slice(1).split('?');
+function routeFromUrl(hash = location.hash) {
+  const [target, query] = hash.slice(1).split('?');
   const page = Object.hasOwn(names, target) ? target : 'overview';
   const state = Object.fromEntries(new URLSearchParams(query));
   return { page, state };
 }
 let route = routeFromUrl();
 
-function currentContext() {
+function observeBuild(latest) {
+  if (!latest) return;
+  if (buildVersion && latest.version !== buildVersion) nextBuildVersion = latest.version;
+  buildVersion ||= latest.version;
+  if (latest.version === buildVersion) buildInfo = latest;
+}
+
+function currentContext(selection = route) {
+  const { state } = selection;
   const defaults = {
-    universeVersion: config?.universes?.find((item) => item.id === (route.state.universe || 'us-core'))?.version,
-    modelVersion: config?.models?.find((item) => item.id === (route.state.model || 'composite'))?.version,
+    universeVersion: config?.universes?.find((item) => item.id === (state.universe || 'us-core'))?.version,
+    modelVersion: config?.models?.find((item) => item.id === (state.model || 'composite'))?.version,
     universe: 'us-core', model: 'composite', benchmark: config?.availableBenchmarks?.includes('SPY') ? 'SPY' : config?.availableBenchmarks?.includes('VTI') ? 'VTI' : config?.availableBenchmarks?.[0] || 'SPY',
     basis: 'reconstructed',
-    classification: route.state.date && config?.classificationSystems?.includes('sec-sic') ? 'sec-sic' : config?.defaultClassification || 'provider',
-    healthModel: 'default', reference: route.state.date || route.state.basis === 'known' ? 'as-of' : 'latest',
+    classification: state.date && config?.classificationSystems?.includes('sec-sic') ? 'sec-sic' : config?.defaultClassification || 'provider',
+    healthModel: 'default', reference: state.date || state.basis === 'known' ? 'as-of' : 'latest',
   };
   return Object.fromEntries(contextKeys.flatMap((key) => {
-    const selected = route.state[key];
+    const selected = state[key];
     const value = selected === 'auto' ? defaults[key] : selected ?? defaults[key];
     return value == null || value === '' ? [] : [[key, value]];
   }));
@@ -150,11 +166,21 @@ async function publishedSeries(path, options = {}, onProgress = () => {}, reques
     if (job.status !== 'complete') throw new Error(job.error || 'Historical calculations could not be published.');
     response = await request(path, options);
   }
+  if (response.pendingOnly && response.materialization?.preparationState && response.materialization.prepareAction !== 'range') {
+    throw new Error(response.materialization.error || 'This calculation is not prepared for the selected session. Use Settings & Data → Jobs to prepare its context.');
+  }
   return response;
 }
 
-function requestFor(context) {
-  return (path, options = {}) => api(path, { ...options, params: { ...(!options.plain ? context : {}), ...options.params } });
+function requestFor(context, observe) {
+  return async (path, options = {}) => {
+    const params = { ...(!options.plain ? context : {}), ...options.params };
+    const result = await api(path, { ...options, params });
+    if (!options.plain && params.date === context.date && recipeKeys.every((key) => params[key] === context[key])) {
+      observe?.(path, result?.preparation || result?.materialization);
+    }
+    return result;
+  };
 }
 
 function snapshotContext() {
@@ -182,9 +208,32 @@ function applyAnalysisStatus(status) {
     // Analysis state remains available for the current page.
   }
 }
-function listAnalysisStatus(status) {
+function listAnalysisStatus(status, options) {
+  const prepared = preparedAnalysisStatus(status, options);
+  if (prepared) return prepared;
   const ready = status?.latestAnalysis;
   return ready && { ...status, latestDate: ready.date, dataVersion: ready.dataVersion, appliedAt: undefined };
+}
+function preparedAnalysisStatus(status, { allowPinned = false } = {}) {
+  if (!status?.preparation?.total || !allowPinned && (route.state.date || route.state.dataVersion)) return null;
+  const context = currentContext();
+  const point = status.preparation.contexts?.find((item) => item.date === status.latestDate &&
+    recipeKeys.every((key) => item[key] == null || String(item[key]) === String(context[key])));
+  return point?.stages?.current === 'complete' && point.stages.recent === 'complete'
+    ? { ...status, latestDate: point.date, dataVersion: status.preparation.dataVersion, appliedAt: undefined } : null;
+}
+function dataUpdateCandidate() {
+  const status = config?.status;
+  if (!status) return null;
+  const next = listViews.has(route.page) ? listAnalysisStatus(status, { allowPinned: true })
+    : config.automaticPreparation && refreshableViews.has(route.page)
+      ? preparedAnalysisStatus(status, { allowPinned: true }) : status;
+  const current = snapshotContext();
+  const displayedDate = current.date || analysisStatus?.latestDate;
+  const displayedVersion = Number(current.dataVersion);
+  const revision = Number(next?.dataVersion);
+  if (!next?.latestDate || !Number.isInteger(revision) || revision < displayedVersion || next.latestDate < displayedDate) return null;
+  return revision > displayedVersion || !route.state.date && !route.state.dataVersion && next.latestDate > displayedDate ? next : null;
 }
 function newerAnalysis(next, current) {
   return next && (!current || next.latestDate > current.latestDate
@@ -209,11 +258,45 @@ function initialAnalysisStatus(status) {
   } catch {
     // A new tab defaults to the current warehouse revision.
   }
+  if (config?.automaticPreparation) return listAnalysisStatus(status) || status;
   return status;
 }
 
 const importLabels = { 'provider-import': 'Importing prices', 'provider-bootstrap': 'Loading market history', 'provider-reference': 'Loading reference data' };
 const setIfChanged = (element, text) => { if (element.textContent !== text) element.textContent = text; };
+
+function footerStatus(status, visible, capture, preparing) {
+  const writeFacts = (id, facts) => {
+    const target = document.getElementById(id);
+    const html = facts.filter(Boolean).map((value) => `<span>${safe(value)}</span>`).join('');
+    if (target.innerHTML !== html) target.innerHTML = html;
+  };
+  writeFacts('footer-build', [
+    buildInfo?.appVersion ? `App v${buildInfo.appVersion}` : 'Market Intelligence',
+    buildInfo?.releaseId && `Release ${buildInfo.releaseId}`,
+    (buildInfo?.buildHash || buildInfo?.version) && `Build ${buildInfo.buildHash || buildInfo.version}`,
+    (buildInfo?.calculationVersion || status?.calculationVersion) && `Calculation ${buildInfo?.calculationVersion || status.calculationVersion}`,
+    buildInfo?.deployment, buildInfo?.builtAt && `Built ${dateLabel(buildInfo.builtAt)}`,
+  ]);
+  const context = snapshotContext();
+  const viewDate = context.date || visible?.latestDate;
+  const revision = context.dataVersion;
+  const raw = status?.dataVersion;
+  const activeCalculations = preparing?.current || activePreparation;
+  const importStatus = capture?.active ? 'History import running' : activeImport
+    ? `${importLabels[activeImport.type]} · ${count(activeImport.progress)}%`
+    : status?.lastSuccess ? `Last import ${dateLabel(status.lastSuccess)}` : '';
+  const prepStatus = activeCalculations ? `Calculations running · ${count(activeCalculations.progress)}%`
+    : preparing?.queued ? `${count(preparing.queued)} calculations queued`
+    : preparing?.failed ? `${count(preparing.failed)} calculations failed`
+    : preparing?.complete ? `${count(preparing.complete)} calculations ready` : '';
+  writeFacts('footer-data', [
+    status?.latestDate ? `Prices through ${dateLabel(status.latestDate)}` : configError ? 'Warehouse unavailable' : status ? 'No prices loaded' : 'Checking warehouse',
+    viewDate && viewDate !== status?.latestDate && `View ${dateLabel(viewDate)}`,
+    raw != null && (revision != null && String(raw) !== String(revision) ? `View revision ${revision} / warehouse ${raw}` : `Warehouse revision ${raw}`),
+    importStatus, prepStatus,
+  ]);
+}
 
 function statusLine() {
   const status = config?.status;
@@ -227,29 +310,61 @@ function statusLine() {
   const available = visible?.state === 'available';
   const capture = status?.bootstrap;
   const histories = capture?.stages?.prices?.complete;
+  const preparing = status?.preparation?.current;
+  const active = preparing || activePreparation;
   const update = capture?.active ? (Number.isInteger(histories) && histories > 0 ? `History import · ${count(histories)} symbols` : 'Loading market history')
-    : activeImport ? `${importLabels[activeImport.type]} · ${count(activeImport.progress)}%` : '';
+    : activeImport ? `${importLabels[activeImport.type]} · ${count(activeImport.progress)}%`
+    : active ? `Preparing ${config?.universes?.find(({id}) => id === preparing?.universe)?.name || 'analytics'} · ${count(active.progress)}%` : '';
   const contents = configError ? '<span class="status-dot"></span> Service unavailable'
     : update ? `<span class="status-dot syncing"></span><button class="status-action" data-action="warehouse-jobs" type="button" title="View warehouse jobs">${safe(update)}</button>`
       : visible?.latestDate ? `<span class="status-dot ${available ? 'live' : ''}"></span><span>${available ? 'EOD data' : 'Partial EOD data'}</span>`
         : '<span class="status-dot"></span> Awaiting data';
   if (badge.innerHTML !== contents) badge.innerHTML = contents;
-  badge.title = visible?.latestDate ? `Analysis through ${dateLabel(visible.latestDate)} · revision ${snapshotContext().dataVersion ?? 'unknown'}` : '';
+  const view = snapshotContext();
+  const viewDate = view.date || visible?.latestDate;
+  badge.title = viewDate ? `Analysis through ${dateLabel(viewDate)} · revision ${view.dataVersion ?? 'unknown'}` : '';
   document.querySelector('.data-source .status-dot').classList.toggle('live', available);
+  footerStatus(status, visible, capture, status?.preparation);
 }
 
 function updateContextIndicators() {
   const markup = [];
   if (nextBuildVersion) markup.push(action('Reload build', 'reload-build', 'refresh', { className: 'updated-button' }));
-  const ready = listViews.has(route.page) && listAnalysisStatus(config?.status);
-  const revision = ready?.dataVersion ?? config?.status?.dataVersion;
-  if (revision != null && (String(snapshotContext().dataVersion) !== String(revision) || currentListRoute() && newerAnalysis(ready, analysisStatus))) {
+  const update = dataUpdateCandidate();
+  if (update) {
     markup.push(action('Update data', 'apply-data', 'pulse', { className: 'updated-button',
-      title: `View warehouse revision ${revision}. Current view uses revision ${snapshotContext().dataVersion}.` }));
+      title: `View warehouse revision ${update.dataVersion}. Current view uses revision ${snapshotContext().dataVersion}.` }));
+  }
+  if (config?.automaticPreparation && routePreparations.size) {
+    const states = [...routePreparations.values()];
+    const state = states.find((item) => ['unregistered', 'failed', 'superseded'].includes(item)) || states[0];
+    if (['unregistered', 'failed', 'superseded'].includes(state)) {
+      markup.push(action(state === 'failed' ? 'Retry context preparation' : 'Prepare this context', 'prepare-context', 'refresh'));
+    } else if (['queued', 'running'].includes(state)) {
+      markup.push('<span class="muted" role="status">Preparing this context…</span>');
+    }
   }
   const target = contextBar.querySelector('#context-updates');
   const content = markup.join('');
   if (target && target.innerHTML !== content) target.innerHTML = content;
+}
+
+function registerContext(selection, { retry = false } = {}) {
+  const context = currentContext(selection);
+  const followLatest = !context.date && !context.dataVersion;
+  const key = JSON.stringify([...recipeKeys, 'date', 'dataVersion'].map((field) => String(context[field] ?? '')));
+  const existing = registrations.get(key);
+  if (existing?.pending || (!retry && existing)) return existing.promise;
+  const entry = { pending: true };
+  entry.promise = api('data/preparation', { plain: true, body: { context: { ...context, followLatest }, retry } })
+    .then((result) => {
+      if (result.waitingForCapture) registrations.delete(key);
+      return result;
+    })
+    .catch((error) => { registrations.delete(key); throw error; })
+    .finally(() => { entry.pending = false; });
+  registrations.set(key, entry);
+  return entry.promise;
 }
 
 async function requestConfig(signal, retryTransient) {
@@ -276,6 +391,7 @@ async function reloadConfig({ signal, retryTransient = false } = {}) {
     const screens = await api('screens', { plain: true, signal: screensSignal }).catch(() => config?.screens || []);
     signal?.throwIfAborted();
     config = { ...settings, screens };
+    observeBuild(settings.build);
     if (!analysisStatus) applyAnalysisStatus(initialAnalysisStatus(config.status));
     configError = '';
   } catch (error) {
@@ -327,28 +443,92 @@ function navState() {
   const title = names[route.page];
   document.title = `${title} | Market Intelligence`;
   document.querySelector('#breadcrumb-page').textContent = title;
+  helpButton.title = `Help for ${title}`;
+  helpButton.setAttribute('aria-label', helpButton.title);
+  document.querySelector('#footer-jobs').href = routeUrl('settings', { tab: 'jobs', date: null, dataVersion: null });
   for (const link of document.querySelectorAll('[data-route]')) {
     link.href = routeUrl(link.dataset.route);
     if (link.closest('nav') && link.dataset.route === route.page) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   }
-  document.body.classList.remove('nav-open');
-  document.querySelector('.menu-toggle').setAttribute('aria-expanded', 'false');
+  closeNavigation();
   contextControls();
+  statusLine();
 }
 
-function showDialog(node, title, body, subtitle = '') {
+const dialogOpeners = new WeakMap();
+const dialogs = [];
+let actionControl;
+
+function activeDialog() {
+  return dialogs.findLast((node) => node.open);
+}
+
+function focusOpener(opener) {
+  if (!opener) return;
+  const fallback = opener.id ? document.getElementById(opener.id) : opener.dataset.action &&
+    [...main.querySelectorAll('[data-action]')].find((control) =>
+      control.dataset.action === opener.dataset.action && control.dataset.value === opener.dataset.value);
+  const target = opener.isConnected ? opener : fallback;
+  if (target && !target.disabled) target.focus();
+  else if (!activeDialog()) main.focus();
+}
+
+for (const node of [modal, detail, help]) {
+  let outsideStart;
+  const isBackdrop = (event) => {
+    if (event.target !== node) return false;
+    const { left, right, top, bottom, width, height } = node.getBoundingClientRect();
+    return !(width && height) || event.clientX < left || event.clientX >= right || event.clientY < top || event.clientY >= bottom;
+  };
+  node.addEventListener('pointerdown', (event) => { outsideStart = isBackdrop(event); });
+  node.addEventListener('pointercancel', () => { outsideStart = undefined; });
+  node.addEventListener('click', (event) => {
+    if (node.open && outsideStart !== false && isBackdrop(event)) node.close();
+    outsideStart = undefined;
+  });
+  node.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    if (node.open) node.close();
+  });
+  node.addEventListener('close', () => {
+    if (node.open) return;
+    outsideStart = undefined;
+    const index = dialogs.indexOf(node);
+    if (index !== -1) dialogs.splice(index, 1);
+    const opener = dialogOpeners.get(node);
+    dialogOpeners.delete(node);
+    node.querySelector('.dialog-content').replaceChildren();
+    const active = activeDialog();
+    if (!active || opener && active.contains(opener)) focusOpener(opener);
+  });
+}
+
+function closeDialogs() {
+  for (const node of [...dialogs].reverse()) if (node.open) node.close();
+}
+
+function showDialog(node, title, body, subtitle = '', opener = actionControl || document.activeElement) {
   node.dispatchEvent(new window.Event('workspace:dialog-change'));
   node.setAttribute('aria-label', title);
   node.querySelector('.dialog-content').innerHTML = `<div class="dialog-head"><div><h2>${safe(title)}</h2>${subtitle ? `<p class="muted">${safe(subtitle)}</p>` : ''}</div>
     ${iconButton('Close', 'close-dialog', 'close')}</div><div class="dialog-body">${body}</div>`;
-  if (!node.open) node.showModal();
+  if (!node.open) {
+    dialogOpeners.set(node, opener);
+    const previous = dialogs.indexOf(node);
+    if (previous !== -1) dialogs.splice(previous, 1);
+    dialogs.push(node);
+    node.showModal();
+  }
+  (node.querySelector('[autofocus]') || node.querySelector('.dialog-head button'))?.focus();
   return node.querySelector('.dialog-body');
 }
 
-async function openStock(id) {
-  const entry = await import('./stocks.js');
-  return entry.openStock(makeEnvironment(controller?.signal), id);
+async function openStock(id, selectedContext = {}) {
+  if (!id) return;
+  const context = { ...snapshotContext(), ...selectedContext };
+  closeDialogs();
+  return go('stock', { ...context, symbol: id });
 }
 
 async function openAddWatchlist(ids) {
@@ -360,7 +540,15 @@ function makeEnvironment(signal) {
   const localRoute = route;
   const pageStore = store[localRoute.page] ||= {};
   const requestContext = snapshotContext();
-  const request = requestFor(requestContext);
+  const request = requestFor(requestContext, (path, preparation) => {
+    if (signal?.aborted || localRoute !== route) return;
+    if (preparation?.preparationState && !preparation.prepareAction) {
+      routePreparations.set(path, preparation.preparationState);
+    } else {
+      routePreparations.delete(path);
+    }
+    updateContextIndicators();
+  });
   return {
     main, modal, detail, page: localRoute.page, params: localRoute.state, config, state: pageStore,
     context: currentContext(), snapshotContext: requestContext, go, routeUrl, api: request,
@@ -379,6 +567,7 @@ async function render({ reload = false } = {}) {
   controller = new AbortController();
   const { signal } = controller;
   activeView = null;
+  routePreparations.clear();
   navState();
   main.setAttribute('aria-busy', 'true');
   main.innerHTML = heading(names[route.page]) + pending();
@@ -388,7 +577,8 @@ async function render({ reload = false } = {}) {
       if (!loaded) throw new Error(configError || 'Could not connect to the market warehouse');
     }
     if (current !== generation) return;
-    const ready = currentListRoute() && listAnalysisStatus(config.status);
+    const ready = currentListRoute() ? listAnalysisStatus(config.status)
+      : refreshableViews.has(route.page) ? preparedAnalysisStatus(config.status) : null;
     if (ready && (Number(analysisStatus?.dataVersion) !== Number(ready.dataVersion) || analysisStatus?.latestDate !== ready.latestDate)) {
       applyAnalysisStatus(ready);
       statusLine();
@@ -409,69 +599,244 @@ async function render({ reload = false } = {}) {
   }
 }
 
-let tickerSearchRun = 0;
-let tickerSearchTimer;
-async function tickerResults(query, target) {
-  const run = ++tickerSearchRun;
-  target.innerHTML = pending('Searching securities…');
+const searchButton = document.querySelector('#ticker-search');
+const helpButton = document.querySelector('#context-help');
+const menuToggle = document.querySelector('.menu-toggle');
+const searchGroups = { stocks: 'Securities', pages: 'Pages', screens: 'Saved screens', watchlists: 'Watchlists', help: 'Help' };
+
+async function openHelp(id = route.page, anchor, opener = helpButton) {
+  const body = showDialog(help, 'Workspace help', pending('Loading the workspace guide…'), '', opener);
   try {
-    const result = await requestFor(snapshotContext())('screens/query', { body: { search: query, perPage: 12, includeUntraded: true } });
-    if (run !== tickerSearchRun || !target.isConnected) return;
-    target.innerHTML = result.rows.length ? result.rows.map((row) =>
-      `<div class="search-result">${stockLink(row)}<span>${safe(row.name)}</span><span class="quiet">${safe(row.exchange)}</span></div>`).join('')
-      : empty('No matching security', 'Try another ticker or choose a different universe.');
+    const topics = await loadHelp();
+    if (!help.open || !body.isConnected) return;
+    const { title, html } = helpTopic(topics, id, routeUrl);
+    help.setAttribute('aria-label', `Help · ${title}`);
+    help.querySelector('.dialog-head h2').textContent = title;
+    body.innerHTML = html;
+    help.scrollTop = 0;
+    if (anchor) document.getElementById(anchor)?.focus();
+    else body.querySelector('[data-help-topic]')?.focus();
   } catch (error) {
-    if (run === tickerSearchRun && target.isConnected) target.innerHTML = notice('Search unavailable', error.message, '', true);
+    if (help.open && body.isConnected) body.innerHTML = notice('Help unavailable', error.message, action('Retry', 'help-topic', 'refresh', { value: id }), true);
   }
 }
-function searchDialog() {
-  const body = showDialog(modal, 'Find a stock', `<form id="ticker-form">${field('Ticker or company', '<input id="ticker-input" type="search" autocomplete="off" placeholder="Search selected universe">')}</form>
-    <div class="search-results section-space" id="ticker-results" aria-live="polite"></div>`);
+
+function searchDialog(opener = searchButton) {
+  const context = snapshotContext();
+  const body = showDialog(modal, 'Search workspace', `<form id="ticker-form">${field('Ticker, company, page, saved item, or definition',
+    '<input id="ticker-input" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="ticker-results" autocomplete="off" spellcheck="false">')}</form>
+    <p id="search-scope" class="muted"></p>
+    <div id="search-status" class="search-status" role="status" aria-live="polite"></div>
+    <div id="ticker-results" class="section-space" role="listbox" aria-label="Search results"></div>`, '', opener);
   const input = body.querySelector('#ticker-input');
   const target = body.querySelector('#ticker-results');
-  const prompt = () => {
-    ++tickerSearchRun;
-    target.innerHTML = empty('Search the warehouse', 'Enter a ticker or company name.', 'search');
+  const status = body.querySelector('#search-status');
+  const scope = body.querySelector('#search-scope');
+  const workspaceRequest = new AbortController();
+  let request;
+  let timer;
+  let query = '';
+  let point = { ...context, date: context.date || analysisStatus?.latestDate };
+  let stocks = [];
+  let watchlists = [];
+  let topics = [];
+  let stockError = '';
+  let localErrors = [];
+  let searching = false;
+  let activateWhenReady = false;
+  let selected = null;
+  let options = [];
+  const isOpen = () => modal.open && body.isConnected;
+  const matches = (title) => query.toLowerCase().split(/\s+/).every((term) => title.toLowerCase().includes(term));
+  const select = (value) => {
+    selected = value;
+    let activeId;
+    for (const option of target.querySelectorAll('[role="option"]')) {
+      const active = options[Number(option.dataset.searchIndex)]?.key === selected;
+      option.setAttribute('aria-selected', active);
+      if (active) activeId = option.id;
+    }
+    if (activeId) input.setAttribute('aria-activedescendant', activeId);
+    else input.removeAttribute('aria-activedescendant');
   };
-  prompt();
-  input.focus();
-  input.addEventListener('input', () => {
-    clearTimeout(tickerSearchTimer);
-    const query = input.value.trim();
-    if (!query) prompt();
-    else tickerSearchTimer = setTimeout(() => tickerResults(query, target), 220);
+  function paint() {
+    if (!isOpen()) return;
+    const items = {
+      stocks,
+      pages: Object.entries(names).filter(([id, name]) => id !== 'stock' && matches(name))
+        .map(([id, title]) => ({ id, title })),
+      screens: (config?.screens || []).filter(({ name }) => query && matches(name)).slice(0, 8)
+        .map((screen) => ({ id: screen.id, title: screen.name, screen })),
+      watchlists: watchlists.filter(({ name }) => query && matches(name)).slice(0, 8).map(({ id, name }) => ({ id, title: name })),
+      help: searchHelp(topics, query),
+    };
+    options = [];
+    target.innerHTML = Object.entries(items).filter(([, entries]) => entries.length).map(([kind, entries]) =>
+      `<section class="search-group" role="group" aria-label="${searchGroups[kind]}"><h3 aria-hidden="true">${searchGroups[kind]}</h3>
+        ${entries.map((entry) => {
+          const index = options.length;
+          options.push({ ...entry, kind, key: `${kind}:${entry.id}:${entry.anchor || ''}` });
+          return `<button type="button" class="search-option" role="option" tabindex="-1" aria-selected="false" id="workspace-option-${index}"
+            data-search-index="${index}" data-search-kind="${kind}"><strong>${safe(entry.title)}</strong>${entry.description ? `<span>${safe(entry.description)}</span>` : ''}</button>`;
+        }).join('')}</section>`).join('');
+    input.setAttribute('aria-expanded', String(options.length > 0));
+    select(options.some(({ key }) => key === selected) ? selected : null);
+    const revision = point.dataVersion;
+    const warehouse = config?.status?.dataVersion;
+    setIfChanged(scope, [
+      point.date ? `Securities as of ${dateLabel(point.date)}` : '',
+      revision != null ? `revision ${revision}` : '',
+      warehouse != null && revision != null && Number(warehouse) > Number(revision) ? `newer warehouse revision ${warehouse} available` : '',
+    ].filter(Boolean).join(' · '));
+    const message = [stockError, ...(query ? localErrors : [])].filter(Boolean).join(' ');
+    status.innerHTML = searching ? pending('Searching securities…')
+      : message ? notice('Some results are unavailable', message)
+      : query && !options.length ? empty('No matching items', 'Try another ticker, company name, or workspace term.', 'search') : '';
+  }
+  function choose(option) {
+    if (!option || !isOpen()) return;
+    modal.close();
+    switch (option.kind) {
+      case 'stocks': return openStock(option.id, option.context);
+      case 'pages': return go(option.id);
+      case 'screens': return go('screener', { ...savedScreenRoute(option.screen.definition), screen: option.id });
+      case 'watchlists': return go('watchlists', { list: option.id });
+      case 'help': return openHelp(option.id, option.anchor, opener);
+      default: return undefined;
+    }
+  }
+  function activateSelection() {
+    const selectedOption = options.find(({ key }) => key === selected);
+    if (selectedOption || !searching) choose(selectedOption || options[0]);
+    else activateWhenReady = true;
+  }
+  const stop = () => {
+    clearTimeout(timer);
+    request?.abort();
+    workspaceRequest.abort();
+    for (const type of ['close', 'workspace:dialog-change']) modal.removeEventListener(type, stop);
+  };
+  for (const type of ['close', 'workspace:dialog-change']) modal.addEventListener(type, stop, { once: true });
+  const restart = () => {
+    clearTimeout(timer);
+    request?.abort();
+    query = input.value.trim();
+    selected = null;
+    activateWhenReady = false;
+    stocks = [];
+    stockError = '';
+    searching = !!query;
+    paint();
+    if (!query) return;
+    const search = query;
+    const searchRequest = new AbortController();
+    request = searchRequest;
+    const { signal } = searchRequest;
+    timer = setTimeout(async () => {
+      const scoped = requestFor(context);
+      try {
+        let result;
+        try {
+          result = await scoped('stocks/search', { params: { q: search, limit: 12 }, signal });
+        } catch (error) {
+          if (error.status !== 404) throw error;
+        }
+        if (!Array.isArray(result?.rows)) {
+          result = await scoped('screens/query', { body: { search, perPage: 12, includeUntraded: true }, signal });
+          if (result.pendingOnly) throw new Error('Security search is unavailable for the selected analysis context.');
+        }
+        if (!signal.aborted) {
+          point = { ...context, date: result.date || context.date || analysisStatus?.latestDate,
+            dataVersion: result.dataVersion ?? context.dataVersion };
+          stocks = (result.rows || []).map((row) => ({ id: row.securityId || row.symbol, title: row.symbol,
+            description: [row.name, row.exchange, row.matchedAlias && row.matchedAlias !== row.symbol ? `Former ticker ${row.matchedAlias}` : null]
+              .filter(Boolean).join(' · '), context: point }));
+        }
+      } catch (error) {
+        if (!signal.aborted) stockError = error.message || 'Securities could not be searched.';
+      } finally {
+        if (!signal.aborted) {
+          searching = false;
+          paint();
+          if (activateWhenReady && !stockError) choose(options[0]);
+        }
+      }
+    }, 200);
+  };
+  input.addEventListener('input', restart);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.isComposing) {
+      event.preventDefault();
+      activateSelection();
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp'].includes(event.key) || !options.length) return;
+    event.preventDefault();
+    const index = options.findIndex(({ key }) => key === selected);
+    const next = index < 0 ? (event.key === 'ArrowDown' ? 0 : options.length - 1)
+      : (index + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length;
+    select(options[next].key);
+    document.getElementById(`workspace-option-${next}`)?.scrollIntoView?.({ block: 'nearest' });
   });
   body.querySelector('form').addEventListener('submit', (event) => {
     event.preventDefault();
-    if (input.value.trim()) {
-      modal.close();
-      openStock(input.value.trim()).catch((error) => toast(error.message));
-    }
+    activateSelection();
   });
   target.addEventListener('click', (event) => {
-    if (event.target.closest('[data-action="stock"]')) modal.close();
+    const index = event.target.closest('[data-search-index]')?.dataset.searchIndex;
+    if (index != null) choose(options[Number(index)]);
   });
+  const local = (promise, assign, label) => promise.then(assign).catch(() => {
+    if (!workspaceRequest.signal.aborted) localErrors = [...localErrors, `${label} could not be loaded.`];
+  }).finally(paint);
+  local(api('watchlists', { plain: true, signal: workspaceRequest.signal }), (result) => { watchlists = result; }, 'Watchlists');
+  local(loadHelp(), (result) => { topics = result; }, 'Help');
+  paint();
+  input.focus();
 }
 
-document.querySelector('#ticker-search').addEventListener('click', searchDialog);
+function closeNavigation(restoreFocus = false) {
+  if (!document.body.classList.contains('nav-open')) return;
+  document.body.classList.remove('nav-open');
+  menuToggle.setAttribute('aria-expanded', 'false');
+  if (restoreFocus) menuToggle.focus();
+}
+
+searchButton.addEventListener('click', () => searchDialog());
+helpButton.addEventListener('click', () => openHelp());
 document.querySelector('.skip-link').addEventListener('click', (event) => {
   event.preventDefault();
   main.focus();
 });
-document.querySelector('.menu-toggle').addEventListener('click', (event) => {
-  event.currentTarget.setAttribute('aria-expanded', document.body.classList.toggle('nav-open'));
+menuToggle.addEventListener('click', () => {
+  if (document.body.classList.contains('nav-open')) return closeNavigation(true);
+  document.body.classList.add('nav-open');
+  menuToggle.setAttribute('aria-expanded', 'true');
+  document.querySelector('nav [aria-current="page"], #navigation a')?.focus();
 });
 document.addEventListener('keydown', (event) => {
-  if (event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey && !modal.open && !detail.open && !event.target.closest('input, textarea, select, [contenteditable]')) {
+  if (event.defaultPrevented) return;
+  const layer = activeDialog();
+  if (event.key === 'Escape' && (layer || document.body.classList.contains('nav-open'))) {
     event.preventDefault();
-    searchDialog();
+    if (layer) layer.close();
+    else closeNavigation(true);
+    return;
+  }
+  if (layer || event.isComposing || event.target.closest?.('input, textarea, select, [contenteditable]')) return;
+  const slash = event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey;
+  const command = event.key.toLowerCase() === 'k' && (event.metaKey || event.ctrlKey) && !event.altKey;
+  if (slash || command) {
+    event.preventDefault();
+    const opener = document.activeElement === document.body ? searchButton : document.activeElement;
+    searchDialog(opener);
   }
 });
 
 const globalActions = {
   current() {
     const screen = config?.screens.find(({ id }) => id === route.state.screen);
-    return go(route.page, { date: null, dataVersion: null,
+    return selectContext({ date: null, dataVersion: null,
       ...(screen && savedScreenRoute(screen.definition).date ? { screen: null } : {}) });
   },
   'retry-view'() { return render({ reload: true }); },
@@ -481,14 +846,35 @@ const globalActions = {
     updateContextIndicators();
   },
   async 'apply-data'() {
+    const selection = route;
     if (!await reloadConfig()) return toast('New data could not be loaded. Try again.');
-    applyAnalysisStatus((listViews.has(route.page) && listAnalysisStatus(config.status)) || config.status);
+    if (route !== selection) return;
+    const update = dataUpdateCandidate();
+    if (!update) return updateContextIndicators();
+    applyAnalysisStatus(update);
     statusLine();
     return route.state.dataVersion ? go(route.page, { dataVersion: null }) : render();
   },
-  'warehouse-jobs'() { return go('settings', { tab: 'jobs' }); },
+  'warehouse-jobs'() { return go('settings', { tab: 'jobs', date: null, dataVersion: null }); },
+  async 'prepare-context'(value, control) {
+    control.disabled = true;
+    const hash = location.hash;
+    try {
+      const result = await registerContext(route, { retry: true });
+      if (hash === location.hash) {
+        if (result.waitingForCapture) toast('Context saved. Preparation will start when the import finishes.');
+        else await render();
+      }
+    } finally {
+      if (control.isConnected) control.disabled = false;
+    }
+  },
+  'use-universe'(id) { return selectContext({ universe: id, universeVersion: null }); },
+  'use-model'(id) { return selectContext({ model: id, modelVersion: null }); },
+  'use-health'(id) { return selectContext({ healthModel: id }); },
+  'help-topic'(id) { return openHelp(id); },
   'reload-build'() {
-    if (modal.open || detail.open) return toast('Close the open panel before reloading.');
+    if (activeDialog()) return toast('Close the open panel before reloading.');
     if (hasFormDraft()) return toast('Apply or clear the form edits before reloading.');
     location.reload();
   },
@@ -497,19 +883,44 @@ const globalActions = {
   'export-chart'(value, element) { exportChart(element.closest('.panel')?.querySelector('[data-chart]'), value || 'market-series.csv'); },
 };
 
+async function selectContext(patch) {
+  const page = route.page;
+  const hash = routeUrl(page, patch, true);
+  if (hash === location.hash) return;
+  const selected = routeFromUrl(hash);
+  go(page, patch);
+  if (!config?.automaticPreparation || !config.status?.latestDate) return;
+  try {
+    const result = await registerContext(selected);
+    if (location.hash === hash && (result.queued || result.jobs?.length)) await render();
+  } catch (error) {
+    if (location.hash === hash) toast(error.message);
+  }
+}
+
 document.addEventListener('click', async (event) => {
   const control = event.target.closest('[data-action]');
-  if (!control) return;
+  if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') return;
   const handler = globalActions[control.dataset.action] || activeView?.[control.dataset.action];
   if (!handler) return;
+  const previous = actionControl;
   try {
-    await handler(control.dataset.value, control, event);
+    actionControl = control;
+    let result;
+    try {
+      result = handler(control.dataset.value, control, event);
+    } finally {
+      actionControl = previous;
+    }
+    await result;
   } catch (error) {
     if (error.name !== 'AbortError') toast(error.message);
   }
 });
 
 document.addEventListener('change', async (event) => {
+  const helpTopicControl = event.target.closest('[data-help-topic]');
+  if (helpTopicControl) return openHelp(helpTopicControl.value);
   const control = event.target.closest('[data-change]');
   if (!control) return;
   const kind = control.dataset.change;
@@ -517,7 +928,7 @@ document.addEventListener('change', async (event) => {
     const key = control.dataset.value;
     const versions = key === 'universe' || key === 'model' ? { [`${key}Version`]: null } : {};
     if (key === 'date') versions.dataVersion = control.value ? snapshotContext().dataVersion : null;
-    go(route.page, { ...versions, [key]: control.value === 'auto' ? null : control.value });
+    await selectContext({ ...versions, [key]: control.value === 'auto' ? null : control.value });
   } else if (kind === 'saved-view' && control.value) {
     const saved = config.screens.find(({ id }) => id === control.value);
     go('screener', { ...savedScreenRoute(saved?.definition), screen: control.value });
@@ -529,6 +940,7 @@ document.addEventListener('change', async (event) => {
 });
 
 document.addEventListener('click', (event) => {
+  if (!event.target.closest('#sidebar, .menu-toggle')) closeNavigation(Boolean(document.activeElement?.closest('#sidebar')));
   const link = event.target.closest('[data-route]');
   if (!link || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   event.preventDefault();
@@ -536,8 +948,7 @@ document.addEventListener('click', (event) => {
 });
 
 window.addEventListener('hashchange', () => {
-  if (modal.open) modal.close();
-  if (detail.open) detail.close();
+  closeDialogs();
   route = routeFromUrl();
   render();
 });
@@ -571,18 +982,16 @@ async function checkBuild(force = false) {
     ]);
     if (jobs.status === 'fulfilled') {
       activeImport = jobs.value.find((job) => Object.hasOwn(importLabels, job.type) && ['queued', 'running'].includes(job.status)) || null;
+      activePreparation = jobs.value.find((job) => job.type === 'prepare-context' && job.status === 'running') || null;
       document.dispatchEvent(new window.CustomEvent('warehouse:jobs', { detail: jobs.value }));
     }
-    if (checkStatus && build.status === 'fulfilled' && build.value) {
-      if (buildVersion && build.value.version !== buildVersion) nextBuildVersion = build.value.version;
-      buildVersion ||= build.value.version;
-    }
+    if (checkStatus && build.status === 'fulfilled') observeBuild(build.value);
     if (checkStatus && status.status === 'fulfilled' && status.value && config) {
       lastStatusCheck = now;
       config = { ...config, status: status.value };
       document.dispatchEvent(new window.CustomEvent('warehouse:status', { detail: status.value }));
     }
-    const safeRefresh = !modal.open && !detail.open && !hasFormDraft();
+    const safeRefresh = !activeDialog() && !hasFormDraft();
     const canRefresh = refreshableViews.has(route.page) && safeRefresh;
     const canRefreshRankings = canRefreshList() && safeRefresh;
     const idleFor = document.visibilityState === 'hidden' ? Infinity : now - lastInteraction;
@@ -596,22 +1005,25 @@ async function checkBuild(force = false) {
       const previousRoute = route;
       const loaded = await reloadConfig();
       const next = listAnalysisStatus(loaded?.status);
-      if (newerAnalysis(next, analysisStatus) && route === previousRoute && canRefreshList() && !modal.open && !detail.open && !hasFormDraft()) {
+      if (newerAnalysis(next, analysisStatus) && route === previousRoute && canRefreshList() && !activeDialog() && !hasFormDraft()) {
         applyAnalysisStatus(next);
         statusLine();
         render();
         return;
       }
     }
-    const newData = latest && analysisStatus && Number(latest.dataVersion) > Number(analysisStatus.dataVersion);
+    const plan = latest?.preparation;
+    const planReady = preparedAnalysisStatus(latest);
+    const newData = latest && analysisStatus && Number(latest.dataVersion) > Number(analysisStatus.dataVersion) &&
+      (!plan?.total || planReady);
     const published = Number(latest?.latestAnalysis?.dataVersion ?? latest?.latestPublication?.data_version) > Number(analysisStatus?.dataVersion);
     const batchDue = analysisStatus && now - analysisStatus.appliedAt >= batchRefreshMs;
     if (newData && canRefresh && !route.state.date && !route.state.dataVersion && idleFor >= 120000 && (published || batchDue)) {
       const previousRoute = route;
       const loaded = await reloadConfig();
-      if (loaded && route === previousRoute && !modal.open && !detail.open && !hasFormDraft() &&
+      if (loaded && route === previousRoute && !activeDialog() && !hasFormDraft() &&
         (document.visibilityState==='hidden' || Date.now() - lastInteraction >= 120000)) {
-        applyAnalysisStatus(loaded.status);
+        applyAnalysisStatus(preparedAnalysisStatus(loaded.status) || loaded.status);
         statusLine();
         render();
         return;

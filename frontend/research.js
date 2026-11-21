@@ -170,8 +170,13 @@ async function renderIndustries(env) {
     const sourceName = { nasdaq: 'Nasdaq', 'sec-sic': 'SEC filing taxonomy' };
     const referenceNote = data.referenceMode === 'latest' && data.referenceDate
       ? notice('Current reference capture', `Price session ${dateLabel(data.date)} · classification reference through ${dateLabel(data.referenceDate)}.`) : '';
+    const missingRotationHistory = data.classificationSystem === 'nasdaq' && groups.length > 0 &&
+      !groups.some((group) => numeric(group.velocity4w) || numeric(group.rankChange4w));
+    const rotationNote = missingRotationHistory ? notice('Nasdaq group history is unavailable',
+      'Current Nasdaq classifications do not establish membership four or twelve weeks earlier. Historical SEC groups are available where filing-dated evidence exists.',
+      env.config.classificationSystems?.includes('sec-sic') ? action('Use SEC groups as of session', 'use-industry-source', 'layers', { value: 'sec-sic' }) : '') : '';
     main.innerHTML = heading('Industries', 'Compare group leadership, participation, and rotation.', action('Create theme', 'create-theme', 'plus', { className: 'primary' })) +
-      partialCoverage(data.coverage, env.routeUrl) + referenceNote +
+      partialCoverage(data.coverage, env.routeUrl) + referenceNote + rotationNote +
       segment('industry-level', groupLevels, state.level, 'tabs') +
       `<div class="stack"><section class="panel panel-body">${panelHead('Group rankings', `${count(groups.length)} comparable groups · ${dateLabel(data.date)}`,
         `<label class="checkbox-label"><input type="checkbox" data-change="group-emerging"${state.emergingOnly?' checked':''}> Emerging groups</label>`)}
@@ -268,7 +273,7 @@ async function renderIndustries(env) {
       if (secondary) secondary.disabled = state.compare.size !== 1;
       loadComparison();
     },
-    'use-industry-source'(value) { return env.go('industries', { classification:value, reference:env.context.date ? 'as-of' : 'latest' }); },
+    'use-industry-source'(value) { return env.go('industries', { classification:value, reference:env.context.date || value === 'sec-sic' ? 'as-of' : 'latest' }); },
     'change:rotation'(value) { state.rotation = value; draw(); },
     'change:rotation-x'(value) { state.rotationX = value; draw(); },
     'change:rotation-color'(value) { state.rotationColor = value; draw(); },

@@ -1,0 +1,448 @@
+{
+  "version": 1,
+  "topics": [
+    {
+      "id": "overview",
+      "title": "Market overview",
+      "summary": "Read broad participation, leadership, movers, and market context together.",
+      "sections": [
+        {
+          "heading": "What the overview shows",
+          "paragraphs": [
+            "The overview brings together benchmark context, advancing and declining participation, breadth history, leading securities, daily movers, and the selected market-health model. Each panel answers a different question: whether the benchmark moved, how many comparable stocks participated, and which securities or groups led. A benchmark gain alone does not imply broad participation.",
+            "Breadth percentages use the comparable traded securities for that metric and session. Prices that are missing, invalid, quarantined, unchanged where a move is required, or too short for a lookback can be excluded. Use the numerator, denominator, and coverage status in the interface to understand what a percentage describes. The data-quality page explains missing or excluded inputs."
+          ]
+        },
+        {
+          "heading": "A practical review",
+          "steps": [
+            "Start with the selected date, universe, benchmark, and RS model shown in the context controls.",
+            "Compare benchmark direction with advancing, declining, and moving-average participation.",
+            "Open a breadth reading to inspect contributors, comparable names, and exclusions for that date.",
+            "Use replay to compare another completed session; verify that its historical context is prepared before drawing a comparison."
+          ]
+        },
+        {
+          "heading": "Example research sequence",
+          "paragraphs": [
+            "For a swing-research review, first note broad participation and the benchmark context; then compare the 1M/3M/6M leaders with the model-driven improving-leader lists. Screen candidates for a defined trend, high/low distance, and volume pattern, and check whether their industry or theme shows comparable strength. Carry names to a manual watchlist or save a dynamic screen, then record a dated journal thesis and the conditions that would invalidate it. Later, replay that session or run an event/cohort study to inspect how the observations developed. This is a repeatable research sequence, not a buy/sell signal or performance promise."
+          ]
+        },
+        {
+          "heading": "Health and interpretation",
+          "paragraphs": [
+            "Health components combine selected participation and leadership measures using the active model's weights. An observed/descriptive reading summarizes available observations; it is not a probability or forecast. A strict coverage gate can withhold the score when the configured share of required inputs is missing. A missing score is a data-quality signal, not a market state."
+          ]
+        }
+      ],
+      "related": ["monitor", "coverage", "history", "glossary"],
+      "links": [{ "label": "Coverage and source quality", "href": "#settings" }]
+    },
+    {
+      "id": "monitor",
+      "title": "Market Monitor",
+      "summary": "Compare fixed breadth thresholds across sessions and inspect exact contributors.",
+      "sections": [
+        {
+          "heading": "Fixed presets and custom comparison",
+          "paragraphs": [
+            "The standard timeline uses fixed upside and downside move presets. A bar shows the share of comparable securities whose close-to-close move met that threshold over the selected window. Its denominator is the count with a valid comparable return, not the entire listed market. Optional counts show the underlying numerator and denominator; moving averages and deltas summarize the displayed metric over prior sessions.",
+            "Custom comparison controls are separate from the standard presets. Choose a rolling window in trading sessions and a percentage move, then apply it to see a separate timeline and export. A custom setting does not change the fixed preset definitions. Bar scales can be automatic for each comparison or shared for visual comparison."
+          ]
+        },
+        {
+          "heading": "Read and investigate a bar",
+          "steps": [
+            "Choose the visible session range and whether to show counts, historical extremes, or averages and changes.",
+            "Use the session date to replay the market context for that day.",
+            "Select an upside or downside bar to open its exact constituent list. The same drawer can show the selected metric's historical trend and that date's qualifying, comparable, and excluded stocks.",
+            "Export the standard or custom timeline when you need a local analysis copy."
+          ]
+        },
+        {
+          "heading": "Historical extremes",
+          "paragraphs": [
+            "Extreme markers compare each reading with its prepared historical distribution for the same metric. They mark readings at or above the 90th percentile or at or below the 10th percentile when calibration is available. If the historical comparison is not prepared or coverage is insufficient, the interface says calibration is unavailable rather than inventing a percentile."
+          ]
+        }
+      ],
+      "related": ["overview", "history", "coverage", "glossary"]
+    },
+    {
+      "id": "screener",
+      "title": "Screener",
+      "summary": "Build repeatable filters from security metrics, ranks, and supported expressions.",
+      "sections": [
+        {
+          "heading": "Build a screen",
+          "steps": [
+            "Choose a universe and analysis context before selecting fields; changing either can change the comparable population.",
+            "Add numeric, category, date, or boolean conditions. Combine conditions with nested AND/OR groups, then choose sort precedence, visible columns, computed columns, and pagination.",
+            "Use the high/low editor for distance from a rolling extreme or session age since a strict break. Save the definition when you want to reuse it.",
+            "Inspect the result count and field availability. A null value can mean insufficient history, unavailable source data, a quarantined interval, or an unprepared context."
+          ]
+        },
+        {
+          "heading": "Rolling high and low fields",
+          "paragraphs": [
+            "Distance is the close relative to the highest high or lowest low in the selected rolling window. Strict age counts trading sessions since price strictly exceeded the prior rolling high or fell below the prior rolling low; equal highs and lows do not reset that clock. Age of the current extreme is a separate value. An event on the current session has age zero. A gap or unverified split crossing can make the field unavailable.",
+            "Windows are measured in trading sessions: 52 weeks is 252 sessions. Example filters include at least 30 sessions since a 20-session high or at least 250 since a 252-session low; these are filter values, not minimum-history requirements. The rolling window and prior-extreme event must be supported by contiguous, source-safe history. A saved screen can follow the latest completed prepared EOD or pin a historical date and data revision."
+          ]
+        },
+        {
+          "heading": "Expressions and limits",
+          "paragraphs": [
+            "Computed columns and screen expressions support a validated set of numeric operations, comparisons, boolean logic, and functions such as rank, percentile, previous, change, min, max, abs, log, and coalesce. This is a safe metric-expression language, not arbitrary SQL or Python. Screen expressions do not make every ranking-model method available as a model formula.",
+            "Built-in Stockbee-style presets are fixed: 4% in one session, 25% in 63 sessions, 25% or 50% in 20 sessions, and 13% in 34 sessions. Custom rolling thresholds are separate; the app does not claim a proprietary Stockbee formula."
+          ]
+        }
+      ],
+      "related": ["rankings", "screens", "stock", "coverage", "glossary"]
+    },
+    {
+      "id": "rankings",
+      "title": "Relative-strength rankings",
+      "summary": "Compare returns and model ranks within the selected comparable population.",
+      "sections": [
+        {
+          "heading": "Return leader lists",
+          "paragraphs": [
+            "Independent split-adjusted return lists are available for 1 week, 1 month, 3 months, 6 months, and 1 year. Each period has its own eligible/comparable population. The adjustable top-percent cutoff defaults to 2%; the list size is the ceiling of population times cutoff. A smaller population can therefore produce fewer results. Rows link to the corresponding TradingView chart, and selected rows can be carried to a watchlist.",
+            "These period lists answer which securities led a particular interval. Model-driven lists answer different questions, including Top RS, Fast Improvers, New Top-Decile Entries, Emerging Leaders, Industry Leaders, and Weakening Leaders. A model list is not interchangeable with a raw return list."
+          ]
+        },
+        {
+          "heading": "Composite RS calculation",
+          "definitions": [
+            {
+              "term": "Composite RS",
+              "text": "The built-in composite model combines split-adjusted 12-, 6-, 3-, and 1-month returns using weights of 40%, 30%, 20%, and 10%, then ranks securities within the selected comparable universe.",
+              "formula": "score = 0.40 × return(252 sessions) + 0.30 × return(126) + 0.20 × return(63) + 0.10 × return(21)"
+            },
+            {
+              "term": "Percentile",
+              "text": "Percentiles are relative to eligible comparable securities in the current universe and context. Higher percentiles indicate stronger relative rank; insufficient lookback history remains null rather than being filled with zero."
+            }
+          ]
+        },
+        {
+          "heading": "Create a model and choose a date",
+          "steps": [
+            "Select a built-in model or create a versioned model with supported return windows and one of the available scoring methods.",
+            "Use latest mode for the most recent completed, prepared EOD; use replay for a historical date and pinned data revision.",
+            "Check the comparable population and history sufficiency before comparing ranks across dates."
+          ],
+          "paragraphs": ["Rank ties use deterministic ordering, but equal scores do not imply different economic strength. Model results depend on the chosen universe, benchmark, price basis, calculation version, and available history."]
+        }
+      ],
+      "related": ["screener", "stock", "screens", "watchlists", "glossary"]
+    },
+    {
+      "id": "industries",
+      "title": "Industries and themes",
+      "summary": "Compare group participation, leadership, relative performance, and changes over time.",
+      "sections": [
+        {
+          "heading": "How group views work",
+          "paragraphs": [
+            "Group views aggregate security metrics for the selected classification system and context. Depending on the panel, you can compare group breadth, median or cap-weighted performance, relative strength, leadership, rank changes, persistence, turnover, and parent-relative results. Drill into a group to inspect its securities and compare the exact date's inputs.",
+            "Themes are user-defined collections and can overlap industries. A theme's summary describes its members; it does not create an independent provider classification. Group changes can reflect both security performance and changes in eligible membership."
+          ]
+        },
+        {
+          "heading": "Choose a classification carefully",
+          "paragraphs": [
+            "Nasdaq typed-reference classifications represent a captured current reference, not a full historical classification series. For dated historical industry analysis, SEC/SIC is the available alternative, with the caveat that SEC identity mapping is through the current catalog and does not establish a complete point-in-time universe. If a group lacks prior classifications, historical comparison can be unavailable or incomplete.",
+            "Rotation and leadership persistence charts compare prepared sessions and show cohort or comparable counts where applicable. Nulls mean the source cohort or required history is not available; they should not be read as zero leadership."
+          ]
+        },
+        {
+          "heading": "A useful workflow",
+          "steps": [
+            "Choose the date, universe, classification, and model, then compare groups on both absolute and parent-relative measures.",
+            "Open a group to review contributors and breadth denominators before concluding that the whole group is participating.",
+            "Use a saved theme to compare a consistent custom basket across prepared sessions."
+          ]
+        }
+      ],
+      "related": ["history", "screener", "coverage", "glossary"]
+    },
+    {
+      "id": "history",
+      "title": "Historical explorer and studies",
+      "summary": "Replay prepared market history and evaluate cohorts or events with explicit availability limits.",
+      "sections": [
+        {
+          "heading": "Historical series and replay",
+          "paragraphs": [
+            "Historical Explorer plots selected metrics for a chosen universe, model, benchmark, classification, and data revision. Daily and weekly series may include breadth, ranks, group leadership, and transition or persistence measures. Selecting a date changes the analytical context; use the displayed date and revision to confirm what is being compared.",
+            "Historical observations are constrained by the source records available for that date. The current warehouse has a broader captured history beginning in late 2016, while the earliest portion contains only a small sample. A complete sequence of dates is not proof that every US security was present on every date. Historical float, complete ticker-reuse continuity, and terminal returns for delisted securities are not established."
+          ]
+        },
+        {
+          "heading": "Cohorts, events, and analogs",
+          "paragraphs": [
+            "Event studies measure forward returns after a defined market event; cohorts compare a selected set of securities. Transition analysis counts comparable changes between prepared periods, and analogs compare current context with earlier observations. Results should show sample size, comparison counts, and censoring. Right-censored outcomes have not yet completed their forward window.",
+            "The system uses availability-aware dates to avoid treating a later-published input as known earlier. That safeguard cannot compensate for missing historical classifications, prices, or delisted terminal data. These are descriptive studies, not estimates of future performance."
+          ]
+        },
+        {
+          "heading": "Prepare before reading",
+          "steps": [
+            "Select the exact date and context, then check Data Quality or job status if the chart reports unprepared or partial history.",
+            "Queue the specific history job when needed and wait for completion; normal read requests do not silently compute a cold full-catalog history grid.",
+            "Export plotted data when you need to review or reproduce a result outside the app."
+          ]
+        }
+      ],
+      "related": ["overview", "industries", "coverage", "glossary"]
+    },
+    {
+      "id": "journal",
+      "title": "Market Journal",
+      "summary": "Save dated research notes and structured market reports with versioned prompts and factors.",
+      "sections": [
+        {
+          "heading": "Reports and prompts",
+          "paragraphs": [
+            "Market Journal stores daily report revisions, a versioned Markdown prompt, and structured numeric factors. Generated reports include sentiment, market health, risk posture, and confidence fields, plus any configured factors. The report records its availability time and next eligible session so a historical study does not pretend the text was available before publication.",
+            "Retrospective reports are labeled and excluded from backtests by default. A Claude API key is optional and must be configured in Journal Settings before real generation; no report should be described as Claude-generated unless the provider response was actually received. The key is encrypted locally."
+          ]
+        },
+        {
+          "heading": "Keep notes separate",
+          "paragraphs": [
+            "Personal notes are stored separately from generated reports and remain local. A note is not sent to Anthropic unless you explicitly opt in for that generation. Avoid putting secrets or account credentials in a prompt or note. The active prompt and custom factor definitions are versioned so later edits do not silently rewrite prior report context."
+          ]
+        },
+        {
+          "heading": "Use it in research",
+          "steps": [
+            "Review the selected market context and data quality before generating a report.",
+            "Edit and publish a prompt revision, then define numeric factors with clear labels and descriptions.",
+            "Save your own note separately; opt in only if you want that note included in the request.",
+            "Use factor charts and backtests to inspect recorded values, respecting each report's availability time and the default exclusion of retrospective entries."
+          ]
+        }
+      ],
+      "related": ["settings", "coverage", "history", "glossary"]
+    },
+    {
+      "id": "watchlists",
+      "title": "Watchlists",
+      "summary": "Track manually selected securities or the current members of a saved screen.",
+      "sections": [
+        {
+          "heading": "Manual and dynamic lists",
+          "paragraphs": [
+            "A manual watchlist stores securities you explicitly add. You can add a ticker from search, a screener result, a rankings list, or a contributor drawer, then remove names without changing the source screen. A dynamic watchlist is linked to a saved screen and evaluates that screen's membership rather than maintaining an independent manual member set.",
+            "Dynamic membership can change as the latest completed EOD context changes. If the source screen is pinned to a historical date or data revision, the watchlist is a replay of that pinned definition. The page labels live versus pinned behavior when the context is available."
+          ]
+        },
+        {
+          "heading": "Create a watchlist",
+          "steps": [
+            "Choose Create Watchlist and select Manual selections or Dynamic from a saved screen.",
+            "For a manual list, add securities by ticker or carry selected rows from another market view.",
+            "For a dynamic list, save the source screen first and confirm whether it follows latest EOD or a pinned replay.",
+            "Open a row for stock detail or its TradingView chart; use the screen's own filters to change dynamic membership."
+          ]
+        },
+        {
+          "heading": "Interpret membership",
+          "paragraphs": ["A watchlist is an organizational tool, not an endorsement or trade instruction. Missing or unranked securities can remain in a manual list even when they are excluded from a particular ranking denominator."]
+        }
+      ],
+      "related": ["screens", "screener", "rankings", "stock"]
+    },
+    {
+      "id": "screens",
+      "title": "Saved screens",
+      "summary": "Store filter, column, sort, and context choices for repeatable latest or historical research.",
+      "sections": [
+        {
+          "heading": "Save a reusable definition",
+          "paragraphs": [
+            "A saved screen stores its filters, supported expressions, columns, sort order, and analysis context. Latest-mode screens follow the latest completed prepared EOD publication. Historical screens can pin a date and data version so their definition can be replayed against that context. A model or source revision may also be pinned where the saved definition specifies it.",
+            "When a definition depends on rolling high/low measures, save or prepare the required windows. Preparation status is tied to the exact context; a completed archive for another model, benchmark, universe, classification, or warehouse version does not guarantee this screen is ready."
+          ]
+        },
+        {
+          "heading": "Use and revise screens",
+          "steps": [
+            "Build and inspect the screen in the Screener, then choose Save Screen.",
+            "Choose whether to follow latest data or pin the selected historical session.",
+            "Open a saved screen to evaluate its current or pinned membership; inspect null fields and comparable counts.",
+            "Create a new saved version when the research rule changes so prior definitions remain identifiable."
+          ]
+        },
+        {
+          "heading": "What a match means",
+          "paragraphs": ["A match means the available metrics satisfied the saved predicate in the chosen context. It does not certify complete market membership or source coverage. Expressions support the app's safe numeric/filter language, not arbitrary database queries or every possible RS scoring formula."]
+        }
+      ],
+      "related": ["screener", "watchlists", "rankings", "coverage"]
+    },
+    {
+      "id": "alerts",
+      "title": "Alerts",
+      "summary": "Evaluate saved rules for market breadth, stock conditions, screens, groups, or regimes.",
+      "sections": [
+        {
+          "heading": "Supported rules",
+          "paragraphs": [
+            "Alert rules can watch a breadth threshold, a stock condition entering or leaving a condition, saved-screen membership, industry-rank entry, or a market-health regime change. Rules have a name and active state. When an evaluation matches, the app stores a dated event with the evaluated context so you can review what triggered it.",
+            "Alerts are evaluated against completed analytical sessions and available prepared inputs. A missing source value or incomplete context can prevent a condition from matching; it should not be interpreted as a negative event. The event log is a research record, not an execution or broker integration."
+          ]
+        },
+        {
+          "heading": "Create and evaluate",
+          "steps": [
+            "Open Alerts and choose Create Rule.",
+            "Select the trigger type and specify its threshold, screen, group, or regime condition.",
+            "Save the rule and confirm it is enabled. Pause or edit the rule when its research definition changes.",
+            "Evaluate a completed session when available, then inspect the event's date, universe, and source context."
+          ]
+        },
+        {
+          "heading": "Avoid overreading alerts",
+          "paragraphs": ["A triggered rule reports that a defined condition occurred in the data. It does not recommend a trade or predict a return. Review the underlying prices, denominators, and data-quality notes before using an event in a study."]
+        }
+      ],
+      "related": ["monitor", "screens", "industries", "overview", "coverage"]
+    },
+    {
+      "id": "settings",
+      "title": "Settings and data quality",
+      "summary": "Choose analytical context, inspect source coverage, manage local imports, and configure Journal access.",
+      "sections": [
+        {
+          "heading": "Context and readiness",
+          "paragraphs": [
+            "The active context can include date, universe, RS model, benchmark, classification, price basis, coverage threshold, and warehouse revision. The same metric can differ when one of these changes. Data Quality and job status expose received records, exclusions, source errors, and whether a specific calculation context has been prepared.",
+            "Recent provider imports do not automatically mean recent analytics are ready. The warehouse import, raw capture receipt, strict universe coverage, and prepared analytics are separate states. For broad datasets, preparation runs as queued background work and can take hours or be held by a disk-space admission guard. Check the exact requested context before interpreting a chart."
+          ]
+        },
+        {
+          "heading": "Provider and security settings",
+          "paragraphs": [
+            "Provider credentials are read server-side from private local settings. Do not paste keys into help, browser code, or saved research. EODHD daily prices, bulk history, split actions, and delisted listings are available under the configured account; fundamentals and ticker-rename requests have returned 403. Historical public float and complete point-in-time membership remain unavailable in current sources.",
+            "Journal Settings can store an Anthropic API key encrypted locally. A key is optional; without it, live Claude generation is not available. Prompt and factor revisions can still be edited without representing them as generated reports."
+          ]
+        },
+        {
+          "heading": "Operator workflow",
+          "steps": [
+            "Check warehouse status, data quality, and queued jobs before changing provider or calculation settings.",
+            "Use targeted imports or repairs for known gaps; avoid forcing a full history restart unless that is intended.",
+            "After an import, check current, recent, and history preparation status separately.",
+            "Create and verify a backup before a large import or destructive recovery operation."
+          ]
+        }
+      ],
+      "related": ["coverage", "journal", "history", "glossary"]
+    },
+    {
+      "id": "stock",
+      "title": "Ticker detail",
+      "summary": "Review a security's price history, relative strength, volume, range metrics, and provenance.",
+      "sections": [
+        {
+          "heading": "What is on the ticker page",
+          "paragraphs": [
+            "Ticker detail combines a six-month view of 126 trading sessions of OHLCV candles, price/volume measures, returns, relative-strength history, selected benchmark comparisons, and available source/provenance fields. The plotted chart can be exported as CSV. Use the TradingView link to open the matching security chart in a separate research tool.",
+            "Metrics are scoped to the selected date, model, benchmark, price basis, universe, and data/calculation revision. The ticker's loaded-history high is limited to the history actually present for that security; it is not necessarily its all-time high. Corporate actions and unresolved source-quality intervals can change which measures are usable."
+          ]
+        },
+        {
+          "heading": "Range and volume measures",
+          "definitions": [
+            {
+              "term": "Distance from rolling high",
+              "text": "The close's relative distance from the highest high in the selected session window. Values near zero are close to that window's high; negative values are below it.",
+              "formula": "(close − rolling high) / rolling high"
+            },
+            {
+              "term": "Strict days since high/low",
+              "text": "Trading sessions since a session strictly exceeded the prior rolling high or fell below the prior rolling low. Ties do not reset the counter; the current extreme's age is shown separately."
+            },
+            {
+              "term": "52-week window",
+              "text": "252 trading sessions. A window can be unavailable until its required comparable history is prepared and source-safe."
+            }
+          ]
+        },
+        {
+          "heading": "Investigate the record",
+          "steps": [
+            "Confirm symbol identity, selected context, listing dates, and loaded history span.",
+            "Compare the candle chart with action/provenance notes when the return or volume series looks discontinuous.",
+            "Use watchlist or export actions to carry the security into a saved workflow; review exclusions before treating a missing field as zero."
+          ]
+        }
+      ],
+      "related": ["screener", "rankings", "watchlists", "coverage", "glossary"]
+    },
+    {
+      "id": "coverage",
+      "title": "Coverage and source limitations",
+      "summary": "Separate provider capture, warehouse import, universe coverage, and prepared analytics.",
+      "sections": [
+        {
+          "heading": "Four different states",
+          "definitions": [
+            { "term": "Raw capture", "text": "Provider responses and manifests saved for audit or re-import. Capture receipt counts describe requests and records received, not market-wide analytical coverage." },
+            { "term": "Warehouse import", "text": "Validated, identity-mapped observations committed into a specific data version. Invalid rows, stale symbols, pre-listing bars, ambiguous aliases, and quarantined windows can be withheld." },
+            { "term": "Universe coverage", "text": "The fraction of eligible securities or observations represented for a selected date and metric. The denominator depends on universe rules and valid source history." },
+            { "term": "Prepared analytics", "text": "Calculated snapshots and archives available for the exact model, date, benchmark, classification, and data/calculation version requested." }
+          ]
+        },
+        {
+          "heading": "Known limits",
+          "paragraphs": [
+            "EODHD price, bulk-history, action, and delisted-listing endpoints are available under the configured account. Fundamentals and rename endpoints have returned 403. SEC/SIC and Nasdaq current-reference sources add useful classifications, but do not provide complete historical membership. Historical public float is not established, delisted records do not have complete terminal returns, and ticker reuse needs more source evidence.",
+            "Some early historical dates contain only a small sample, while wider market coverage begins later. Recent captures can be partial, and a partial receipt does not trigger an automatic full-history redownload on every scheduled refresh. Raw source, corrections, received counts, and analytics readiness should be checked independently."
+          ]
+        },
+        {
+          "heading": "Coverage-aware interpretation",
+          "paragraphs": [
+            "Observed/descriptive metrics report what the current comparable set shows. Strict health applies configured minimum support and can withhold a score. Neither mode repairs missing source history. A percentage must be read with its numerator, denominator, and date; changing the universe changes the question being answered."
+          ]
+        }
+      ],
+      "related": ["overview", "monitor", "history", "settings", "glossary"]
+    },
+    {
+      "id": "glossary",
+      "title": "Definitions and calculations",
+      "summary": "Shared terms used across market breadth, relative strength, history, and health.",
+      "sections": [
+        {
+          "heading": "Common definitions",
+          "definitions": [
+            { "term": "Comparable population", "text": "Securities eligible for a specific metric in a selected universe, date, and context after required price/history checks." },
+            { "term": "Breadth percentage", "text": "Qualifying securities divided by comparable securities for that metric and session.", "formula": "100 × numerator / denominator" },
+            { "term": "Relative strength percentile", "text": "A security's position relative to comparable securities. Higher percentile means stronger relative rank; it is not a future-return probability." },
+            { "term": "EOD", "text": "End-of-day data for a completed market session. Latest-mode screens and reports follow completed and prepared publications, not an unfinished intraday quote." },
+            { "term": "Observed health", "text": "A descriptive score based on available component observations and shown with support/coverage information." },
+            { "term": "Strict health", "text": "A score made available only when configured component coverage and sample minimums are satisfied; otherwise the score is withheld." },
+            { "term": "RASI proxy", "text": "The app's observed NYSE common-stock ratio-adjusted summation series. It is not the published NYSE all-issues NYSI.", "formula": "net advances = 1000 × (advancers − decliners) / (advancers + decliners); oscillator = fast EMA − slow EMA; summation = cumulative oscillator after warmup" }
+          ]
+        },
+        {
+          "heading": "More metric notes",
+          "paragraphs": [
+            "Split-adjusted returns account for verified splits in the price series. Total-return mode additionally depends on supported dividend inputs; missing provider fundamentals or corporate events should not be invented. Rank is an ordinal position within the comparable universe, while percentile provides a normalized relative position.",
+            "An SMA is the simple mean of values over a stated number of sessions. An EMA weights recent observations more heavily: EMA(t) = α × value(t) + (1 − α) × EMA(t−1). The summation proxy starts its fast/slow EMAs and cumulative value at zero, derives a fast-minus-slow exponential oscillator, and publishes after its valid-coverage warmup; gaps restart that warmup."
+          ]
+        }
+      ],
+      "related": ["overview", "monitor", "rankings", "screener", "coverage", "stock"],
+      "links": [
+        { "label": "McClellan oscillator method", "href": "https://www.mcoscillator.com/learning_center/kb/mcclellan_oscillator/Calculating_the_McClellan_Oscillator/" },
+        { "label": "Ratio-adjusted summation methodology", "href": "https://www.mcoscillator.com/learning_center/kb/market_data/ratio_adjusted_summation_index/" }
+      ]
+    }
+  ]
+}

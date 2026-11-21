@@ -8,15 +8,20 @@ let drawerRequest = 0;
 const ranges = [[21, '1M'], [63, '3M'], [126, '6M'], [252, '1Y'], [504, '2Y']];
 const maPeriods = [20, 50, 200];
 
+export function plottableBar(bar) {
+  return numeric(bar?.close) && bar.traded !== false && !bar.unverifiedSplit
+    ? bar : { ...bar, close:null, open:null, high:null, low:null, volume:null };
+}
+
 function addMovingAverages(bars) {
   const sums = new Map(maPeriods.map((n) => [n, 0]));
-  const valid = (bar) => numeric(bar?.close) && bar.traded !== false && !bar.unverifiedSplit;
   let consecutive = 0;
-  return bars.map((bar, index) => {
-    if (!valid(bar)) {
+  return bars.map((rawBar, index) => {
+    const bar = plottableBar(rawBar);
+    if (!numeric(bar.close)) {
       consecutive = 0;
       for (const n of maPeriods) sums.set(n, 0);
-      return { ...bar, close:null,open:null,high:null,low:null,volume:null };
+      return bar;
     }
     consecutive++;
     const moving = {};
@@ -29,7 +34,7 @@ function addMovingAverages(bars) {
   });
 }
 
-function toWeekly(bars) {
+export function toWeekly(bars) {
   const byWeek = new Map();
   for (const bar of bars) {
     const date = new Date(`${bar.date}T00:00:00Z`);
@@ -48,6 +53,24 @@ function toWeekly(bars) {
     }
   }
   return [...byWeek.values()];
+}
+
+export function describePricePoint(bar) {
+  return [...(bar.priceQuarantined ? ['Source price quarantined · return unavailable'] : []),
+    `Share volume: ${numeric(bar.volume) ? compact(bar.volume) : 'Unavailable'}${bar.volumeQuarantined ? ' · reviewed source override' : ''}`];
+}
+
+export function stockScreenMatches(env, result) {
+  const { date, evaluated, screens } = result;
+  const caption = `Evaluated ${count(evaluated)} saved screens as of ${dateLabel(date)}.`;
+  if (!screens.length) return empty('No saved screen matches', caption, 'screens');
+  return `<div class="stack">${screens.map((screen) => {
+    const context = { ...env.snapshotContext, universe: screen.universe?.id || screen.universe || env.context.universe,
+      universeVersion: screen.universe?.version || null, model: screen.model?.id || screen.model || env.context.model,
+      modelVersion: screen.model?.version || null, date, screen: screen.id };
+    return `<div class="simple-row"><div><strong>${safe(screen.name)}</strong><div class="muted">Saved version ${count(screen.version)}</div></div>
+      <a href="${safe(env.routeUrl('screener', context))}" class="button">Open screen ${icon('chevron-right')}</a></div>`;
+  }).join('')}</div><p class="muted section-space">${caption}</p>`;
 }
 
 const tile = (label, value, note = '') => `<div class="metric-tile"><span>${safe(label)}</span><strong>${safe(value)}</strong>${note ? `<small>${safe(note)}</small>` : ''}</div>`;
@@ -135,15 +158,7 @@ export async function openStock(env, id) {
         if (target.isConnected) target.innerHTML = publishingHistory(job);
       });
       if (!target.isConnected) return;
-      const matching = screenMembership.screens;
-      target.innerHTML = matching.length ? `<div class="stack">${matching.map((screen) => {
-        const context = { ...env.snapshotContext, universe: screen.universe?.id || screen.universe || env.context.universe,
-          universeVersion: screen.universe?.version || null, model: screen.model?.id || screen.model || env.context.model,
-          modelVersion: screen.model?.version || null, date: screenMembership.date, screen: screen.id };
-        return `<div class="simple-row"><div><strong>${safe(screen.name)}</strong><div class="muted">Saved version ${count(screen.version)}</div></div>
-          <a href="${safe(env.routeUrl('screener', context))}" class="button">Open screen ${icon('chevron-right')}</a></div>`;
-      }).join('')}</div><p class="muted section-space">${count(screenMembership.evaluated)} saved screens evaluated as of ${dateLabel(screenMembership.date)}.</p>`
-        : empty('No saved screen matches', `Evaluated ${count(screenMembership.evaluated)} saved screens as of ${dateLabel(screenMembership.date)}.`, 'screens');
+      target.innerHTML = stockScreenMatches(env, screenMembership);
     } catch (error) {
       if (target.isConnected) target.innerHTML = notice('Screen membership unavailable', error.message, '', true);
     }
@@ -174,8 +189,7 @@ export async function openStock(env, id) {
           { key: 'sma_50', label: '50D SMA', format: money }, { key: 'sma_200', label: '200D SMA', format: money }],
         { volume:true,fill:priceStyle==='line',candles:priceStyle==='candles',height:270,axisFormat:(value)=>`$${number(value,0)}`,
           exportFields:['open','high','low','close','volume'],
-          describePoint:(bar)=>[...(bar.priceQuarantined?['Source price quarantined · return unavailable']:[]),
-            `Share volume: ${numeric(bar.volume)?compact(bar.volume):'Unavailable'}${bar.volumeQuarantined?' · reviewed source override':''}`] })}
+          describePoint:describePricePoint })}
         </section>
         <div class="metric-grid section-space">${[['1W return', data.return_5d], ['1M return', data.return_21d], ['3M return', data.return_63d],
           ['6M return', data.return_126d], ['12M return', data.return_252d]].map(([label, value]) => tile(label, rate(value))).join('')}</div>`

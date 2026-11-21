@@ -1,0 +1,435 @@
+import { createHash } from 'node:crypto';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
+import { expectedSessions } from './calendar.mjs';
+import { CALCULATION_VERSION, isoDate, normalizeSymbol } from './database.mjs';
+import { UNIVERSES } from './engine.mjs';
+import { mean, quantile } from './metrics.mjs';
+
+const format = 'prepared-details-1';
+const maximumSessions = 7560;
+const wholeCatalog = UNIVERSES.find(({ id }) => id === 'us-all');
+const pinnedScope = Symbol('prepared detail scope');
+export const detailRiskWindows = Object.freeze([21, 63, 126, 252, 504, 704]);
+const digest = (value) => createHash('sha256').update(value).digest('hex');
+const encode = (value) => gzipSync(JSON.stringify(value), { level: 6 });
+const decode = (value) => JSON.parse(gunzipSync(value));
+const barFields = [
+  'open', 'high', 'low', 'close', 'rawClose', 'volume', 'rawVolume', 'dollarVolume', 'traded',
+  'missing', 'unverifiedSplit', 'priceQuarantined', 'volumeQuarantined', 'quality',
+  'knownAt', 'ingestedAt', 'source', 'version', 'volumeBasis',
+];
+const identityFields = ['symbol', 'name', 'exchange', 'type', 'isin', 'listingDate', 'delistingDate'];
+const highFields = ['allTimeHigh', 'loadedHistoryHigh', 'loadedHistoryHighFrom', 'loadedHistoryHighThrough',
+  'loadedHistoryHighObservations', 'loadedHistoryHighExpected', 'loadedHistoryHighBoundary',
+  'distance_all_time_high', 'distance_loaded_history_high'];
+const keyWhere = 'calculation_version=? AND basis=? AND security_id=? AND data_version=? AND anchor_date=?';
+const schema = `
+  CREATE TABLE IF NOT EXISTS prepared_detail_blocks (
+    hash TEXT PRIMARY KEY, value BLOB NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS prepared_detail_products (
+    calculation_version TEXT NOT NULL, basis TEXT NOT NULL, security_id TEXT NOT NULL,
+    data_version INTEGER NOT NULL, anchor_date TEXT NOT NULL, header BLOB NOT NULL, blocks BLOB NOT NULL,
+    PRIMARY KEY(calculation_version,basis,security_id,data_version,anchor_date)
+  ) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS prepared_detail_risk (
+    calculation_version TEXT NOT NULL, basis TEXT NOT NULL, security_id TEXT NOT NULL,
+    data_version INTEGER NOT NULL, anchor_date TEXT NOT NULL, benchmark TEXT NOT NULL, value BLOB NOT NULL,
+    PRIMARY KEY(calculation_version,basis,security_id,data_version,anchor_date,benchmark)
+  ) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS prepared_detail_batches (
+    id TEXT PRIMARY KEY, cursor TEXT, processed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL,
+    written INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0
+  ) WITHOUT ROWID
+`;
+
+const keyFor = (config, id, dataVersion = config.dataVersion, date = config.date) =>
+  [CALCULATION_VERSION, config.basis, id, dataVersion, date];
+const pick = (source, names) => Object.fromEntries(names.filter((name) => Object.hasOwn(source, name)).map((name) => [name, source[name]]));
+const present = (db) => db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='prepared_detail_products'").get();
+
+function normalizedWindows(values = detailRiskWindows) {
+  if (!Array.isArray(values) || values.length > 24 || values.some((value) => !Number.isInteger(value) || value < 1 || value > maximumSessions)) {
+    throw new RangeError('Risk lookbacks must be whole trading-session counts from 1 to 7,560');
+  }
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
+function normalizedBenchmarks(values = [], preferred) {
+  if (!Array.isArray(values) || values.length > 24) throw new RangeError('Choose up to 24 prepared risk benchmarks');
+  const result = [...new Set(['SPY', 'VTI', preferred, ...values].filter(Boolean).map(normalizeSymbol))].sort();
+  if (result.length > 24) throw new RangeError('Choose up to 24 prepared risk benchmarks including SPY and VTI');
+  if (result.some((value) => !value || value.length > 30)) throw new RangeError('Invalid prepared risk benchmark');
+  return result;
+}
+
+export function riskMetrics(detail, benchmark) {
+  const bars = detail.chartBars || detail.bars;
+  const benchmarkDates = benchmark instanceof Map ? benchmark : new Map(benchmark?.map((row) => [row.date, row.close]) || []);
+  const returns = [];
+  const pairing = [];
+  let peak = 0;
+  let drawdown = 0;
+  let previous;
+  let priced = 0;
+  for (const bar of bars) {
+    if (!bar.traded || !(bar.close > 0) || bar.unverifiedSplit) {
+      previous = null;
+      if (bar.unverifiedSplit || bar.priceQuarantined) peak = 0;
+      continue;
+    }
+    priced++;
+    peak = Math.max(peak, bar.close);
+    drawdown = Math.min(drawdown, bar.close / peak - 1);
+    if (previous) {
+      const value = bar.close / previous.close - 1;
+      returns.push(value);
+      if (benchmarkDates.get(previous.date) > 0 && benchmarkDates.get(bar.date) > 0) {
+        pairing.push([value, benchmarkDates.get(bar.date) / benchmarkDates.get(previous.date) - 1]);
+      }
+    }
+    previous = bar;
+  }
+  const x = mean(pairing.map((item) => item[0]));
+  const y = mean(pairing.map((item) => item[1]));
+  const covariance = mean(pairing.map(([a, b]) => (a - x) * (b - y)));
+  const stockVariance = mean(pairing.map(([a]) => (a - x) ** 2));
+  const benchmarkVariance = mean(pairing.map(([, b]) => (b - y) ** 2));
+  return {
+    observations: returns.length, benchmarkObservations: pairing.length,
+    maximumDrawdown: priced ? drawdown : null,
+    beta: pairing.length >= 20 && benchmarkVariance > 0 ? covariance / benchmarkVariance : null,
+    correlation: pairing.length >= 20 && stockVariance > 0 && benchmarkVariance > 0 ? covariance / Math.sqrt(stockVariance * benchmarkVariance) : null,
+    dailyHistoricalReturn5pct: returns.length >= 20 ? quantile(returns, 0.05) : null,
+    dailyHistoricalVaR95: returns.length >= 20 ? Math.max(0, -quantile(returns, 0.05)) : null,
+    annualizedVolatility: detail.volatility_20d, atr14: detail.atr_14d,
+  };
+}
+
+function canonicalContext(config) {
+  if (config[pinnedScope]) return config;
+  // Only identity/action caches are shared, at this single anchor and knowledge cutoff.
+  return { ...config, universe: wholeCatalog, currentVersion: false, includeAllTimeHigh: false, referenceMode: 'as-of',
+    historySource: { end: config.date, indices: new Map(), actions: new Map() }, [pinnedScope]: true };
+}
+
+function quarter(date) {
+  return `${date.slice(0, 4)}-${Math.ceil(Number(date.slice(5, 7)) / 3)}`;
+}
+
+function packedBar(bar) {
+  let mask = 0;
+  const values = [];
+  for (const [index, name] of barFields.entries()) {
+    if (!Object.hasOwn(bar, name) || bar[name] === undefined) continue;
+    mask |= 1 << index;
+    values.push(bar[name]);
+  }
+  return [bar.date, mask, ...values];
+}
+
+function unpackedBar([date, mask, ...values]) {
+  const bar = { date };
+  let cursor = 0;
+  for (const [index, name] of barFields.entries()) if (mask & (1 << index)) bar[name] = values[cursor++];
+  return bar;
+}
+
+function chartBlocks(chartBars) {
+  const groups = new Map();
+  for (const bar of chartBars) {
+    const key = quarter(bar.date);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(packedBar(bar));
+  }
+  return [...groups.values()].map((bars) => {
+    const blob = encode(bars);
+    return { first: bars[0][0], last: bars.at(-1)[0], count: bars.length, hash: digest(blob), blob };
+  });
+}
+
+function productHeader(detail, explicitSplitPriceBasis) {
+  const actions = (detail.actions ?? []).filter((action) => action.date <= detail.date);
+  const quality = (detail.quality ?? []).filter((issue) => !issue.effective_from || issue.effective_from <= detail.date);
+  const splitDates = actions.filter((action) => action.type === 'split' && Number.isFinite(action.factor) && action.factor > 0).map(({ date }) => date);
+  const basisGuards = [
+    ...(explicitSplitPriceBasis ? splitDates : []),
+    ...detail.chartBars.filter((bar) => bar.unverifiedSplit || bar.priceQuarantined).map(({ date }) => date),
+    ...quality.filter((issue) => issue.kind === 'split').map((issue) => issue.effective_from).filter(Boolean),
+  ];
+  return {
+    format, ...pick(detail, identityFields), ...pick(detail, highFields),
+    ...pick(detail, ['referenceDate', 'referenceMode', 'earliestDate', 'latestDate']),
+    calendarFrom: detail.chartBars[0]?.date ?? null, calendarThrough: detail.chartBars.at(-1)?.date ?? null,
+    aliases: detail.aliases ?? [], actions, quality,
+    unsafeBefore: basisGuards.sort().at(-1) ?? null,
+    warnings: (detail.warnings ?? []).filter((message) => !message.startsWith('Security falls outside')),
+  };
+}
+
+function validDetail(config, detail) {
+  if (!config.date || !detail || detail.date !== config.date || !detail.securityId || !Array.isArray(detail.chartBars) ||
+      detail.dataVersion != null && detail.dataVersion !== config.dataVersion ||
+      detail.calculationVersion != null && detail.calculationVersion !== CALCULATION_VERSION) {
+    throw new Error('Prepared stock detail does not match the pinned source date and version');
+  }
+  if (detail.chartBars.length && (detail.chartBars.at(-1).date !== config.date ||
+      detail.chartBars.some((bar, index) => !isoDate(bar?.date) || index && bar.date <= detail.chartBars[index - 1].date))) {
+    throw new Error('Prepared stock bars must be ordered through the pinned trading session');
+  }
+}
+
+export function writePreparedDetail(db, config, detail, { riskByBenchmark = {}, explicitSplitPriceBasis = false } = {}) {
+  validDetail(config, detail);
+  db.exec(schema);
+  const key = keyFor(config, detail.securityId);
+  const check = db.prepare(`SELECT 1 FROM prepared_detail_products WHERE ${keyWhere}`);
+  const existing = check.get(...key);
+  const chart = existing ? [] : chartBlocks(detail.chartBars);
+  const chartManifest = chart.map(({ first, last, count, hash }) => ({ first, last, count, hash }));
+  const header = existing ? null : encode(productHeader(detail, explicitSplitPriceBasis));
+  const getRisk = db.prepare(`SELECT value FROM prepared_detail_risk WHERE ${keyWhere} AND benchmark=?`);
+  const putRisk = db.prepare(`INSERT INTO prepared_detail_risk VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(calculation_version,basis,security_id,data_version,anchor_date,benchmark) DO UPDATE SET value=excluded.value`);
+  const block = db.prepare('INSERT OR IGNORE INTO prepared_detail_blocks VALUES (?,?)');
+  const put = db.prepare('INSERT OR IGNORE INTO prepared_detail_products VALUES (?,?,?,?,?,?,?)');
+  const nested = db.isTransaction;
+  db.exec(nested ? 'SAVEPOINT prepare_detail' : 'BEGIN IMMEDIATE');
+  let written = 0;
+  let risksWritten = 0;
+  let blocksWritten = 0;
+  try {
+    if (header && !check.get(...key)) {
+      for (const item of chart) blocksWritten += block.run(item.hash, item.blob).changes;
+      written = put.run(...key, header, encode(chartManifest)).changes;
+    }
+    for (const [benchmark, risks] of Object.entries(riskByBenchmark)) {
+      const ticker = normalizeSymbol(benchmark);
+      const saved = getRisk.get(...key, ticker)?.value;
+      const values = saved ? decode(saved) : {};
+      const additions = Object.entries(risks).filter(([window]) => !Object.hasOwn(values, window));
+      if (!additions.length) continue;
+      putRisk.run(...key, ticker, encode({ ...values, ...Object.fromEntries(additions) }));
+      risksWritten += additions.length;
+    }
+    db.exec(nested ? 'RELEASE prepare_detail' : 'COMMIT');
+  } catch (error) {
+    if (nested) db.exec('ROLLBACK TO prepare_detail; RELEASE prepare_detail');
+    else if (db.isTransaction) db.exec('ROLLBACK');
+    throw error;
+  }
+  return { written: Boolean(written), risksWritten, blocksWritten, securityId: detail.securityId, date: config.date, dataVersion: config.dataVersion };
+}
+
+function findProduct(db, config, securityId, { exactOnly = false } = {}) {
+  if (!config.date || !securityId || !present(db)) return { state: 'not-prepared' };
+  const exact = exactOnly || config.basis === 'known';
+  const comparison = exact ? '=' : '>=';
+  const rows = db.prepare(`SELECT data_version,anchor_date FROM prepared_detail_products
+    WHERE calculation_version=? AND basis=? AND security_id=? AND data_version<=? AND anchor_date${comparison}?
+    ORDER BY (anchor_date=?) DESC,data_version DESC,anchor_date`)
+    .all(...keyFor(config, securityId), config.date);
+  if (!rows.length) return { state: exact ? 'requires-exact-date' : 'not-prepared' };
+  // Chart inputs do not use an observed reference clock, even when the consuming screen does.
+  const bounds = reusableArchiveVersions(db, { ...config, referenceMode: 'as-of' }, rows.map(({ data_version }) => data_version));
+  const get = db.prepare(`SELECT header,blocks FROM prepared_detail_products WHERE ${keyWhere}`);
+  let rejected = false;
+  for (const row of rows) {
+    if (!usableArchiveRow(bounds, { date: config.date, data_version: row.data_version })) continue;
+    const product = get.get(...keyFor(config, securityId, row.data_version, row.anchor_date));
+    if (!product) continue;
+    const header = decode(product.header);
+    if (header.format !== format) continue;
+    if (row.anchor_date !== config.date && header.unsafeBefore > config.date) {
+      rejected = true;
+      continue;
+    }
+    if (row.anchor_date !== config.date && (!header.calendarFrom || header.calendarFrom > config.date || header.calendarThrough < config.date)) continue;
+    return { state: 'ready', header, anchorDate: row.anchor_date, sourceDataVersion: row.data_version, blocks: product.blocks };
+  }
+  return { state: rejected || exact ? 'requires-exact-date' : 'not-prepared' };
+}
+
+export function hasPreparedDetail(db, config, securityId, { exactOnly = false } = {}) {
+  return findProduct(db, config, securityId, { exactOnly }).state === 'ready';
+}
+
+function readBars(db, manifest, date, lookback) {
+  const read = db.prepare('SELECT value FROM prepared_detail_blocks WHERE hash=?');
+  const collected = [];
+  let remaining = lookback;
+  for (let position = manifest.length - 1; position >= 0 && remaining > 0; position--) {
+    const block = manifest[position];
+    if (block.first > date) continue;
+    const payload = read.get(block.hash)?.value;
+    if (!payload) throw new Error('Prepared stock chart block is missing');
+    const rows = decode(payload).filter(([rowDate]) => rowDate <= date).slice(-remaining);
+    collected.push(rows);
+    remaining -= rows.length;
+  }
+  return collected.reverse().flatMap((rows) => rows.map(unpackedBar));
+}
+
+function splitProjection(bars, actions, date, anchorDate) {
+  const factor = actions.filter((action) => action.type === 'split' && action.date > date && action.date <= anchorDate && action.factor > 0)
+    .reduce((value, action) => value * action.factor, 1);
+  if (!(factor > 0) || !Number.isFinite(factor)) return null;
+  if (factor === 1) return bars;
+  const output = [];
+  for (const bar of bars) {
+    const projected = { ...bar };
+    for (const name of ['open', 'high', 'low', 'close', 'volume']) {
+      if (!Number.isFinite(bar[name])) continue;
+      const value = name === 'volume' ? bar[name] / factor : bar[name] * factor;
+      if (!Number.isFinite(value)) return null;
+      projected[name] = value;
+    }
+    output.push(projected);
+  }
+  return output;
+}
+
+export function readPreparedDetail(db, config, securityId, { lookback = 252, benchmark = config.benchmark } = {}) {
+  if (!Number.isInteger(lookback) || lookback < 1 || lookback > maximumSessions) throw new RangeError('Invalid stock detail lookback');
+  const product = findProduct(db, config, securityId);
+  if (product.state !== 'ready') return { state: product.state, riskState: 'not-prepared', detail: null, sourceDataVersion: null, anchorDate: null, projected: false };
+  const { header, anchorDate, sourceDataVersion } = product;
+  const projected = anchorDate !== config.date;
+  const { actions, quality, aliases, ...metadata } = header;
+  const visibleAliases = aliases.filter((alias) => !alias.valid_from || alias.valid_from <= config.date);
+  const identity = projected ? visibleAliases.filter((alias) => !alias.valid_to || alias.valid_to >= config.date)
+    .toSorted((left, right) => (right.valid_from || '').localeCompare(left.valid_from || '') || left.symbol.localeCompare(right.symbol))[0] : null;
+  const chartBars = readBars(db, decode(product.blocks), config.date, lookback);
+  const bars = projected ? splitProjection(chartBars, actions, config.date, anchorDate) : chartBars;
+  if (!bars) return { state: 'requires-exact-date', riskState: 'not-prepared', detail: null, sourceDataVersion, anchorDate, projected: false };
+  const quotes = bars.filter((bar) => !bar.missing);
+  const current = bars.at(-1)?.date === config.date ? bars.at(-1) : null;
+  const storedRisk = projected ? null : db.prepare(`SELECT value FROM prepared_detail_risk WHERE ${keyWhere} AND benchmark=?`)
+    .get(...keyFor(config, securityId, sourceDataVersion, anchorDate), normalizeSymbol(benchmark))?.value;
+  const risk = storedRisk ? decode(storedRisk)[lookback] ?? null : null;
+  const visibleQuality = quality.filter((issue) => !issue.effective_from || issue.effective_from <= config.date);
+  const rawMetadata = projected ? {
+    symbol: identity?.symbol ?? null, exchange: identity?.exchange ?? null,
+    earliestDate: metadata.earliestDate <= config.date ? metadata.earliestDate : null,
+    latestDate: quotes.at(-1)?.date ?? null,
+    warnings: ['Chart prices project the prepared reconstructed split basis. Historical high and risk statistics require their exact session.'],
+  } : pick(metadata, [...identityFields, ...highFields, 'earliestDate', 'latestDate', 'warnings']);
+  return {
+    state: 'ready', riskState: risk ? 'ready' : 'not-prepared', sourceDataVersion, anchorDate, projected,
+    detail: {
+      ...rawMetadata, securityId, date: config.date, dataVersion: config.dataVersion, sourceDataVersion,
+      calculationVersion: CALCULATION_VERSION, basis: config.basis, referenceDate: config.date, referenceMode: 'as-of',
+      close: current?.close ?? null, traded: current?.traded ?? false,
+      aliases: visibleAliases, actions: actions.filter((action) => action.date <= config.date), quality: visibleQuality,
+      chartBars: bars, bars: quotes, risk,
+    },
+  };
+}
+
+export function createPreparedDetailWriter(db, engine, config, { benchmarks, riskWindows } = {}) {
+  const tickers = normalizedBenchmarks(benchmarks, config.benchmark);
+  const windows = normalizedWindows(riskWindows);
+  const prepared = canonicalContext(config);
+  if (!config.date || !config.earliestDate) throw new Error('Load prices before preparing stock detail');
+  db.exec(schema);
+  const getRisk = db.prepare(`SELECT value FROM prepared_detail_risk WHERE ${keyWhere} AND benchmark=?`);
+  const getProduct = db.prepare(`SELECT 1 FROM prepared_detail_products WHERE ${keyWhere}`);
+  const explicitPriceBasis = db.prepare(`SELECT 1 FROM price_revisions WHERE security_id=? AND version<=? AND date<=?
+    AND split_close>0 LIMIT 1`);
+  const priorRisks = (key, ticker) => {
+    const saved = getRisk.get(...key, ticker)?.value;
+    return saved ? decode(saved) : {};
+  };
+  let maps;
+  function benchmarkMaps() {
+    if (maps) return maps;
+    const from = windows.length ? expectedSessions(config.earliestDate, config.date).slice(-windows.at(-1))[0] : null;
+    const benchmarkBars = from ? engine.studyPrices(prepared, tickers, from, config.date) : new Map();
+    maps = new Map(tickers.map((ticker) => [ticker, new Map((benchmarkBars.get(ticker) ?? []).map((bar) => [bar.date, bar.close]))]));
+    return maps;
+  }
+  const write = (detail) => {
+    validDetail(config, detail);
+    const key = keyFor(config, detail.securityId);
+    const riskByBenchmark = {};
+    for (const ticker of tickers) {
+      const existing = priorRisks(key, ticker);
+      const missing = windows.filter((window) => !Object.hasOwn(existing, window));
+      if (!missing.length) continue;
+      const map = benchmarkMaps().get(ticker);
+      riskByBenchmark[ticker] = Object.fromEntries(missing.map((window) =>
+        [window, riskMetrics({ ...detail, chartBars: detail.chartBars.slice(-window) }, map)]));
+    }
+    const hasSplit = detail.actions?.some((action) => action.type === 'split' && action.factor > 0 && action.date <= config.date);
+    const explicit = hasSplit && Boolean(explicitPriceBasis.get(detail.securityId, config.dataVersion, config.date));
+    return writePreparedDetail(db, config, detail, { riskByBenchmark, explicitSplitPriceBasis: explicit });
+  };
+  write.ready = (securityId) => {
+    const key = keyFor(config, securityId);
+    return Boolean(getProduct.get(...key)) && tickers.every((ticker) => {
+      const saved = priorRisks(key, ticker);
+      return windows.every((window) => Object.hasOwn(saved, window));
+    });
+  };
+  return write;
+}
+
+const roster = `FROM securities WHERE EXISTS
+  (SELECT 1 FROM price_revisions WHERE security_id=securities.id AND version<=? AND date<=? LIMIT 1)`;
+
+function batchResult(config, row, progress) {
+  const done = Boolean(row.complete);
+  progress(done ? 1 : row.total ? row.processed / row.total : 0);
+  return { status: done ? 'complete' : 'running', done, cursor: done ? null : row.cursor,
+    processedSecurities: row.processed, totalSecurities: row.total, written: row.written, date: config.date, dataVersion: config.dataVersion };
+}
+
+export function prepareDetailsBatch(db, engine, config, {
+  cursor = null, bucketSize = 64, securityIds, benchmarks, riskWindows, progress = () => {}, signal,
+} = {}) {
+  signal?.throwIfAborted();
+  if (!config.date || !config.earliestDate) throw new Error('Load prices before preparing stock detail');
+  if (!Number.isInteger(bucketSize) || bucketSize < 1 || bucketSize > 256) throw new RangeError('Stock detail bucket size must be 1–256');
+  if (cursor != null && typeof cursor !== 'string') throw new TypeError('Stock detail cursor must be a permanent security ID');
+  if (securityIds != null && (!Array.isArray(securityIds) || securityIds.length > 256 ||
+      securityIds.some((id) => typeof id !== 'string' || !id))) throw new TypeError('Choose up to 256 permanent security IDs');
+  const ids = securityIds == null ? null : [...new Set(securityIds)].sort();
+  const tickers = normalizedBenchmarks(benchmarks, config.benchmark);
+  const windows = normalizedWindows(riskWindows);
+  const hash = digest(JSON.stringify([format, CALCULATION_VERSION, config.basis, config.date, config.dataVersion, tickers, windows, ids]));
+  db.exec(schema);
+  const read = db.prepare('SELECT * FROM prepared_detail_batches WHERE id=?');
+  let state = read.get(hash);
+  if (!state) {
+    const total = ids?.length ?? db.prepare(`SELECT count(*) AS count ${roster}`).get(config.dataVersion, config.date).count;
+    db.prepare('INSERT OR IGNORE INTO prepared_detail_batches(id,total,complete) VALUES (?,?,?)').run(hash, total, Number(total === 0));
+    state = read.get(hash);
+  }
+  if (state.complete) return batchResult(config, state, progress);
+  const previous = state.cursor ?? '';
+  const requested = ids ? ids.filter((id) => id > previous).slice(0, bucketSize)
+    : db.prepare(`SELECT id ${roster} AND id>? ORDER BY id LIMIT ?`).all(config.dataVersion, config.date, previous, bucketSize).map(({ id }) => id);
+  const point = canonicalContext(config);
+  const write = createPreparedDetailWriter(db, engine, point, { benchmarks: tickers, riskWindows: windows });
+  const exists = ids ? db.prepare('SELECT 1 FROM securities WHERE id=?') : null;
+  const missing = requested.filter((id) => !write.ready(id));
+  if (missing.length) engine.snapshot(point, { cache: true, velocity: false });
+  let stored = 0;
+  for (const id of missing) {
+    signal?.throwIfAborted();
+    let detail = engine.detail(point, id, maximumSessions, { velocity: false });
+    if (!detail && point.basis === 'known' && exists?.get(id)) {
+      detail = { securityId: id, date: point.date, dataVersion: point.dataVersion, chartBars: [],
+        volatility_20d: null, atr_14d: null, warnings: ['No security identity or quotes were available at the selected session.'] };
+    }
+    if (detail && write(detail).written) stored++;
+  }
+  signal?.throwIfAborted();
+  const processed = state.processed + requested.length;
+  const done = processed >= state.total || requested.length < bucketSize;
+  // Products are individually atomic. A resumed bucket may encounter completed products; their inserts are idempotent.
+  db.prepare(`UPDATE prepared_detail_batches SET cursor=?,processed=?,complete=?,written=written+? WHERE id=? AND cursor IS ?`)
+    .run(requested.at(-1) ?? state.cursor, processed, Number(done), stored, hash, state.cursor);
+  return batchResult(config, read.get(hash), progress);
+}
