@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b1013">
+  <title>Market Overview | Market Intelligence</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#overview" data-route="overview" aria-label="Market Intelligence overview">
+        <span aria-hidden="true" class="brand-mark"><svg viewBox="0 0 28 28" fill="none"><path d="M5 21V11m6 10V7m6 14V13m6 8V5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="M5 12.5 11 8l6 6 6-7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span>Market<span class="brand-second">Intelligence</span></span>
+      </a>
+      <nav id="navigation" aria-label="Workspace">
+        <div class="nav-group">Research</div>
+        <a href="#overview" data-route="overview" data-icon="overview">Market Overview</a>
+        <a href="#monitor" data-route="monitor" data-icon="pulse">Market Monitor</a>
+        <a href="#screener" data-route="screener" data-icon="screener">Stock Screener</a>
+        <a href="#rankings" data-route="rankings" data-icon="rankings">RS Rankings</a>
+        <a href="#industries" data-route="industries" data-icon="industries">Industries</a>
+        <a href="#history" data-route="history" data-icon="history">Historical Explorer</a>
+        <a href="#journal" data-route="journal" data-icon="journal">Market Journal</a>
+        <div class="nav-group">Workspace</div>
+        <a href="#screens" data-route="screens" data-icon="screens">Saved Screens</a>
+        <a href="#watchlists" data-route="watchlists" data-icon="watchlists">Watchlists</a>
+        <a href="#alerts" data-route="alerts" data-icon="alerts">Alerts</a>
+        <a href="#settings" data-route="settings" data-icon="settings">Settings &amp; Data</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="data-source"><span class="status-dot"></span><span><strong id="source-name">Market warehouse</strong><small id="source-caption">Checking data</small></span></div>
+        <a href="#settings" data-route="settings" class="icon-button" aria-label="View data status" data-icon="chevron-right"></a>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <button class="icon-button menu-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar" data-icon="menu"></button>
+        <div class="breadcrumb"><span data-icon="overview"></span><span>Workspace</span><span class="crumb-separator">/</span><strong id="breadcrumb-page">Market Overview</strong></div>
+        <button id="ticker-search" class="button ticker-search" type="button"><span data-icon="search"></span><span>Find a stock</span><kbd>/</kbd></button>
+        <div id="data-badge" class="status" role="status"><span class="status-dot"></span> Checking data</div>
+      </header>
+      <div class="context-bar" id="context-bar" aria-label="Analysis context"></div>
+      <main id="main" tabindex="-1"><div class="pending" role="status">Loading the workspace…</div></main>
+    </div>
+  </div>
+  <dialog id="detail" class="drawer" aria-label="Research detail"><div class="dialog-content"></div></dialog>
+  <dialog id="modal" aria-label="Workspace action"><div class="dialog-content"></div></dialog>
+  <div id="feedback" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

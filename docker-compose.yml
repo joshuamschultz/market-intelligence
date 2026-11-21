@@ -1,0 +1,15 @@
+services:
+  market-intelligence:
+    build: .
+    ports:
+      - "127.0.0.1:4173:4173"
+    environment:
+      EODHD_API_KEY: "${EODHD_API_KEY:-}"
+      MARKET_ACCESS_TOKEN: "${MARKET_ACCESS_TOKEN:?Set MARKET_ACCESS_TOKEN in .env}"
+      MARKET_SYNC: "${MARKET_SYNC:-0}"
+      MARKET_SYNC_AFTER: "${MARKET_SYNC_AFTER:-20:30}"
+      MARKET_REFERENCE_SYNC: "${MARKET_REFERENCE_SYNC:-0}"
+    volumes:
+      - market-data:/app/data
+volumes:
+  market-data:

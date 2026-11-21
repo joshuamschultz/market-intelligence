@@ -1,0 +1,26 @@
+{
+  "operation": "verified-source-facts",
+  "id": "2026-11-21-vcig-unresolved-price-basis",
+  "reviewedAt": "2026-11-21",
+  "securityId": "eodhd:VCIG",
+  "overrides": [
+    {
+      "id": "vcig-price-basis",
+      "kind": "price",
+      "from": "2026-08-24",
+      "to": "2026-10-30",
+      "reason": "The pre-November vendor quote segment is incompatible with the issuer\u2019s disclosed October 30 price on the verified new-share basis. No additional split or reconstructed OHLCV is inferred.",
+      "evidenceUrl": "https://www.sec.gov/Archives/edgar/data/1930510/000121390026115124/ea0310249-f1a1_vci.htm"
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2026-779",
+      "fact": "Nasdaq confirms a 1-for-18 reverse split on November 2. That action is already in the warehouse."
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1930510/000121390026115124/ea0310249-f1a1_vci.htm",
+      "fact": "The issuer filing states $3.04 for the October 30 close on the 1-for-18 post-split basis. The provider price segment cannot be independently reconciled."
+    }
+  ]
+}

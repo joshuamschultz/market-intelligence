@@ -1,0 +1,32 @@
+{
+  "operation": "verified-source-facts",
+  "id": "2026-11-21-rbot-otcid",
+  "reviewedAt": "2026-11-21",
+  "securityId": "eodhd:RBOT",
+  "venue": {
+    "expectedSymbol": "RBOT",
+    "exchange": "NYSE",
+    "through": "2026-03-03",
+    "next": {
+      "symbol": "RBOT",
+      "exchange": "OTCID",
+      "from": "2026-03-04"
+    }
+  },
+  "overrides": [
+    {
+      "id": "rbot-otcid-venue",
+      "kind": "notice",
+      "from": "2026-03-04",
+      "to": "9999-12-31",
+      "reason": "NYSE trading was suspended March 3. The same issue began OTCID quotation March 4 and falls outside US Core. Later vendor quotes remain subject to OTC price-quality review.",
+      "evidenceUrl": "https://www.sec.gov/Archives/edgar/data/1812173/000121390026025193/ea0280520-8k_vicarious.htm"
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1812173/000121390026025193/ea0280520-8k_vicarious.htm",
+      "fact": "Vicarious Surgical Form 8-K confirms the March 3 NYSE suspension and March 4 start of OTCID quotation under RBOT."
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "operation": "verified-source-facts",
+  "id": "2026-11-21-pom-unresolved-price-basis",
+  "reviewedAt": "2026-11-21",
+  "securityId": "eodhd:POM",
+  "overrides": [
+    {
+      "id": "pom-ads-price-basis",
+      "kind": "price",
+      "from": "2025-10-08",
+      "to": "2026-06-17",
+      "reason": "The original ADS quote history changes unit basis before the verified June 22 event. An independently verified complete series is required before releasing these price observations.",
+      "evidenceUrl": "https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2026-420"
+    },
+    {
+      "id": "pom-ordinary-transition",
+      "kind": "price",
+      "from": "2026-10-21",
+      "to": "2026-10-21",
+      "reason": "The vendor series crosses from the retired ADS to new ordinary shares under the same ticker. The issuer conversion is documented, but verified reconciliation of the two quote series is pending.",
+      "evidenceUrl": "https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2026-743"
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2026-420",
+      "fact": "Nasdaq specifies a June 22 1-for-18 ADS reverse split. The observed change in the warehouse begins before that trading date."
+    },
+    {
+      "url": "https://www.nasdaqtrader.com/TraderNews.aspx?id=ECA2026-743",
+      "fact": "Nasdaq confirms the October 21 ADS retirement and new CUSIP for post-consolidation ordinary shares."
+    }
+  ]
+}

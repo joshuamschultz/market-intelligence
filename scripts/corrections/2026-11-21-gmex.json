@@ -1,0 +1,31 @@
+{
+  "operation": "verified-source-facts",
+  "id": "2026-11-21-gmex-dated-ticker",
+  "reviewedAt": "2026-11-21",
+  "securityId": "eodhd:GMEX",
+  "venue": {
+    "expectedSymbol": "GMEX",
+    "exchange": "NASDAQ",
+    "through": "2026-03-11",
+    "before": {
+      "symbol": "FTEL",
+      "from": "0001-01-01"
+    }
+  },
+  "overrides": [
+    {
+      "id": "gmex-ticker-change",
+      "kind": "notice",
+      "from": "2026-03-12",
+      "to": "2026-03-12",
+      "reason": "Fitell changed its symbol from FTEL to GMEX on March 12. The rename does not alter prices or the independently recorded January split.",
+      "evidenceUrl": "https://www.sec.gov/Archives/edgar/data/1928581/000149315226009687/ex99-1.htm"
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1928581/000149315226009687/ex99-1.htm",
+      "fact": "The issuer gives March 12 as the effective FTEL to GMEX ticker change."
+    }
+  ]
+}

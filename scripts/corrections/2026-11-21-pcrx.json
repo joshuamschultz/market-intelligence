@@ -1,0 +1,40 @@
+{
+  "operation": "verified-source-facts",
+  "id": "2026-11-21-pcrx-merger",
+  "reviewedAt": "2026-11-21",
+  "securityId": "eodhd:PCRX",
+  "venue": {
+    "expectedSymbol": "PCRX",
+    "exchange": "NASDAQ",
+    "through": "2026-11-16",
+    "terminal": true
+  },
+  "overrides": [
+    {
+      "id": "pcrx-price-identity",
+      "kind": "price",
+      "from": "2026-11-12",
+      "to": "9999-12-31",
+      "reason": "Vendor penny prices disagree with independently reported trading near the contract price before the merger. The issue ceased trading November 16. These rows are withheld until primary quote history is verified.",
+      "evidenceUrl": "https://www.nasdaqtrader.com/TraderNews.aspx?id=eca2026-809"
+    },
+    {
+      "id": "pcrx-cash-merger",
+      "kind": "notice",
+      "from": "2026-11-17",
+      "to": "2026-11-17",
+      "reason": "The merger closed before the November 17 session. Nasdaq confirmed $36.50 cash per share as merger consideration, not a trade or closing price. No terminal market bar has been supplied.",
+      "evidenceUrl": "https://www.nasdaqtrader.com/TraderNews.aspx?id=eca2026-809"
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://www.nasdaqtrader.com/TraderNews.aspx?id=eca2026-809",
+      "fact": "Nasdaq identifies the November 16 final trading date, November 17 pre-open close, and $36.50 cash consideration."
+    },
+    {
+      "url": "https://www.nasdaqtrader.com/TraderNews.aspx?id=eca2026-809",
+      "fact": "CUSIP 695127100 identifies the terminal issue. Vendor OHLC revisions are kept pending independent source confirmation."
+    }
+  ]
+}

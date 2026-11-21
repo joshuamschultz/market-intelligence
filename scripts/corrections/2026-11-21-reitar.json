@@ -1,0 +1,37 @@
+{
+  "id": "2026-11-21-reitar-venue-and-split",
+  "reviewedAt": "2026-11-21",
+  "securityId": "eodhd:RITR",
+  "issuer": "Reitar Logtech Holdings Limited",
+  "cik": "1951229",
+  "originalSymbol": "RITR",
+  "originalVenue": "NASDAQ",
+  "lastPrimarySession": "2026-09-16",
+  "temporaryVenue": "PINK",
+  "temporarySymbol": "RITRF",
+  "temporaryStart": "2026-09-17",
+  "postSplitSymbol": "RITRD",
+  "vendorSeriesId": "eodhd:RITRD",
+  "duplicateIds": ["eodhd:RITRF", "eodhd:RITRD"],
+  "previousVolumeBasis": "2026-09-16",
+  "split": {
+    "date": "2026-11-12",
+    "factor": 0.004,
+    "expectedPriorClose": 0.019,
+    "expectedEventClose": 3.4
+  },
+  "evidence": [
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1951229/000121390026100503/ea030552001ex99-1.htm",
+      "fact": "Issuer gives the September 17 effective date for the Nasdaq suspension and identifies RITR as the Nasdaq ticker."
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1951229/000121390026118258/ea0312004-6k_reitar.htm",
+      "fact": "Issuer identifies the pre-consolidation RITRF OTC series, and the cumulative 1-for-250 market-effective consolidation on November 12."
+    },
+    {
+      "url": "https://www.sec.gov/Archives/edgar/data/1951229/000121390026120078/ea0312381-6k_reitar.htm",
+      "fact": "Issuer confirms post-consolidation OTC RITRD trades and the continued Nasdaq suspension pending reinstatement."
+    }
+  ]
+}

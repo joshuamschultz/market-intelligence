@@ -1,0 +1,48 @@
+{
+  "operation": "verified-source-facts",
+  "id": "2026-11-21-sos-split-effective-date",
+  "reviewedAt": "2026-11-21",
+  "securityId": "eodhd:SOS",
+  "corporateActions": [
+    {
+      "type": "split",
+      "date": "2026-11-20",
+      "factor": 0.05,
+      "knownAt": "2026-11-18",
+      "replaces": "2026-11-19"
+    }
+  ],
+  "overrides": [
+    {
+      "id": "sos-misdated-split",
+      "kind": "split",
+      "from": "2026-11-19",
+      "to": "2026-11-19",
+      "reason": "The issuer postponed the 1-for-20 split to November 20. The original November 19 vendor action is superseded.",
+      "evidenceUrl": "https://www.globenewswire.com/news-release/2026/11/18/3405647/0/en/sos-limited-announces-postponement-of-effective-date-of-1-for-20-reverse-share-split.html",
+      "knownAt": "2026-11-18"
+    },
+    {
+      "id": "sos-vendor-adjusted-close",
+      "kind": "adjusted-close",
+      "from": "2026-11-19",
+      "to": "2026-11-19",
+      "reason": "Vendor adjusted close uses the superseded effective date. Use the verified split and the reported raw closes for economic comparison.",
+      "evidenceUrl": "https://www.globenewswire.com/news-release/2026/11/18/3405647/0/en/sos-limited-announces-postponement-of-effective-date-of-1-for-20-reverse-share-split.html"
+    },
+    {
+      "id": "sos-volume-basis",
+      "kind": "volume",
+      "from": "2026-11-19",
+      "to": "2026-11-19",
+      "reason": "The vendor share-volume basis on the superseded effective date is unverified. Price-only metrics remain available.",
+      "evidenceUrl": "https://www.globenewswire.com/news-release/2026/11/18/3405647/0/en/sos-limited-announces-postponement-of-effective-date-of-1-for-20-reverse-share-split.html"
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://www.globenewswire.com/news-release/2026/11/18/3405647/0/en/sos-limited-announces-postponement-of-effective-date-of-1-for-20-reverse-share-split.html",
+      "fact": "SOS Limited announced November 18 that the 1-for-20 reverse split moved from November 19 to November 20."
+    }
+  ]
+}
