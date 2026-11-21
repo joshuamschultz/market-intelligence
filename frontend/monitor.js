@@ -5,7 +5,6 @@ import {
 import { partialCoverage } from './overview.js';
 import { openBreadthDrawer } from './contributors.js';
 
-const windows = [20, 34, 63, 126, 252];
 const rowLimits = [20, 63, 126, 252];
 const stockbeePairs = [
   { id:'daily', label:'Daily momentum', period:'1 session', threshold:4, sessions:1 },
@@ -19,8 +18,10 @@ const ratioKeys = ['up_down_4pct_5d','up_down_4pct_10d'];
 const readingKeys = (pairs) => pairs.flatMap(({threshold,sessions})=>['up','down'].map((side)=>keyOf(side,threshold,sessions)));
 const exact = (row, key) => `${count(row[`${key}_numerator`])} / ${count(row[`${key}_denominator`])}`;
 const pctPoint = (value) => numeric(value) ? `${signed(value)} pp` : '—';
+const movingPeriods = [5, 10, 20];
+const changePeriods = [1, 5, 21];
 
-function bar(row, side, pair, state, prior, scale) {
+function bar(row, side, pair, state, scale) {
   const key = keyOf(side,pair.threshold,pair.sessions);
   const value = row[key];
   const historical = row[`${key}_extreme_percentile`];
@@ -28,15 +29,18 @@ function bar(row, side, pair, state, prior, scale) {
   const calibrated = numeric(historical);
   const label = `${side === 'up' ? 'Up' : 'Down'} ≥ ${pair.threshold}% · ${pair.sessions}D`;
   const legend = calibrated ? `Historical percentile ${Math.round(historical)}` : 'Historical calibration unavailable';
-  const delta = available && numeric(prior?.[key]) ? value-prior[key] : null;
+  const averages = movingPeriods.map((n) => percent(row[`${key}_sma${n}`]));
+  const changes = changePeriods.map((n) => pctPoint(row[`${key}_change${n}`]));
+  const details = `5/10/20D means ${averages.join(' / ')} · 1/5/21D change ${changes.join(' / ')}`;
   const extreme = calibrated ? historical >= 90 ? ' extreme-high' : historical <= 10 ? ' extreme-low' : '' : '';
   const width = available ? Math.min(100,Math.max(0,value / scale * 100)) : 0;
-  return `<button type="button" class="breadth-bar ${side}${state.extremes ? extreme : ''}${available ? '' : ' missing'}"
+  return `<button type="button" class="breadth-bar ${side}${state.extremes ? extreme : ''}${available ? '' : ' missing'}${state.statistics ? ' with-statistics' : ''}"
     data-action="monitor-detail" data-value="${safe(key)}" data-date="${safe(row.date)}" style="--bar-size:${width}%"
-    title="${safe(`${dateLabel(row.date)} · ${label} · ${percent(value)} · ${exact(row,key)} qualifying/comparable · ${legend}${numeric(delta) ? ` · ${pctPoint(delta)} vs prior session` : ''}`)}"
+    title="${safe(`${dateLabel(row.date)} · ${label} · ${percent(value)} · ${exact(row,key)} qualifying/comparable · ${legend} · ${details}`)}"
     aria-label="${safe(`${dateLabel(row.date)} ${label}: ${percent(value)}, ${exact(row,key)} qualifying over comparable. Open contributors.`)}">
     <span class="bar-fill"></span><span class="bar-value">${percent(value, value === 0 ? 0 : 1)}</span>
     ${state.counts ? `<small class="bar-count">${exact(row,key)}</small>` : ''}
+    ${state.statistics ? `<small class="bar-count">SMA ${averages.join(' · ')}</small><small class="bar-count">Δ ${changes.join(' · ')}</small>` : ''}
     ${state.extremes && extreme ? '<span class="extreme-mark" aria-hidden="true"></span>' : ''}</button>`;
 }
 
@@ -62,12 +66,11 @@ function timeline(data,pairs,state) {
     <thead><tr><th scope="col" class="monitor-date">Session<span>Traded</span></th>
       ${pairs.map(({label,period,threshold}, index)=>`<th scope="col"><strong>${safe(label)}</strong><small>${safe(period)} · 0–${scales[index]}%</small><div class="bar-column-head"><span>Down ≥ ${threshold}%</span><span>Up ≥ ${threshold}%</span></div></th>`).join('')}
       <th scope="col"><strong>U/D participation</strong><small>±4% daily readings</small><div class="bar-column-head"><span>5D ratio</span><span>10D ratio</span></div></th>
-    </tr></thead><tbody>${rows.toReversed().map((row,index)=>{
-      const prior=rows[rows.length-index-2];
+    </tr></thead><tbody>${rows.toReversed().map((row)=>{
       return `<tr${row.coverage === 'complete' ? '' : ' class="partial-row"'}>
         <th class="monitor-date" scope="row"><button type="button" class="date-button" data-action="replay-monitor" data-value="${safe(row.date)}" title="Replay ${safe(dateLabel(row.date))}">
           ${safe(dateLabel(row.date,true))}<small>${count(row.traded)} traded</small></button></th>
-        ${pairs.map((pair,index)=>`<td><div class="opposed-bars">${bar(row,'down',pair,state,prior,scales[index])}${bar(row,'up',pair,state,prior,scales[index])}</div></td>`).join('')}
+        ${pairs.map((pair,index)=>`<td><div class="opposed-bars">${bar(row,'down',pair,state,scales[index])}${bar(row,'up',pair,state,scales[index])}</div></td>`).join('')}
         <td><div class="opposed-bars ratio-pair">${ratioKeys.map((key)=>sideRatio(row,key)).join('')}</div></td></tr>`;
     }).join('')}</tbody></table></div>`;
 }
@@ -79,6 +82,7 @@ export async function render(env) {
   state.threshold ??= 25;
   state.counts ??= false;
   state.extremes ??= true;
+  state.statistics ??= false;
   state.scale ||= 'auto';
   let loadRun=0;
   let drillRun=0;
@@ -91,12 +95,14 @@ export async function render(env) {
   function filters() {
     return `<form class="monitor-toolbar" id="monitor-filter">
       ${field('Visible sessions',`<select data-change="monitor-limit">${rowLimits.map((key)=>option(key,`${key} sessions`,state.limit)).join('')}</select>`)}
-      ${field('Rolling window',`<select data-change="monitor-window">${windows.map((item)=>option(item,`${item} sessions`,state.window)).join('')}</select>`)}
-      ${field('Rolling threshold',`<select data-change="monitor-threshold">${[13,25,50].map((item)=>option(item,`±${item}%`,state.threshold)).join('')}</select>`)}
+      ${field('Rolling window',`<input name="sessions" type="number" min="1" max="7560" value="${state.window}" required>`)}
+      ${field('Rolling threshold (%)',`<input name="magnitude" type="number" min=".01" max="1000" step=".01" value="${state.threshold}" required>`)}
+      <button type="submit" class="button">Apply threshold</button>
       ${field('Bar scale', `<select data-change="monitor-scale">${option('auto','Auto per group',state.scale)}${option('common','Common 0–100%',state.scale)}</select>`)}
       <span class="context-spacer"></span>
       <label class="checkbox-label"><input type="checkbox" data-change="monitor-counts" ${state.counts?'checked':''}> Show counts</label>
       <label class="checkbox-label"><input type="checkbox" data-change="monitor-extremes" ${state.extremes?'checked':''}> Mark extremes</label>
+      <label class="checkbox-label"><input type="checkbox" data-change="monitor-statistics" ${state.statistics?'checked':''}> Show averages and changes</label>
     </form>`;
   }
   function shell() {
@@ -186,8 +192,10 @@ export async function render(env) {
   function exportData() {
     if (!current?.rows.length) return;
     const keys=readingKeys(shownPairs());
-    const includes=keys.flatMap((key)=>[key,`${key}_numerator`,`${key}_denominator`,`${key}_extreme_percentile`,`${key}_calibration_observations`]);
-    csvDownload(current.rows,['date','coverage','traded',...includes,...ratioKeys],'market-monitor.csv');
+    const includes=[...new Set(keys.flatMap((key)=>[key,`${key}_numerator`,`${key}_denominator`,`${key}_extreme_percentile`,`${key}_calibration_observations`,
+      ...movingPeriods.map((n)=>`${key}_sma${n}`),...changePeriods.map((n)=>`${key}_change${n}`)]))];
+    csvDownload(current.rows,['date','coverage','traded',...includes,
+      ...ratioKeys.flatMap((key)=>[key,`${key}_numerator`,`${key}_denominator`,`${key}_state`])],'market-monitor.csv');
   }
 
   env.setActions({
@@ -195,11 +203,10 @@ export async function render(env) {
     'monitor-export':exportData,
     'monitor-export-parquet':()=>env.exportFile('market/monitor',{params:{limit:state.limit,metrics:readingKeys(shownPairs()).join(','),export:'parquet'}},'market-monitor.parquet'),
     'change:monitor-limit'(value){state.limit=Number(value);return load();},
-    'change:monitor-window'(value){state.window=Number(value);return load();},
-    'change:monitor-threshold'(value){state.threshold=Number(value);return load();},
     'change:monitor-scale'(value){state.scale=value;showRows();},
     'change:monitor-counts'(value,input){state.counts=input.checked;showRows();},
     'change:monitor-extremes'(value,input){state.extremes=input.checked;showRows();},
+    'change:monitor-statistics'(value,input){state.statistics=input.checked;showRows();},
     'monitor-detail'(key,button) {
       const date=button.dataset.date;
       const title=current?.metrics.find((item)=>item.key===key)?.label || key.replaceAll('_',' ');
@@ -211,5 +218,12 @@ export async function render(env) {
     'replay-monitor':(date)=>env.go('overview',{date,dataVersion:env.snapshotContext.dataVersion}),
   });
   shell();
+  main.querySelector('#monitor-filter').onsubmit = (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    state.window = Number(form.get('sessions'));
+    state.threshold = Number(form.get('magnitude'));
+    load();
+  };
   load();
 }

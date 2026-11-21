@@ -272,15 +272,35 @@ function healthModel(input = {}) {
   };
 }
 
-function healthCoverage(snapshot) {
+const observedCaveat = 'Descriptive results for the selected observed universe. Historical membership and full market coverage are unreconciled.';
+
+function coveragePolicy({ coverageMode = 'verified', observedMinimum = 20, observedThreshold = 0.8 } = {}) {
+  if (!['verified', 'observed'].includes(coverageMode)) throw new RangeError('Coverage mode must be verified or observed');
+  const descriptive = coverageMode === 'observed';
+  if (!descriptive) return { coverageMode, descriptive };
+  const minimum = boundedInteger(observedMinimum, 'Observed minimum', 1, 100_000);
+  const threshold = Number(observedThreshold);
+  if (!(threshold > 0 && threshold <= 1)) throw new RangeError('Observed completeness threshold must be greater than zero and at most one');
+  return { coverageMode, descriptive, observedMinimum: minimum, observedThreshold: threshold, coverageWarning: observedCaveat };
+}
+
+function healthCoverage(snapshot, policy) {
   const coverage = snapshot?.coverage ?? {};
   const ratio = finite(coverage.ratio) ? coverage.ratio
     : positive(coverage.expected) && finite(coverage.traded) ? coverage.traded / coverage.expected : null;
   const threshold = finite(coverage.completenessThreshold) && coverage.completenessThreshold >= 0 && coverage.completenessThreshold <= 1
     ? coverage.completenessThreshold : 0.9;
   const blockedStates = ['empty', 'incomplete', 'insufficient', 'unavailable', 'partial', 'invalid', 'unknown'];
-  const ready = positive(ratio) && ratio <= 1 && ratio >= threshold && !blockedStates.includes(coverage.state);
-  return { ...coverage, ratio, completenessThreshold: threshold, ready };
+  const verifiedReady = positive(ratio) && ratio <= 1 && ratio >= threshold && !blockedStates.includes(coverage.state);
+  if (!policy?.descriptive) return { ...coverage, ratio, completenessThreshold: threshold, ready: verifiedReady };
+  const listed = coverage.listed;
+  const traded = coverage.traded;
+  const observedRatio = positive(listed) && finite(traded) ? traded / listed : null;
+  const ready = positive(observedRatio) && observedRatio <= 1 && observedRatio >= policy.observedThreshold &&
+    traded >= policy.observedMinimum && !['invalid', 'unavailable', 'empty'].includes(coverage.state);
+  return { ...coverage, ratio: coverage.ratio ?? null, completenessThreshold: threshold, ready, verifiedReady,
+    observed: { listed: listed ?? null, traded: traded ?? null, ratio: observedRatio, minimum: policy.observedMinimum,
+      threshold: policy.observedThreshold, comparableUniverse: 'observed_eligible_members' } };
 }
 
 const expectedMetric = {
@@ -289,17 +309,24 @@ const expectedMetric = {
   industryLeadership: 'classification',
 };
 
-function usableComponent(snapshot, id, data) {
-  const expected = snapshot?.coverage?.comparableExpected?.[expectedMetric[id]];
+function usableComponent(snapshot, id, data, policy) {
+  const expected = snapshot?.coverage?.comparableExpected?.[expectedMetric[id]] ??
+    (policy?.descriptive ? snapshot?.coverage?.traded : null);
   if (!finite(expected)) return { ...data, adequacy: null };
   const observed = id === 'industryLeadership' ? snapshot.coverage.classifications
     : id === 'volumeParticipation' ? (snapshot.aggregates?.dollarVolumeObservations ?? snapshot.aggregates?.dailyObservations) : data.denominator;
   const ratio = expected > 0 && finite(observed) ? observed / expected : null;
-  const threshold = healthCoverage(snapshot).completenessThreshold;
+  const threshold = policy?.descriptive ? policy.observedThreshold : healthCoverage(snapshot).completenessThreshold;
   const groupCount = id === 'industryLeadership' ? data.expectedComparableIndustries : null;
   const groupRatio = groupCount > 0 && finite(data.denominator) ? data.denominator / groupCount : null;
-  const sufficient = ratio != null && ratio >= threshold && (groupRatio == null || groupRatio >= threshold);
+  const classifiedSubset = policy?.descriptive && id === 'industryLeadership';
+  const sufficient = classifiedSubset
+    ? finite(observed) && observed >= policy.observedMinimum && data.denominator >= Math.min(5, policy.observedMinimum)
+      && (groupRatio == null || groupRatio >= threshold)
+    : ratio != null && ratio >= threshold && (!policy?.descriptive || observed >= policy.observedMinimum)
+      && (groupRatio == null || groupRatio >= threshold);
   return { ...data, adequacy: { expected, observed: observed ?? null, ratio, threshold, sufficient,
+    ...(classifiedSubset ? { comparisonScope: 'observed_classified_subset', minimumClassified: policy.observedMinimum } : {}),
     ...(groupRatio != null ? { comparableIndustries: groupCount, observedIndustries: data.denominator, groupRatio } : {}) } };
 }
 
@@ -318,7 +345,7 @@ function normalizeComponent(value, calibration, priorValues) {
 function snapshotTimeline(snapshots, sessionDates) {
   const dates = calendar(sessionDates ?? snapshots.map((snapshot) => snapshot.date));
   const byDate = indexDatedRecords(snapshots, 'Snapshot date');
-  const contextKeys = (snapshot) => ['universe', 'model', 'benchmark'].map((key) => {
+  const contextKeys = (snapshot) => ['universe', 'model', 'benchmark', 'basis', 'classificationSystem'].map((key) => {
     const value = snapshot?.[key];
     return typeof value === 'object' && value !== null ? [value.id, value.version] : value;
   });
@@ -368,12 +395,23 @@ function classifyRegime(features, model, coverage) {
   };
 }
 
-function breadthDivergences(snapshot, previous, benchmarkHigh, leadership, oldLeadership) {
+function adequateMetric(observation, metric, raw, policy) {
+  if (!policy.descriptive) return true;
+  const comparable = raw?.denominator;
+  const expected = observation?.coverage?.comparableExpected?.[metric] ?? observation?.coverage?.traded;
+  return positive(expected) && finite(comparable) && comparable >= policy.observedMinimum && comparable / expected >= policy.observedThreshold;
+}
+
+function breadthDivergences(snapshot, previous, benchmarkHigh, leadership, oldLeadership, policy) {
   if (!previous) return [];
-  const before = (key) => breadthComponent(previous, key).value;
-  const current = (key) => breadthComponent(snapshot, key).value;
+  const reading = (day, key) => {
+    const data = breadthComponent(day, key);
+    return adequateMetric(day, key, data, policy) ? data.value : null;
+  };
+  const before = (key) => reading(previous, key);
+  const current = (key) => reading(snapshot, key);
   const signals = [];
-  const record = (id, label, evidence) => signals.push({ id, label, date: snapshot.date, comparisonDate: previous.date, evidence });
+  const record = (id, label, evidence) => signals.push({ id, label, date: snapshot.date, comparisonDate: previous.date, evidence, ...policy });
   const benchmark = snapshot.aggregates?.benchmarkReturn;
   const intermediate = current('above_50d');
   const oldIntermediate = before('above_50d');
@@ -394,36 +432,50 @@ function breadthDivergences(snapshot, previous, benchmarkHigh, leadership, oldLe
       benchmarkReturn: benchmark, momentum, oldMomentum,
     });
   }
-  const { nasdaqReturn, nasdaqMedianReturn } = snapshot.aggregates ?? {};
-  if (positive(nasdaqReturn) && finite(nasdaqMedianReturn) && nasdaqMedianReturn < 0) {
-    record('nasdaq_rises_median_falls', 'Nasdaq rises while its median constituent falls', { nasdaqReturn, nasdaqMedianReturn });
+  const { nasdaqReturn, nasdaqMedianReturn, nasdaqBenchmark, nasdaqBenchmarkProxy, nasdaqObservations, nasdaqExpected } = snapshot.aggregates ?? {};
+  const threshold = policy.descriptive ? policy.observedThreshold : healthCoverage(snapshot).completenessThreshold;
+  const observationsMinimum = policy.descriptive ? policy.observedMinimum : 1;
+  const adequatelyObserved = (observed, expected) => expected == null
+    ? !policy.descriptive : positive(expected) && observed >= observationsMinimum && observed / expected >= threshold;
+  if (positive(nasdaqReturn) && finite(nasdaqMedianReturn) && nasdaqMedianReturn < 0 &&
+      adequatelyObserved(nasdaqObservations, nasdaqExpected)) {
+    record(nasdaqBenchmarkProxy ? 'qqq_rises_nasdaq_median_falls' : 'nasdaq_rises_median_falls',
+      nasdaqBenchmarkProxy ? 'QQQ (Nasdaq-100 ETF) rises while the median Nasdaq-listed common stock falls'
+        : 'Nasdaq Composite rises while the median Nasdaq-listed common stock falls',
+      { nasdaqReturn, nasdaqMedianReturn, nasdaqBenchmark, nasdaqBenchmarkProxy, nasdaqObservations, nasdaqExpected });
   }
   const previousLeaders = new Set((previous.stocks ?? []).filter((stock) => stock.rsPercentile >= 90).map((stock) => stock.securityId));
-  const leaderReturn = snapshot.aggregates?.leaderReturn ?? mean((snapshot.stocks ?? [])
-    .filter((stock) => previousLeaders.has(stock.securityId) && finite(stock.return_1d)).map((stock) => stock.return_1d));
-  if (positive(leaderReturn) && finite(leadership) && finite(oldLeadership) && leadership < oldLeadership) {
-    record('leaders_rise_industry_participation_falls', 'Leaders rise while industry participation falls', { leaderReturn, leadership, oldLeadership });
+  const comparableLeaderReturns = (snapshot.stocks ?? [])
+    .filter((stock) => previousLeaders.has(stock.securityId) && finite(stock.return_1d)).map((stock) => stock.return_1d);
+  const leadershipArchive = snapshot.aggregates?.previousLeaderDate === previous.date ? snapshot.aggregates : null;
+  const leaderReturn = leadershipArchive?.leaderReturn ?? mean(comparableLeaderReturns);
+  const leaderCount = leadershipArchive?.leaderReturnObservations ?? comparableLeaderReturns.length;
+  const leaderExpected = leadershipArchive?.leaderReturnExpected ?? previousLeaders.size;
+  if (positive(leaderReturn) && adequatelyObserved(leaderCount, leaderExpected) &&
+      finite(leadership) && finite(oldLeadership) && leadership < oldLeadership) {
+    record('leaders_rise_industry_participation_falls', 'Prior top-decile RS stocks rise while industry participation falls',
+      { leaderReturn, leaderCount, leaderExpected, leadership, oldLeadership });
   }
   return signals;
 }
 
-function computeHealth(snapshot, index, timeline, model) {
+function computeHealth(snapshot, index, timeline, model, policy) {
   const date = timeline.dates[index];
-  const coverage = healthCoverage(snapshot);
+  const coverage = healthCoverage(snapshot, policy);
   const usableSnapshot = coverage.ready ? snapshot : undefined;
   const prior = (offset) => {
     if (offset === 0) return usableSnapshot;
     const candidate = timeline.at(index - offset);
-    return candidate && snapshot && timeline.sameContext(candidate, snapshot) && healthCoverage(candidate).ready ? candidate : undefined;
+    return candidate && snapshot && timeline.sameContext(candidate, snapshot) && healthCoverage(candidate, policy).ready ? candidate : undefined;
   };
   const readComponent = (id, offset) => {
     const source = offset === 0 ? snapshot : prior(offset);
-    if (id !== 'industryLeadership' || !source) return usableComponent(source, id, COMPONENTS[id].get(source));
+    if (id !== 'industryLeadership' || !source) return usableComponent(source, id, COMPONENTS[id].get(source), policy);
     const end = shiftDate(weekEnd(source.date), -28);
     const comparison = expectedSessions(shiftDate(end, -4), end).at(-1);
     const baselineIndex = timeline.index?.get(comparison);
     const baseline = baselineIndex != null ? prior(index - baselineIndex) : undefined;
-    return usableComponent(source, id, COMPONENTS[id].get(source, baseline));
+    return usableComponent(source, id, COMPONENTS[id].get(source, baseline), policy);
   };
   const components = Object.entries(COMPONENTS).map(([id, component]) => {
     const data = readComponent(id, 0);
@@ -450,7 +502,7 @@ function computeHealth(snapshot, index, timeline, model) {
   const features = Object.fromEntries(components.map(({ id, value, adequacy }) => [id, adequacy?.sufficient === false ? null : value]));
   const priorChange = prior(model.changeLookback);
   for (const [key, id] of [['shortChange', 'shortBreadth'], ['intermediateChange', 'intermediateBreadth']]) {
-    const previous = usableComponent(priorChange, id, COMPONENTS[id].get(priorChange));
+    const previous = usableComponent(priorChange, id, COMPONENTS[id].get(priorChange), policy);
     const before = previous.adequacy?.sufficient === false ? null : previous.value;
     const current = features[id];
     features[key] = before == null || current == null ? null : current - before;
@@ -460,26 +512,31 @@ function computeHealth(snapshot, index, timeline, model) {
   features.benchmarkMomentum = finite(exactBenchmarkReturn) ? exactBenchmarkReturn * 100 : benchmark.momentum;
   const weaknessPeriod = Array.from({ length: model.weaknessLookback }, (_, i) => COMPONENTS.shortBreadth.get(prior(i + 1)).value);
   features.priorWeakSessions = weaknessPeriod.every(finite) ? weaknessPeriod.filter((value) => value < model.weaknessThreshold).length : null;
-  const benchmarkHigh = model.benchmarkLookback === 20 ? benchmark.isNewHigh : rollingBenchmark(prior, 20).isNewHigh;
+  const benchmarkHigh = usableSnapshot?.aggregates?.benchmarkHigh20d ??
+    (model.benchmarkLookback === 20 ? benchmark.isNewHigh : rollingBenchmark(prior, 20).isNewHigh);
+  const oldIndustry = readComponent('industryLeadership', 1);
   const reason = state === 'ready' ? null : state;
   return {
     date, score: reason ? null : components.reduce((sum, item) => sum + item.contribution, 0),
     state, reason, model, coverage, components, missingComponents: missing,
     regime: classifyRegime(features, model, { ...coverage, ready: state === 'ready' }),
-    divergences: state === 'ready' ? breadthDivergences(usableSnapshot, prior(1), benchmarkHigh,
-      features.industryLeadership, readComponent('industryLeadership', 1).value) : [],
+    divergences: coverage.ready ? breadthDivergences(usableSnapshot, prior(1), benchmarkHigh,
+      features.industryLeadership, oldIndustry.adequacy?.sufficient === false ? null : oldIndustry.value, policy) : [],
+    ...policy,
     knownAt: snapshot?.knownAt ?? null, universe: snapshot?.universe ?? null, benchmark: snapshot?.benchmark ?? null,
   };
 }
 
-export function marketHealthHistory(snapshots, { model, sessions } = {}) {
+export function marketHealthHistory(snapshots, { model, sessions, ...coverage } = {}) {
   const definition = healthModel(model);
-  const timeline = snapshotTimeline(snapshots, sessions);
+  const policy = coveragePolicy(coverage);
+  const dates = !sessions && policy.descriptive ? snapshots.map(({ date }) => date).sort() : [];
+  const timeline = snapshotTimeline(snapshots, sessions ?? (dates.length ? expectedSessions(dates[0], dates.at(-1)) : undefined));
   const output = [];
   let previousSnapshot;
   for (const [index, date] of timeline.dates.entries()) {
     const snapshot = timeline.at(index);
-    const health = computeHealth(snapshot, index, timeline, definition);
+    const health = computeHealth(snapshot, index, timeline, definition, policy);
     const previous = output.at(-1)?.regime;
     const persists = health.regime.id !== 'unavailable' && previous?.id === health.regime.id &&
       timeline.sameContext(snapshot, previousSnapshot);
@@ -491,16 +548,16 @@ export function marketHealthHistory(snapshots, { model, sessions } = {}) {
   return output;
 }
 
-export function calculateMarketHealth(snapshot, { model, history = [], sessions } = {}) {
+export function calculateMarketHealth(snapshot, { model, history = [], sessions, ...coverage } = {}) {
   if (!snapshot?.date) {
     const definition = healthModel(model);
-    const health = computeHealth(undefined, 0, { dates: [null], at: () => undefined }, definition);
+    const health = computeHealth(undefined, 0, { dates: [null], at: () => undefined }, definition, coveragePolicy(coverage));
     return { ...health, regime: { ...health.regime, since: null, sessions: 0 } };
   }
   const previous = history.filter((item) => item.date < snapshot.date);
   const upToDate = sessions?.filter((date) => date <= snapshot.date);
   if (upToDate && !upToDate.includes(snapshot.date)) upToDate.push(snapshot.date);
-  return marketHealthHistory([...previous, snapshot], { model, sessions: upToDate }).at(-1);
+  return marketHealthHistory([...previous, snapshot], { model, sessions: upToDate, ...coverage }).at(-1);
 }
 
 const DEFAULT_HORIZONS = Object.freeze([5, 10, 20, 60]);
@@ -532,14 +589,36 @@ function eventCondition(input, depth = 0) {
   return condition;
 }
 
-function eventMetric(observation, metric, cutoff) {
-  if (!observation || (observation.coverage && !healthCoverage(observation).ready)) return null;
-  const raw = lookup(observation.metrics, metric) ?? lookup(observation.breadth, metric) ?? pathValue(observation, metric);
+function rawEventMetric(observation, metric) {
+  return lookup(observation.metrics, metric) ?? lookup(observation.breadth, metric) ?? pathValue(observation, metric);
+}
+
+function eventMetric(observation, metric, cutoff, policy) {
+  if (!observation || ((observation.coverage || policy.descriptive) && !healthCoverage(observation, policy).ready)) return null;
+  const raw = rawEventMetric(observation, metric);
   const value = typeof raw === 'object' && raw !== null ? raw.value : raw;
-  if (!finite(value) || raw?.denominator === 0 ||
+  if (!finite(value) || raw?.denominator === 0 || !adequateMetric(observation, metric, raw, policy) ||
       (raw?.effectiveDate != null && validateDate(raw.effectiveDate, 'Metric effective date') > observation.date) ||
       (raw?.knownAt != null && !knownBy(raw.knownAt, cutoff, observation.date))) return null;
   return value;
+}
+
+function comparedMetrics(condition) {
+  const group = condition.all ?? condition.any;
+  return group ? group.flatMap(comparedMetrics) : [condition.metric, ...(condition.after ? [condition.after.metric] : [])];
+}
+
+function observedEventEvidence(observation, metrics) {
+  const { coverage } = observation;
+  return {
+    sourceState: coverage.state ?? null, sourceRatio: coverage.ratio ?? null,
+    observedListed: coverage.listed, observedTraded: coverage.traded,
+    metrics: Object.fromEntries(metrics.map((metric) => {
+      const comparable = rawEventMetric(observation, metric)?.denominator ?? null;
+      const expected = coverage.comparableExpected?.[metric] ?? coverage.traded;
+      return [metric, { comparable, expected, ratio: positive(expected) && finite(comparable) ? comparable / expected : null }];
+    })),
+  };
 }
 
 function conditionResult(condition, index, metricAt) {
@@ -791,11 +870,13 @@ function medianStockOutcome(members, prices, index, horizon, ctx) {
 
 export function runEventStudy({
   sessions, observations = [], condition, benchmarks = {}, cohorts, securityPrices, horizons = DEFAULT_HORIZONS,
-  asOf, start, end, overlap = 'perHorizon', minEventGap = 0, maePrice = 'close',
+  asOf, start, end, overlap = 'perHorizon', minEventGap = 0, maePrice = 'close', coverageMode, observedMinimum, observedThreshold,
 }) {
   const ctx = studyContext(sessions, asOf, maePrice);
   const windows = researchHorizons(horizons);
   const criteria = eventCondition(condition);
+  const policy = coveragePolicy({ coverageMode, observedMinimum, observedThreshold });
+  const assessedMetrics = policy.descriptive ? [...new Set(comparedMetrics(criteria))] : [];
   const gap = boundedInteger(minEventGap, 'minEventGap', 0, MAX_HORIZON);
   if (!['perHorizon', 'longest', 'none'].includes(overlap)) throw new RangeError('Invalid event overlap policy');
   if (start != null) validateDate(start, 'Study start date');
@@ -806,7 +887,7 @@ export function runEventStudy({
   const observationOn = (date) => date ? recordOn(input, date, ctx.observationCutoff(date)) : undefined;
   const metricAt = (index, metric) => {
     const date = ctx.dates[index];
-    return date ? eventMetric(observationOn(date), metric, ctx.observationCutoff(date)) : null;
+    return date ? eventMetric(observationOn(date), metric, ctx.observationCutoff(date), policy) : null;
   };
   const matches = [];
   let unknownCount = 0;
@@ -821,6 +902,7 @@ export function runEventStudy({
     const members = lookup(cohorts, date) ?? (securityPrices ? observation.stocks : undefined) ?? [];
     matches.push({
       index, date, value: criteria.metric ? metricAt(index, criteria.metric) : null,
+      ...(policy.descriptive ? { coverageEvidence: observedEventEvidence(observation, assessedMetrics) } : {}),
       ...cohortMembers(members, date, ctx),
     });
   }
@@ -835,6 +917,7 @@ export function runEventStudy({
       const targetDate = ctx.dates[event.index + horizon] ?? null;
       events.push({
         date: event.date, value: event.value, targetDate, excludedCohortMembers: event.excludedCount,
+        ...(event.coverageEvidence ? { coverageEvidence: event.coverageEvidence } : {}),
         benchmarks: Object.fromEntries(referenceSeries.map(([name, prices]) =>
           [name, forwardOutcome(prices, event.index, horizon, ctx)])),
         medianStock: medianStockOutcome(event.members, securityPrices, event.index, horizon, ctx),
@@ -848,7 +931,163 @@ export function runEventStudy({
   });
   return {
     condition: criteria, asOf: ctx.cutoff, start: start ?? null, end: end ?? null, maePrice, overlap, minEventGap: gap,
-    definitions: RESEARCH_DEFINITIONS, eventCount: matches.length, matchedCount: matches.length, unknownCount, evaluatedCount,
-    events: matches.map(({ date, value }) => ({ date, value })), results,
+    ...policy, definitions: RESEARCH_DEFINITIONS, eventCount: matches.length, matchedCount: matches.length, unknownCount, evaluatedCount,
+    events: matches.map(({ date, value, coverageEvidence }) => ({ date, value, ...(coverageEvidence ? { coverageEvidence } : {}) })), results,
   };
+}
+
+const analogFeatures = ['breadth.above_50d.value', 'breadth.positive_21d.value', 'breadth.top_decile.value'];
+
+export function findHistoricalAnalogs({
+  snapshots = [], sessions, asOf, horizon = 20, limit = 10, minimumHistory = 30, minimumFactors = 2,
+  metrics = analogFeatures, overlap = 'nonoverlapping', ...coverage
+} = {}) {
+  const policy = coveragePolicy(coverage);
+  const period = boundedInteger(horizon, 'Analog horizon', 1, 252);
+  const maximum = boundedInteger(limit, 'Analog limit', 1, 100);
+  const required = boundedInteger(minimumHistory, 'Analog minimum history', 2, 7560);
+  const featuresRequired = boundedInteger(minimumFactors, 'Analog minimum factors', 1, 12);
+  if (!Array.isArray(metrics) || metrics.length > 12 || metrics.some((metric) => typeof metric !== 'string' || !/^breadth\.[\w.]+\.value$/.test(metric))) {
+    throw new TypeError('Analog metrics must be breadth value paths');
+  }
+  const features = [...new Set(metrics)];
+  if (features.length < featuresRequired) throw new RangeError('Too few distinct analog metrics');
+  if (!['nonoverlapping', 'allow'].includes(overlap)) throw new RangeError('Invalid analog overlap policy');
+  const dates = snapshots.map(({ date }) => validateDate(date, 'Analog snapshot date')).sort();
+  const cutoff = asOf == null ? dates.at(-1) ?? null : validateDate(asOf, 'Analog as-of date');
+  const calendarDates = sessions ?? (dates.length && cutoff ? expectedSessions(dates[0], cutoff) : []);
+  const timeline = snapshotTimeline(snapshots, calendarDates);
+  const target = timeline.at(timeline.index.get(cutoff));
+  const output = { asOf: cutoff, horizon: period, overlap, metrics: features, minimumHistory: required, minimumFactors: featuresRequired,
+    sampleCount: 0, outcomeCount: 0, rightCensored: 0, missingOutcomes: 0, overlapSkipped: 0, matches: [], ...policy };
+  const profile = (point) => {
+    if (!point || !healthCoverage(point, policy).ready) return null;
+    const values = features.map((path) => {
+      const metric = path.slice(8, -6);
+      return eventMetric(point, metric, point.date, policy);
+    });
+    return values.every(finite) ? values : null;
+  };
+  const current = profile(target);
+  if (!current) return { ...output, state: 'current_profile_unavailable' };
+  const cutoffIndex = timeline.index.get(cutoff);
+  const candidates = [];
+  for (let index = 0; index < cutoffIndex; index++) {
+    const point = timeline.at(index);
+    if (!timeline.sameContext(point, target)) continue;
+    const readings = profile(point);
+    if (readings) candidates.push({ index, date: point.date, readings });
+  }
+  output.sampleCount = candidates.length;
+  if (candidates.length < required) return { ...output, state: 'insufficient_history' };
+  const spreads = features.map((_, feature) => {
+    const values = candidates.map(({ readings }) => readings[feature]);
+    const center = mean(values);
+    return Math.sqrt(mean(values.map((value) => (value - center) ** 2)));
+  });
+  const informative = spreads.flatMap((spread, feature) => spread > 0 ? [feature] : []);
+  output.informativeMetrics = informative.map((feature) => features[feature]);
+  if (informative.length < featuresRequired) return { ...output, state: 'insufficient_varying_factors' };
+  const distance = ({ readings }) => Math.sqrt(mean(informative.map((feature) => ((readings[feature] - current[feature]) / spreads[feature]) ** 2)));
+  const nearest = candidates.map((candidate) => ({ ...candidate, distance: distance(candidate) }))
+    .sort((left, right) => left.distance - right.distance || right.date.localeCompare(left.date));
+  const accepted = [];
+  for (const candidate of nearest) {
+    if (accepted.length === maximum) break;
+    if (overlap === 'nonoverlapping' && accepted.some((other) => Math.abs(candidate.index - other.index) < period)) {
+      output.overlapSkipped++;
+      continue;
+    }
+    accepted.push(candidate);
+    const end = candidate.index + period;
+    let gross = 1;
+    let status = end > cutoffIndex ? 'rightCensored' : 'complete';
+    if (status === 'complete') {
+      for (let index = candidate.index + 1; index <= end; index++) {
+        const point = timeline.at(index);
+        const value = point?.aggregates?.benchmarkReturn;
+        if (!timeline.sameContext(point, target) || !finite(value) || value <= -1) { status = 'missingBenchmark'; break; }
+        gross *= 1 + value;
+      }
+    }
+    const forwardReturn = status === 'complete' ? percent(gross) : null;
+    if (status === 'rightCensored') output.rightCensored++;
+    if (status === 'missingBenchmark') output.missingOutcomes++;
+    output.matches.push({ date: candidate.date, targetDate: end <= cutoffIndex ? timeline.dates[end] : null,
+      distance: candidate.distance, forwardReturn, status, readings: Object.fromEntries(features.map((name, index) => [name, candidate.readings[index]])) });
+  }
+  const observed = output.matches.map(({ forwardReturn }) => forwardReturn).filter(finite);
+  output.outcomeCount = observed.length;
+  return { ...output, state: 'ready', benchmark: target.benchmark, returnUnit: 'percent',
+    benchmarkSummary: { mean: mean(observed), median: median(observed),
+      winRate: observed.length ? observed.filter(positive).length / observed.length : null },
+    definitions: {
+      distance: 'Root mean square across standardized breadth differences, using the dispersion in prior eligible sessions only.',
+      overlap: 'With nonoverlapping enabled, closer matches take priority and forward windows do not share return sessions.',
+      forwardReturn: 'Compounded benchmark daily returns over the selected number of sessions after the analog, through the as-of date.',
+    } };
+}
+
+export function leadershipTransitionMatrix(snapshots = [], { bands = [0, 50, 80, 90, 95], detail = false } = {}) {
+  if (!Array.isArray(bands) || !bands.length || bands.length > 12 || bands[0] !== 0 ||
+      bands.some((value, index) => !finite(value) || value < 0 || value > 100 || index > 0 && value <= bands[index - 1])) {
+    throw new RangeError('Rank band bounds must begin at 0 and strictly increase through 100');
+  }
+  const labels = bands.map((value, i) => i + 1 < bands.length ? `${value}–<${bands[i + 1]}` : `${value}–100`);
+  const from = [...labels, 'NEW'];
+  const to = [...labels, 'EXIT'];
+  const counts = () => Array.from({ length: from.length }, () => Array(to.length).fill(0));
+  const totals = counts();
+  const weeks = [];
+  const totalsFor = () => ({ comparable: 0, enteredEligibility: 0, leftEligibility: 0, newlyRanked: 0, lostRank: 0 });
+  const participants = totalsFor();
+  const last = bands.length;
+  const band = (value) => finite(value) && value >= 0 && value <= 100 ? bands.findLastIndex((floor) => value >= floor) : -1;
+  const points = snapshots.map((point) => ({ ...point, date: validateDate(point.date, 'Weekly ranking date') }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const timeline = snapshotTimeline(points);
+  let prior = null;
+  let pairs = 0;
+  let skippedIncomplete = 0;
+  let skippedGaps = 0;
+  for (const [index, date] of timeline.dates.entries()) {
+    const end = weekEnd(date);
+    const close = expectedSessions(shiftDate(end, -4), end).at(-1);
+    if (date !== close) { skippedIncomplete++; continue; }
+    const current = timeline.at(index);
+    if (!current) continue;
+    if (prior) {
+      if (shiftDate(weekEnd(prior.date), 7) !== end || !timeline.sameContext(prior, current)) skippedGaps++;
+      else {
+        pairs++;
+        const old = new Map((prior.stocks ?? []).map((stock) => [stock.securityId, band(stock.rsPercentile)]));
+        const next = new Map((current.stocks ?? []).map((stock) => [stock.securityId, band(stock.rsPercentile)]));
+        const changes = totalsFor();
+        const matrix = detail ? counts() : null;
+        for (const id of new Set([...old.keys(), ...next.keys()])) {
+          const before = old.get(id);
+          const after = next.get(id);
+          if (before == null) changes.enteredEligibility++;
+          if (after == null) changes.leftEligibility++;
+          if (before === -1 && after >= 0) changes.newlyRanked++;
+          if (before >= 0 && after === -1) changes.lostRank++;
+          if (before >= 0 && after >= 0) changes.comparable++;
+          if (!(before >= 0) && !(after >= 0)) continue;
+          const x = before >= 0 ? before : last;
+          const y = after >= 0 ? after : last;
+          totals[x][y]++;
+          if (matrix) matrix[x][y]++;
+        }
+        for (const key of Object.keys(changes)) participants[key] += changes[key];
+        if (detail) weeks.push({ previousDate: prior.date, date, matrix, ...changes });
+      }
+    }
+    prior = current;
+  }
+  return { bands, from, to, matrix: totals, pairs, skippedIncomplete, skippedGaps, ...participants, weeks,
+    definitions: {
+      comparable: 'Permanent IDs with a percentile in both consecutive completed weeks.',
+      new: 'Ranked this week with no preceding rank. Eligibility entrants and previously unranked stocks are counted separately.',
+      exit: 'Ranked in the preceding week with no current rank. Eligibility exits and still-eligible unranked stocks are counted separately.',
+    } };
 }

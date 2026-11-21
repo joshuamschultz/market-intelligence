@@ -1,5 +1,6 @@
 import {
-  action, attr, chip, compact, count, csvDownload, dateLabel, direction, empty, field, heading, icon, iconButton, money, notice, number, numeric, option,
+  action, attr, bindObservedCoverage, chip, compact, count, csvDownload, dateLabel, direction, empty, field, heading, icon, iconButton, money, notice, number, numeric, option,
+  observedCoverageFields, observedCoverageParams, observedCoverageSummary,
   panelHead, pagination, pathPart, pending, publishingHistory, percent, rate, ratio, safe, segment, shiftDate, signed, summary, table,
 } from './ui.js';
 import { chart, chartColors } from './charts.js';
@@ -7,15 +8,20 @@ import { partialCoverage } from './overview.js';
 import { mountJournalHistory } from './journal.js';
 
 const groupLevels = [['industry','Industries'], ['sector','Sectors'], ['subindustry','Subindustries'], ['theme','Themes']];
+const rankDelta = (value) => signed(value, 0);
 const groupMetrics = {
   rank: ['Rank', count], medianRS: ['Median RS', number], velocity4w: ['4W velocity', signed], velocity12w: ['12W velocity', signed],
-  rankChange4w: ['4W rank change', signed], rankChange12w: ['12W rank change', signed], topDecile: ['Top decile', percent],
+  rankChange4w: ['4W rank change', rankDelta], rankChange12w: ['12W rank change', rankDelta], topDecile: ['Top decile', percent],
   above50: ['Above 50D', percent], above200: ['Above 200D', percent], breadthChange: ['4W breadth Δ', signed],
-  equalWeight: ['1M equal weight', rate], relativeReturn: ['1M vs benchmark', rate], parentRelativeRS: ['RS vs parent', signed],
+  equalWeight: ['1M equal weight', rate], relativeReturn: ['1M vs benchmark', rate], parentRelativeRS: ['Median RS vs parent', signed],
   upDownDollar: ['U/D dollar volume', ratio], newHighBreadth: ['New 52W highs', percent],
+  parentRelativeReturn: ['1M return vs parent', rate], emergingLeaderCount: ['Emerging leaders', count],
 };
-const groupChartMetrics = [['medianRS','Median RS percentile'], ['index','Equal-weight index'], ['above50','Above 50D SMA'],
-  ['above200','Above 200D SMA'], ['upDownDollar','U/D dollar volume'], ['topDecile','Top decile'], ['rank','Group rank']];
+const groupChartMetrics = [['percentile','Group RS percentile',number], ['medianRS','Median constituent RS percentile',number],
+  ['index','Equal-weight index',number],
+  ['capWeightIndex','Cap-weight index',number], ['largestPositiveDollarShare','Largest-cap share of advancing dollar volume',rate],
+  ['above50','Above 50D SMA',percent], ['above200','Above 200D SMA',percent], ['upDownDollar','U/D dollar volume',ratio],
+  ['topDecile','Top decile',percent], ['emergingLeaderCount','Emerging leader count',count], ['rank','Group rank',count]];
 const stockColumns = ['symbol','name','rsRank','rsPercentile','velocity4w','return_21d','udv_50d','industry'];
 const comparisonWidths = [[20,'1M'],[63,'3M'],[126,'6M'],[252,'1Y']];
 const historicalWidths = [...comparisonWidths, [1260,'5Y'], [2520,'10Y']];
@@ -24,21 +30,29 @@ const rotationFields = {
   medianRS: ['Median constituent RS', (value) => number(value, 0), [0, 100]],
   velocity4w: ['4W RS velocity', signed],
   velocity12w: ['12W RS velocity', signed],
+  rankChange4w: groupMetrics.rankChange4w,
+  rankChange12w: groupMetrics.rankChange12w,
   breadthChange: ['4W breadth change', signed],
   above50: ['Above 50D SMA', (value) => percent(value, 0), [0, 100]],
   topDecile: ['Top-decile participation', (value) => percent(value, 0), [0, 100]],
   relativeReturn: ['1M vs benchmark', (value) => rate(value, 1)],
+  parentRelativeRS: groupMetrics.parentRelativeRS,
+  parentRelativeReturn: groupMetrics.parentRelativeReturn,
 };
+const parentMetrics = ['parentRelativeRS', 'parentRelativeReturn'];
+const directionMetrics = new Set(['velocity4w', 'velocity12w', 'rankChange4w', 'rankChange12w', 'breadthChange',
+  'equalWeight', 'relativeReturn', ...parentMetrics]);
 
 function groupTable(groups, sort, selected, level) {
-  const visible = ['rank','medianRS','velocity4w','velocity12w','topDecile','above50','above200','breadthChange','equalWeight','relativeReturn','upDownDollar'];
+  const visible = ['rank','medianRS','rankChange4w','rankChange12w','velocity4w','velocity12w','topDecile','above50','above200',
+    'breadthChange','equalWeight','relativeReturn', ...(['industry','subindustry'].includes(level) ? parentMetrics : []), 'upDownDollar'];
   return `<div class="table-scroll" tabindex="0" role="region" aria-label="${safe(level)} rankings"><table><thead><tr>
     <th scope="col">Compare</th><th scope="col">Group</th><th scope="col">Members</th>
     ${visible.map((key) => `<th scope="col"${sort.key === key ? attr('aria-sort', sort.direction === 1 ? 'ascending' : 'descending') : ''}>
       <button type="button" class="table-sort" data-action="group-sort" data-value="${key}">${groupMetrics[key][0]}${sort.key === key ? icon(sort.direction === 1 ? 'up' : 'down') : ''}</button></th>`).join('')}</tr></thead><tbody>
     ${groups.map((group) => `<tr><td><input type="checkbox" data-change="group-compare" value="${safe(group.id)}" aria-label="Compare ${safe(group.name)}" ${selected.has(group.id) ? 'checked' : ''}></td>
       <td><button type="button" class="stock-link" data-action="industry" data-value="${safe(group.id)}">${safe(group.name)}</button></td><td class="numeric">${count(group.count)}</td>
-      ${visible.map((key) => `<td class="numeric ${['velocity4w','velocity12w','breadthChange','equalWeight','relativeReturn'].includes(key) ? direction(group[key]) : ''}">${groupMetrics[key][1](group[key])}</td>`).join('')}</tr>`).join('')}
+      ${visible.map((key) => `<td class="numeric ${directionMetrics.has(key) ? direction(group[key]) : ''}">${groupMetrics[key][1](group[key])}</td>`).join('')}</tr>`).join('')}
     </tbody></table></div>`;
 }
 
@@ -50,7 +64,7 @@ function rotationPlot(groups, settings) {
     const fixed = rotationFields[key][2];
     if (fixed) return fixed;
     const values = rows.map((row) => row[key]);
-    const bound = Math.max(key === 'relativeReturn' ? 0.01 : 1, ...values.map(Math.abs));
+    const bound = Math.max(['relativeReturn', 'parentRelativeReturn'].includes(key) ? 0.01 : 1, ...values.map(Math.abs));
     return [-bound, bound];
   };
   const [xMin,xMax] = domain(xKey);
@@ -123,6 +137,7 @@ async function renderIndustries(env) {
   state.sort ||= { key: 'rank', direction: 1 };
   state.compare ||= new Set();
   state.chartMetric ||= 'medianRS';
+  state.chartCadence ||= 'daily';
   state.limit ||= 63;
   state.rotation ||= 'velocity4w';
   state.rotationX ||= 'percentile';
@@ -136,7 +151,7 @@ async function renderIndustries(env) {
   const byId = new Map(data.groups.map((group) => [group.id, group]));
 
   function visibleGroups() {
-    return data.groups.filter((group) => group.level === state.level).toSorted((a, b) => {
+    return data.groups.filter((group) => group.level === state.level && (!state.emergingOnly || group.emerging === true)).toSorted((a, b) => {
       const left = a[state.sort.key];
       const right = b[state.sort.key];
       return left == null ? right == null ? a.name.localeCompare(b.name) : 1
@@ -145,6 +160,11 @@ async function renderIndustries(env) {
   }
   function draw() {
     const groups = visibleGroups();
+    const hasParent = ['industry','subindustry'].includes(state.level);
+    const rotationChoices = Object.entries(rotationFields).filter(([key]) => hasParent || !parentMetrics.includes(key));
+    const rotationSettings = { ...state,
+      rotationX: !hasParent && parentMetrics.includes(state.rotationX) ? 'percentile' : state.rotationX,
+      rotation: !hasParent && parentMetrics.includes(state.rotation) ? 'velocity4w' : state.rotation };
     const preferred = env.context.date ? ['sec-sic', 'nasdaq'] : ['nasdaq', 'sec-sic'];
     const alternative = preferred.find((system) => system !== env.context.classification && env.config.classificationSystems?.includes(system));
     const sourceName = { nasdaq: 'Nasdaq', 'sec-sic': 'SEC filing taxonomy' };
@@ -153,7 +173,8 @@ async function renderIndustries(env) {
     main.innerHTML = heading('Industries', 'Compare group leadership, participation, and rotation.', action('Create theme', 'create-theme', 'plus', { className: 'primary' })) +
       partialCoverage(data.coverage, env.routeUrl) + referenceNote +
       segment('industry-level', groupLevels, state.level, 'tabs') +
-      `<div class="stack"><section class="panel panel-body">${panelHead('Group rankings', `${count(groups.length)} comparable groups · ${dateLabel(data.date)}`)}
+      `<div class="stack"><section class="panel panel-body">${panelHead('Group rankings', `${count(groups.length)} comparable groups · ${dateLabel(data.date)}`,
+        `<label class="checkbox-label"><input type="checkbox" data-change="group-emerging"${state.emergingOnly?' checked':''}> Emerging groups</label>`)}
         ${groups.length ? groupTable(groups, state.sort, state.compare, state.level) : empty('No groups in this context',
           state.level === 'theme' ? 'Create a theme or select a session with existing dated theme membership.' : 'The selected classification has no eligible groups for this price session.',
           'industries', alternative ? action(`Use ${sourceName[alternative]}`, 'use-industry-source', 'layers', {value:alternative}) : '')}
@@ -162,16 +183,19 @@ async function renderIndustries(env) {
         <span class="muted"> · ${count(theme.definition?.members?.length)} saved members</span></div><div class="actions">${action('Edit','edit-theme','edit',{ value: theme.id })}
         ${action('Delete','delete-theme','trash',{ value: theme.id, className: 'danger' })}</div></div>`).join('')}</section>` : ''}
       ${groups.length ? `<div class="split-grid">
-        <section class="panel panel-body">${panelHead('Rotation map', 'Compare breadth, momentum, and relative leadership by group.')}
+        <section class="panel panel-body">${panelHead('Rotation map', 'Positive rank changes indicate an improved rank. Parent comparisons use the group’s sector or industry.')}
           <div class="inline-form rotation-controls">
-          ${[['X axis', 'rotation-x', state.rotationX], ['Y axis', 'rotation', state.rotation]].map(([label,change,current]) =>
-            field(label, `<select data-change="${change}">${Object.entries(rotationFields).map(([key,[text]])=>option(key,text,current)).join('')}</select>`)).join('')}
+          ${[['X axis', 'rotation-x', rotationSettings.rotationX], ['Y axis', 'rotation', rotationSettings.rotation]].map(([label,change,current]) =>
+            field(label, `<select data-change="${change}">${rotationChoices.map(([key,[text]])=>option(key,text,current)).join('')}</select>`)).join('')}
           ${field('Color', `<select data-change="rotation-color">${['breadthChange','velocity4w','velocity12w','relativeReturn'].map((key)=>option(key,rotationFields[key][0],state.rotationColor)).join('')}</select>`)}
           ${field('Size', `<select data-change="rotation-size">${option('count','Constituents',state.rotationSize)}${option('marketCap','Market cap',state.rotationSize)}</select>`)}
-          </div>${rotationPlot(groups,state)}</section>
+          </div>${rotationPlot(groups,rotationSettings)}</section>
         <section class="panel panel-body">${panelHead('Group comparison', 'Select up to eight groups from the table.', iconButton('Export group comparison CSV','export-chart','download','industry-comparison.csv'))}
           <div class="inline-form">
           ${field('Metric', `<select data-change="group-chart">${groupChartMetrics.map(([id,label])=>option(id,label,state.chartMetric)).join('')}</select>`)}
+          ${field('Second metric', `<select data-change="group-secondary"${state.compare.size!==1?' disabled':''}>${option('','No comparison',state.chartSecondary||'')}
+            ${groupChartMetrics.map(([id,label])=>option(id,label,state.chartSecondary)).join('')}</select>`,'Select one group to compare its metrics.')}
+          ${field('Sampling', `<select data-change="group-cadence">${option('daily','Daily',state.chartCadence)}${option('weekly','Weekly',state.chartCadence)}</select>`)}
           ${segment('group-range',comparisonWidths,state.limit)}</div>
           <div id="industry-chart" class="section-space"></div></section>
         </div>` : ''}</div>`;
@@ -189,13 +213,17 @@ async function renderIndustries(env) {
     const run = ++compareRun;
     target.innerHTML = pending();
     try {
-      const result = await env.publishedSeries('industries/compare', { signal, params: { ids: ids.join(','), limit: state.limit } }, (partial, job) => {
+      const result = await env.publishedSeries('industries/compare', { signal, params: { ids: ids.join(','), limit: state.limit, cadence: state.chartCadence } }, (partial, job) => {
         if (target.isConnected && run === compareRun) target.innerHTML = publishingHistory(job);
       });
       if (run !== compareRun || !target.isConnected) return;
-      const key = state.chartMetric;
-      const labels = ids.map((id, index) => ({ key: id, label: byId.get(id).name, color: chartColors[index], value: (row) => row.groups.find((group) => group.id === id)?.[key] }));
-      target.innerHTML = chart(result.rows, labels, { fill: ids.length === 1 });
+      const selectedMetrics = [state.chartMetric, ...(ids.length===1 && state.chartSecondary && state.chartSecondary!==state.chartMetric ? [state.chartSecondary] : [])];
+      const labels = ids.flatMap((id, index) => selectedMetrics.map((metric, axis) => {
+        const [,label,format] = groupChartMetrics.find(([key])=>key===metric);
+        return { key: `${id}:${metric}`, label: `${byId.get(id).name} · ${label}`,
+          axis: axis===1?'right':'left', color: chartColors[index+axis], format, value: (row) => row.groups.find((group) => group.id === id)?.[metric] };
+      }));
+      target.innerHTML = chart(result.rows, labels, { fill: ids.length === 1, axisFormat:labels[0]?.format, rightAxisFormat:labels[1]?.format });
     } catch (error) {
       if (target.isConnected && error.name !== 'AbortError') target.innerHTML = notice('Group comparison unavailable', error.message, '', true);
     }
@@ -226,12 +254,18 @@ async function renderIndustries(env) {
     return loadMembers();
   }
   env.setActions({
-    'industry-level'(value) { state.level = value; draw(); },
+    'industry-level'(value) {
+      state.level = value;
+      if (!['industry','subindustry'].includes(value) && parentMetrics.includes(state.sort.key)) state.sort = { key: 'rank', direction: 1 };
+      draw();
+    },
     'group-sort'(key) { state.sort = { key, direction: state.sort.key === key ? -state.sort.direction : key === 'rank' ? 1 : -1 }; draw(); },
     'change:group-compare'(id, input) {
       if (input.checked && state.compare.size >= 8) { input.checked = false; env.toast('Compare up to eight groups.'); return; }
       if (input.checked) state.compare.add(id);
       else state.compare.delete(id);
+      const secondary = main.querySelector('[data-change="group-secondary"]');
+      if (secondary) secondary.disabled = state.compare.size !== 1;
       loadComparison();
     },
     'use-industry-source'(value) { return env.go('industries', { classification:value, reference:env.context.date ? 'as-of' : 'latest' }); },
@@ -240,6 +274,9 @@ async function renderIndustries(env) {
     'change:rotation-color'(value) { state.rotationColor = value; draw(); },
     'change:rotation-size'(value) { state.rotationSize = value; draw(); },
     'change:group-chart'(key) { state.chartMetric = key; loadComparison(); },
+    'change:group-secondary'(key) { state.chartSecondary = key; loadComparison(); },
+    'change:group-cadence'(value) { state.chartCadence = value; loadComparison(); },
+    'change:group-emerging'(value,input) { state.emergingOnly = input.checked; draw(); },
     'group-range'(value) { state.limit = Number(value); draw(); },
     industry(id, button, event) { event.preventDefault(); return openGroup(id); },
     'group-page'(page) { groupPanel.page = Number(page); return loadMembers(); },
@@ -257,10 +294,15 @@ async function renderIndustries(env) {
   if (env.params.group) openGroup(env.params.group);
 }
 
+const leadershipMetrics = [
+  ['leadershipPersistence','Top-decile leadership persistence'], ['leadershipTurnover','Top-decile leadership turnover'],
+];
+const leadershipMetricKeys = new Set(leadershipMetrics.map(([key]) => key));
 const historyMetrics = [
-  ['benchmarkClose','Benchmark close'], ['equalWeightIndex','Equal-weight index'], ['advanceDeclineLine','Cumulative A/D'],
+  ['benchmarkClose','Benchmark close'], ['equalWeightIndex','Equal-weight index'], ['capWeightIndex','Cap-weight index'],
+  ['largestPositiveDollarShare','Largest-cap share of advancing dollar volume'], ['advanceDeclineLine','Cumulative A/D (rebased to zero)'],
   ['adSpread','A/D spread'], ['above_50d','Above 50D SMA'], ['above_200d','Above 200D SMA'],
-  ['up_4pct','Up ≥ 4%'], ['down_4pct','Down ≥ 4%'],
+  ['up_4pct','Up ≥ 4%'], ['down_4pct','Down ≥ 4%'], ...leadershipMetrics,
 ];
 const eventOps = [['crossesAbove','Crosses above'], ['crossesBelow','Crosses below'], ['gt','Greater than'], ['gte','At least'], ['lt','Less than'], ['lte','At most']];
 const horizonsInput = '<input name="horizons" required value="5, 10, 20, 60">';
@@ -344,7 +386,11 @@ function outcomePanel(result, kind) {
   const observations = outcomeData(result.results || [],kind);
   const missingEntry = observations.some(({stats}) => stats?.counts?.missingEntry > 0);
   return `<section class="panel panel-body"><div class="summary-grid three">${stats.map(([key,value])=>summary(key,value,`Through ${dateLabel(result.asOf)}`)).join('')}</div>
-    ${events && !amount && result.unknownCount ? notice('No comparable event observations', 'Market event tests require complete breadth coverage. Sessions with partial coverage remain unavailable.') : ''}
+    ${result.descriptive ? notice('Observed universe · descriptive',
+      `${observedCoverageSummary(result)} ${result.coverageWarning || ''}`) : ''}
+    ${events && !amount && result.unknownCount ? notice('No comparable event observations', result.descriptive
+      ? 'The observed universe did not meet the comparable coverage required for this rule.'
+      : 'Verified tests require reconciled breadth coverage. You can select Observed universe for descriptive research.') : ''}
     ${missingEntry ? notice('Some entry prices are unavailable', 'Forward returns require entry prices available under the selected data basis.') : ''}
     <div class="table-scroll" tabindex="0" role="region" aria-label="Forward return statistics"><table><thead><tr><th>Horizon</th><th>Series</th>
     <th>Returns / observations</th>${events ? '<th>Overlaps omitted</th>' : ''}<th>Mean return</th><th>Median return</th><th>Win rate</th><th>Max adverse excursion</th><th>Max drawdown</th></tr></thead><tbody>
@@ -374,7 +420,8 @@ async function renderHistory(env) {
   const last = snapshot.date || config.status.latestDate;
   const first = config.status.earliestDate || shiftDate(last, -95);
   const metricLabels = new Map([...historyMetrics, ...(config.breadthMetrics || []).map(({key,label})=>[key,label])]);
-  const metricOptions = (which, selected) => `${which ? option('','No comparison',selected) : ''}${[...metricLabels].map(([key,label])=>option(key,label,selected)).join('')}`;
+  const metricOptions = (which, selected, chart = true) => `${which ? option('','No comparison',selected) : ''}${[...metricLabels]
+    .filter(([key]) => chart || !leadershipMetricKeys.has(key)).map(([key,label])=>option(key,label,selected)).join('')}`;
   const rangeStart = (days) => [first, shiftDate(last, -days)].sort().at(-1) || first;
   const anchor = (page) => `<a class="button" href="${safe(env.routeUrl(page, { date:last, dataVersion:env.snapshotContext.dataVersion }))}">${icon(page)} ${safe({ overview:'Market overview', screener:'Stock screener', rankings:'RS rankings', industries:'Industry rotation' }[page])}</a>`;
 
@@ -400,15 +447,18 @@ async function renderHistory(env) {
     const shown = typeof state.eventForm === 'object' ? state.eventForm : {};
     return `<section class="panel panel-body">${panelHead('Breadth event study','Measure forward benchmark and constituent returns after a selected breadth condition.')}
       <form class="stack" id="event-form"><div class="form-grid">
-      ${field('Breadth reading',`<select name="metric">${metricOptions(false,shown.metric || 'above_50d')}</select>`)}
+      ${field('Breadth reading',`<select name="metric">${metricOptions(false,shown.metric || 'above_50d', false)}</select>`)}
       ${field('Event condition',`<select name="op">${eventOps.map(([id,label])=>option(id,label,shown.op || 'crossesAbove')).join('')}</select>`)}
       ${field('Threshold (%)',`<input name="threshold" type="number" step=".1" value="${safe(shown.threshold ?? 35)}" required>`)}
       ${field('Forward trading sessions',shown.horizons ? `<input name="horizons" value="${safe(shown.horizons)}" required>` : horizonsInput)}
       ${field('Start date',`<input name="start" type="date" min="${safe(first)}" max="${safe(last)}" value="${safe(shown.start || rangeStart(180))}" required>`)}
       ${field('Last event date',`<input name="end" type="date" min="${safe(first)}" max="${safe(last)}" value="${safe(shown.end || last)}" required>`)}
+      ${field('Coverage basis',`<select name="coverageMode">${option('verified','Verified market coverage',shown.coverageMode||'verified')}
+        ${option('observed','Observed universe (descriptive)',shown.coverageMode)}</select>`)}
       ${field('Overlap',`<select name="overlap">${option('perHorizon','Separate per horizon',shown.overlap || 'perHorizon')}${option('longest','Separate by longest horizon',shown.overlap)}${option('none','Allow overlapping windows',shown.overlap)}</select>`)}
       ${field('Benchmark tickers',`<input name="benchmarks" value="${safe(shown.benchmarks || context.benchmark)}" required>`)}</div>
-      <label class="checkbox-label"><input name="medianStocks" type="checkbox"${shown.medianStocks === false ? '' : ' checked'}> Include median stock returns</label>
+      ${observedCoverageFields(shown)}
+      <label class="checkbox-label"><input name="medianStocks" type="checkbox"${shown.medianStocks ? ' checked' : ''}> Include median stock returns</label>
       <details class="formula-help"><summary>Require a prior breadth condition</summary><div class="form-grid section-space">
         ${field('Prior reading below (%)','<input name="prior" type="number" step=".1" placeholder="Optional">')}
         ${field('Within trading sessions','<input name="lookback" type="number" min="1" value="20">')}</div></details>
@@ -428,15 +478,76 @@ async function renderHistory(env) {
         <span class="muted"> · ${dateLabel(cohort.definition?.date)}</span></div>${action('Run','run-cohort','history',{value:cohort.id})}</div>`).join('')}</section>` : ''}
       <div id="research-results" class="section-space" aria-live="polite">${state.cohortResult ? outcomePanel(state.cohortResult,'cohort') : ''}</div>`;
   }
+  function comparisonsForm() {
+    return `<div class="stack"><section class="panel panel-body">${panelHead('Historical market analogs',
+      'Compare the selected session’s breadth profile with similar earlier observations.')}
+      <form id="analog-form" class="inline-form">
+        ${field('Coverage basis',`<select name="coverageMode">${option('verified','Verified market coverage',state.analogCoverage?.coverageMode || 'verified')}
+          ${option('observed','Observed universe (descriptive)',state.analogCoverage?.coverageMode)}</select>`)}
+        ${observedCoverageFields(state.analogCoverage)}
+        ${field('Forward sessions',`<input name="horizon" type="number" min="1" max="126" required value="${state.analogHorizon || 20}">`)}
+        <button type="submit" class="button primary">Find analogs</button></form>
+        <div id="analog-results" class="section-space" aria-live="polite"></div></section>
+      <section class="panel panel-body">${panelHead('Weekly leadership transitions','Compare RS bands between consecutive completed market weeks.')}
+        <form id="transition-form" class="inline-form">
+          ${field('Completed weeks',`<input name="weeks" type="number" min="2" max="25" required value="${state.transitionWeeks || 8}">`)}
+          <button type="submit" class="button primary">Build transition matrix</button></form>
+        <div id="transition-results" class="section-space" aria-live="polite"></div></section></div>`;
+  }
+
+  async function studyComparisons(form, values) {
+    const analog = form.id === 'analog-form';
+    const target = main.querySelector(analog ? '#analog-results' : '#transition-results');
+    target.innerHTML = pending();
+    try {
+      if (analog) {
+        state.analogHorizon = Number(values.horizon);
+        state.analogCoverage = observedCoverageParams(values);
+        const result = await env.publishedSeries('market/analogs', { signal,
+          params: { horizon: state.analogHorizon, ...state.analogCoverage } }, (partial, job) => {
+          if (target.isConnected) target.innerHTML = publishingHistory(job);
+        });
+        if (!target.isConnected) return;
+        target.innerHTML = (result.descriptive ? notice('Observed universe · descriptive',
+          `${observedCoverageSummary(result)} ${result.coverageWarning || ''}`) : '') +
+          `<div class="inline-stack section-space">${chip(`${count(result.sampleCount)} eligible comparison sessions`)}
+          ${chip(`${count(result.outcomeCount)} realized outcomes`)}${chip(`Median return ${percent(result.benchmarkSummary?.median,2,true)}`)}</div>` +
+          (result.matches.length ? `<div class="table-scroll" tabindex="0" role="region" aria-label="Historical analogs"><table><thead>
+            <tr><th>Session</th><th>Normalized distance</th><th>Forward session</th><th>Benchmark return</th><th>Outcome</th></tr></thead><tbody>
+            ${result.matches.map((match)=>`<tr><td><button class="date-button" data-action="replay-analog" data-value="${safe(match.date)}">${dateLabel(match.date)}</button></td>
+            <td>${number(match.distance,3)}</td><td>${dateLabel(match.targetDate)}</td><td>${percent(match.forwardReturn,2,true)}</td>
+            <td>${safe({complete:'Realized',rightCensored:'Not yet observed',missingBenchmark:'Benchmark unavailable'}[match.status] || 'Unavailable')}</td></tr>`).join('')}</tbody></table></div>`
+            : empty('No comparable analogs', 'The selected coverage basis and lookback do not contain enough comparable profiles.', 'history'));
+      } else {
+        state.transitionWeeks = Number(values.weeks);
+        const queued = await env.api('research/leadership-transitions', { body: { context: env.snapshotContext, weeks: state.transitionWeeks } });
+        const result = await waitForJob(env, queued, target);
+        if (!result || !target.isConnected) return;
+        target.innerHTML = result.pairs ? `<div class="inline-stack">${chip(`${count(result.pairs)} weekly pairs`)}
+          ${chip(`${count(result.comparable)} comparable transitions`)}${chip(`${count(result.newlyRanked)} new ranks`)}${chip(`${count(result.lostRank)} lost ranks`)}
+          ${result.skippedGaps ? chip(`${count(result.skippedGaps)} gaps omitted`,'warning') : ''}</div>
+          <div class="table-scroll section-space" tabindex="0" role="region" aria-label="Weekly leadership transition matrix"><table><thead>
+          <tr><th>Previous → current percentile</th>${result.to.map((band)=>`<th scope="col">${safe(band)}</th>`).join('')}</tr></thead>
+          <tbody>${result.from.map((band,index)=>`<tr><th scope="row">${safe(band)}</th>${result.matrix[index].map((value)=>`<td class="numeric">${count(value)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`
+          : empty('No comparable weekly pairs', 'Select a date with consecutive completed weeks and ranked securities.', 'rankings');
+      }
+    } catch (error) {
+      if (target.isConnected && error.name !== 'AbortError') target.innerHTML = notice('Comparison unavailable',error.message,'',true);
+    }
+  }
+
   function draw() {
     main.innerHTML = heading('Historical Explorer','Replay sessions, compare market series, and study forward returns.') +
       partialCoverage(snapshot.coverage,env.routeUrl) +
-      segment('history-tab',[['series','Time series'],['event','Event studies'],['cohort','Cohorts'],['journal','Journal signals']],state.tab,'tabs') +
-      (state.tab === 'series' ? historyForm() : state.tab === 'event' ? eventForm() : state.tab === 'cohort' ? cohortForm() : '<div id="journal-research"></div>');
+      segment('history-tab',[['series','Time series'],['event','Event studies'],['cohort','Cohorts'],['comparisons','Analogs & transitions'],['journal','Journal signals']],state.tab,'tabs') +
+      (state.tab === 'series' ? historyForm() : state.tab === 'event' ? eventForm() : state.tab === 'cohort' ? cohortForm()
+        : state.tab === 'comparisons' ? comparisonsForm() : '<div id="journal-research"></div>');
     if (state.tab === 'series') loadSeries();
+    bindObservedCoverage(main.querySelector('#event-form'));
+    bindObservedCoverage(main.querySelector('#analog-form'));
     if (state.tab === 'journal') mountJournalHistory(env,main.querySelector('#journal-research'),{firstDate:first,lastDate:last});
   }
-  const isPercent = (key) => !['benchmarkClose','equalWeightIndex','advanceDeclineLine'].includes(key);
+  const isPercent = (key) => !['benchmarkClose','equalWeightIndex','capWeightIndex','advanceDeclineLine'].includes(key);
   function transformValues(values) {
     if (state.smoothing > 0) values = values.map((_,index)=>{
       const window = values.slice(index - state.smoothing + 1,index + 1);
@@ -498,8 +609,13 @@ async function renderHistory(env) {
         ${state.archive && missing.length ? ` · ${count(missing.length)} unmaterialized daily sessions` : ''}</p>` : '';
       const axis = (key) => state.transform !== 'values' ? (value)=>number(value,0) : key === 'benchmarkClose' ? (value)=>compact(value,true)
         : isPercent(key) ? (value)=>percent(value,0) : compact;
+      const leadership = keys.some((key) => leadershipMetricKeys.has(key));
+      const describePoint = leadership ? (row) => [row.previousLeaderDate && numeric(row.leadershipRankObservations) && numeric(row.leaderReturnExpected)
+        ? `${count(row.leadershipRankObservations)} of ${count(row.leaderReturnExpected)} prior-session leaders have comparable ranks · ${dateLabel(row.previousLeaderDate)}`
+        : 'Prior-session leadership comparison unavailable'] : undefined;
       target.innerHTML = chart(data,series,{height:260,fill:true,axisFormat:axis(keys[0]),rightAxisFormat:axis(keys[1]),
-        onPick:({date})=>env.go('history',{date,dataVersion:env.snapshotContext.dataVersion})})+realized;
+        describePoint, onPick:({date})=>env.go('history',{date,dataVersion:env.snapshotContext.dataVersion})})+realized+
+        (leadership ? '<p class="muted section-space">Persistence is the share of comparable prior-session top-decile leaders that remain in the top decile. Turnover is the share that drop below it. Weekly sampling shows the final session’s reading.</p>' : '');
     } catch(error) {
       if (target.isConnected && error.name !== 'AbortError') target.innerHTML=notice('Historical series unavailable',error.message,'',true);
     }
@@ -534,6 +650,7 @@ async function renderHistory(env) {
         const condition={metric:values.metric,op:values.op,value:Number(values.threshold)};
         if (values.prior !== '') condition.after={op:'lt',value:Number(values.prior),within:Number(values.lookback)};
         process('event',env.api('research/event-studies',{body:{condition,context:env.snapshotContext,start:values.start,end:values.end,asOf:last,
+          ...observedCoverageParams(values),
           horizons:horizons(values.horizons),benchmarks:values.benchmarks.split(',').map((s)=>s.trim().toUpperCase()).filter(Boolean),overlap:values.overlap,medianStocks:!!values.medianStocks}}));
       } catch(error) { env.toast(error.message); }
     }
@@ -545,6 +662,7 @@ async function renderHistory(env) {
           screen,date:values.date,asOf:values.asOf,horizons:horizons(values.horizons)}}));
       } catch(error) { env.toast(error.message); }
     }
+    if (['analog-form','transition-form'].includes(event.target.id)) studyComparisons(event.target,values);
   };
   env.setActions({
     'history-tab'(value) { state.tab=value; draw(); },
@@ -557,6 +675,7 @@ async function renderHistory(env) {
       draw();
     },
     'run-cohort':(id)=>process('cohort',env.api(`cohorts/${pathPart(id)}/execute`,{body:{}})),
+    'replay-analog':(date)=>env.go('history',{date,dataVersion:env.snapshotContext.dataVersion}),
     'export-research-returns'(kind) {
       const result = state[`${kind}Result`];
       if (!result) return;

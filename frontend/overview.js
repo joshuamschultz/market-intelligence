@@ -1,5 +1,6 @@
 import {
-  action, attr, chip, compact, count, dateLabel, direction, empty, heading, icon, iconButton, notice, number, numeric, option,
+  action, attr, bindObservedCoverage, chip, compact, count, dateLabel, direction, empty, heading, icon, iconButton, notice, number, numeric, option,
+  observedCoverageFields, observedCoverageParams, observedCoverageSummary,
   panelHead, pending, publishingHistory, percent, rate, ratio, safe, segment, summary, table,
 } from './ui.js';
 import { chart } from './charts.js';
@@ -7,6 +8,8 @@ import { openBreadthDrawer } from './contributors.js';
 
 const dailyKeys = ['up_4pct', 'down_4pct', 'up_2pct', 'down_2pct', 'up_1pct', 'down_1pct'];
 const averageKeys = ['above_10d', 'above_20d', 'above_50d', 'above_100d', 'above_150d', 'above_200d', 'ma_50_above_200', 'ma_rising_50', 'ma_rising_200', 'ma_aligned'];
+const fieldCoverageSelect = (value) => `<label class="field"><span>Coverage basis</span><select name="coverageMode">
+  ${option('verified','Verified market coverage',value)}${option('observed','Observed universe (descriptive)',value)}</select></label>`;
 const rangeChoices = [[20, '1M'], [63, '3M'], [120, '6M'], [252, '1Y']];
 const dailyChartKeys = ['above_50d', 'above_200d', 'above_20d'];
 
@@ -76,7 +79,9 @@ function healthPanel(data) {
 export async function render(env) {
   const { main, config, signal, api, routeUrl, state, context } = env;
   const definitions = new Map((config.breadthMetrics || []).map((metric) => [metric.key, metric]));
-  const overview = await api('market/overview', { signal });
+  const overview = await env.publishedSeries('market/overview', { signal }, (partial, job) => {
+    if (env.isActive()) main.innerHTML = publishingHistory(job);
+  });
   if (!env.isActive()) return;
   state.tab ||= 'overview';
   state.range ||= 63;
@@ -121,13 +126,20 @@ export async function render(env) {
         </section>
       </div>
       <section class="panel panel-body">${panelHead('Moving-average participation', 'Open a reading to reconcile its contributing securities.')}<div class="metric-grid">${averageKeys.map((key) => metricTile(key, breadth, definitions)).join('')}</div></section>`
-      : active === 'monitor' ? monitorLayout() : `<div class="split-grid">${healthPanel(overview)}
+      : active === 'monitor' ? monitorLayout() : `<form id="health-coverage-form" class="inline-form section-space">
+        ${fieldCoverageSelect(state.healthCoverage?.coverageMode || 'verified')}
+        ${observedCoverageFields(state.healthCoverage)}
+        <button class="button primary" type="submit">Apply coverage</button></form>
+        <div class="split-grid"><div id="current-health">${healthPanel(overview)}</div>
         <section class="panel panel-body">${panelHead('Breadth divergences', 'Dated benchmark and market participation comparisons')}<div id="divergences">${pending()}</div></section></div>
         <section class="panel panel-body">${panelHead('Market health history', 'Published composite scores using the selected market context.',
           iconButton('Export market health history CSV', 'export-chart', 'download', 'market-health.csv'))}<div id="health-chart">${pending()}</div></section>`);
     if (active === 'overview') loadChart();
     if (active === 'monitor') loadMonitor();
-    if (active === 'health') loadHealth();
+    if (active === 'health') {
+      bindObservedCoverage(main.querySelector('#health-coverage-form'));
+      loadHealth();
+    }
   }
 
   async function loadChart() {
@@ -214,21 +226,26 @@ export async function render(env) {
   async function loadHealth() {
     const target = main.querySelector('#divergences');
     const plot = main.querySelector('#health-chart');
-    if (overview.coverage.state !== 'complete') {
+    const settings = state.healthCoverage || { coverageMode: 'verified' };
+    const { coverageMode } = settings;
+    if (overview.coverage.state !== 'complete' && coverageMode === 'verified') {
       target.innerHTML = empty('Divergence events withheld', 'Complete market coverage is required for market-wide event publication.', 'pulse');
       plot.innerHTML = empty('Market health history withheld', 'Complete market coverage is required for the selected context.', 'chart');
       return;
     }
     try {
-      const result = await env.publishedSeries('market/health', { signal, params: { series: 1, limit: 63 } }, (partial, job) => {
+      const result = await env.publishedSeries('market/health', { signal, params: { series: 1, limit: 63, ...settings } }, (partial, job) => {
         if (target?.isConnected) target.innerHTML = publishingHistory(job);
         if (plot?.isConnected) plot.innerHTML = publishingHistory(job);
       });
       if (!target.isConnected) return;
-      const events = (result.history || []).flatMap((row) => row.divergences || []).toReversed();
+      main.querySelector('#current-health').innerHTML = (coverageMode === 'observed'
+        ? notice('Observed universe · descriptive', `${observedCoverageSummary(result)} ${result.coverageWarning || ''}`)
+        : '') + healthPanel({ ...overview, health: result });
+      const events = (result.events || []).toReversed();
       plot.innerHTML = chart(result.history || [], [{ key: 'score', label: 'Market health score', format: number }], { domain: [0, 100], fill: true });
       target.innerHTML = events.length ? events.map((event) =>
-        `<div class="simple-row"><strong>${safe(event.label || event.id)}</strong><span>${safe(event.date)}</span></div>`).join('')
+        `<div class="simple-row"><strong>${safe(event.label || event.id)}</strong><span>${dateLabel(event.date)}</span></div>`).join('')
         : empty('No divergences in this range', 'Recent comparable sessions contain no matching events.', 'pulse');
     } catch (error) {
       if (target.isConnected && error.name !== 'AbortError') {
@@ -254,6 +271,12 @@ export async function render(env) {
     },
   });
   main.onsubmit = (event) => {
+    if (event.target.id === 'health-coverage-form') {
+      event.preventDefault();
+      state.healthCoverage = observedCoverageParams(Object.fromEntries(new FormData(event.target)));
+      showOverview();
+      return;
+    }
     if (event.target.id !== 'monitor-form') return;
     event.preventDefault();
     const values = new FormData(event.target);

@@ -1,4 +1,4 @@
-import { AVERAGES, finite, mean, quantile, ratio } from './metrics.mjs';
+import { AVERAGES, deviation, finite, mean, quantile, ratio } from './metrics.mjs';
 import { rankBy } from './ranking.mjs';
 
 export function binaryMetric(rows, evaluate) {
@@ -53,6 +53,10 @@ add('ma_rising_200', 'Rising 200D SMA', 'Moving averages', '200-session SMA high
 add('ma_aligned', 'Bullish 20/50/200D alignment', 'Moving averages', '20-day SMA > 50-day SMA > 200-day SMA.', truth('ma_aligned'));
 add('high_volume_up', 'High-volume advancers', 'Volume', 'Advanced with volume ≥ 1.5× prior 20-session average.', (row) => row.return_1d == null || row.rvol_20d == null ? null : row.return_1d > 0 && row.rvol_20d >= 1.5);
 add('high_volume_down', 'High-volume decliners', 'Volume', 'Declined with volume ≥ 1.5× prior 20-session average.', (row) => row.return_1d == null || row.rvol_20d == null ? null : row.return_1d < 0 && row.rvol_20d >= 1.5);
+add('high_volume_up_2x', 'High-volume advancers (2×)', 'Volume', 'Advanced with volume ≥ 2× prior 20-session average.', (row) =>
+  finite(row.return_1d) && finite(row.rvol_20d) ? row.return_1d > 0 && row.rvol_20d >= 2 : null);
+add('high_volume_down_2x', 'High-volume decliners (2×)', 'Volume', 'Declined with volume ≥ 2× prior 20-session average.', (row) =>
+  finite(row.return_1d) && finite(row.rvol_20d) ? row.return_1d < 0 && row.rvol_20d >= 2 : null);
 add('relative_volume_15', 'Relative volume ≥ 1.5×', 'Volume', 'Today’s volume ≥ 1.5× prior 20-session average.', compare('rvol_20d', (v) => v >= 1.5));
 add('relative_volume_20', 'Relative volume ≥ 2×', 'Volume', 'Today’s volume ≥ 2× prior 20-session average.', compare('rvol_20d', (v) => v >= 2));
 add('positive_obv', 'Positive OBV trend', 'Volume', 'Signed share-volume trend over 20 sessions is positive.', compare('obv_slope', (v) => v > 0));
@@ -119,9 +123,15 @@ export function aggregateRows(rows) {
   result.capWeightReturn = cap > 0 ? capWeighted.reduce((sum, row) => sum + row.prior_market_cap * row.return_1d, 0) / cap : null;
   result.medianReturn = quantile(returns, 0.5);
   result.distribution = Object.fromEntries([10, 25, 50, 75, 90].map((p) => [`p${p}`, quantile(returns, p / 100)]));
-  const largest = capWeighted.toSorted((a, b) => b.market_cap - a.market_cap).slice(0, Math.max(1, Math.ceil(capWeighted.length * 0.1)));
+  result.returnDispersion = deviation(returns);
+  result.returnSkewness = result.returnDispersion > 0
+    ? mean(returns.map((value) => ((value - result.equalWeightReturn) / result.returnDispersion) ** 3)) : null;
+  const largest = capWeighted.toSorted((a, b) => b.prior_market_cap - a.prior_market_cap).slice(0, Math.ceil(capWeighted.length * 0.1));
+  result.largestCapCohortCount = largest.length;
   result.largestPositiveDollarShare = largest.length ? ratio(largest.filter((row) => row.return_1d > 0 && finite(row.dollar_volume))
     .reduce((sum, row) => sum + row.dollar_volume, 0), result.upDollar) : null;
+  if (!result.volumeObservations) result.upVolume = result.downVolume = null;
+  if (!result.dollarVolumeObservations) result.upDollar = result.downDollar = null;
   return result;
 }
 
@@ -134,7 +144,8 @@ export function calculateBreadth(traded, extraKeys = []) {
   const denominator = advancers.denominator;
   const numerator = advancers.numerator - decliners.numerator;
   data.adSpread = { numerator, denominator, value: denominator ? 100 * numerator / denominator : null };
-  data.adRatio = { numerator: advancers.numerator, denominator: decliners.numerator, value: ratio(advancers.numerator, decliners.numerator), state: !decliners.numerator && advancers.numerator ? 'infinity' : 'available' };
+  data.adRatio = { numerator: advancers.numerator, denominator: decliners.numerator, value: ratio(advancers.numerator, decliners.numerator),
+    state: decliners.numerator ? 'available' : advancers.numerator ? 'infinity' : 'unavailable' };
   return data;
 }
 
@@ -173,6 +184,10 @@ export function calculateGroups(traded, themes, date, benchmarkReturn) {
     const topDecile = binaryMetric(members, (row) => finite(row.rsPercentile) ? row.rsPercentile >= 90 : null);
     const above50 = binaryMetric(members, truth('above_50d'));
     const above200 = binaryMetric(members, truth('above_200d'));
+    const emergingLeaders = binaryMetric(members, (row) => {
+      if (![row.rsPercentile, row.return_21d, row.return_63d, row.return_252d].every(finite) || row.above_50d == null) return null;
+      return row.rsPercentile >= 75 && row.rsPercentile < 90 && row.above_50d && row.return_21d > 0 && 4 * row.return_63d > row.return_252d;
+    });
     const winners = members.filter((row) => finite(row.rsPercentile)).toSorted((a, b) => b.rsPercentile - a.rsPercentile).slice(0, 3);
     return {
       ...group, count: members.length, memberIds: members.map((row) => row.securityId),
@@ -184,6 +199,9 @@ export function calculateGroups(traded, themes, date, benchmarkReturn) {
       newHighBreadth: binaryMetric(members, truth('new_high_252d')).value,
       upDownDollar: volumes.upDownDollar, upDollar: volumes.upDollar, downDollar: volumes.downDollar,
       leadingConcentration: ratio(winners.reduce((sum, row) => sum + row.rsPercentile, 0), ranked.reduce((sum, value) => sum + value, 0)),
+      largestPositiveDollarShare: volumes.largestPositiveDollarShare,
+      emergingLeaderCount: emergingLeaders.denominator ? emergingLeaders.numerator : null,
+      emergingLeaderObservations: emergingLeaders.denominator,
       marketCap: members.some((row) => row.market_cap > 0) ? members.reduce((sum, row) => sum + (row.market_cap || 0), 0) : null,
       counts: { topDecile, above50, above200 },
     };
@@ -197,6 +215,7 @@ export function calculateGroups(traded, themes, date, benchmarkReturn) {
     row.industryRelativeRS = finite(row.rsPercentile) && finite(industry?.medianRS) ? row.rsPercentile - industry.medianRS : null;
     row.sectorRelativeRS = finite(row.rsPercentile) && finite(sector?.medianRS) ? row.rsPercentile - sector.medianRS : null;
     row.industryRelativeReturn = finite(row.return_21d) && finite(industry?.equalWeight) ? row.return_21d - industry.equalWeight : null;
+    row.sectorRelativeReturn = finite(row.return_21d) && finite(sector?.equalWeight) ? row.return_21d - sector.equalWeight : null;
   }
   for (const level of ['sector', 'industry', 'subindustry', 'theme']) {
     const selected = groups.filter((group) => group.level === level);
@@ -204,8 +223,9 @@ export function calculateGroups(traded, themes, date, benchmarkReturn) {
     for (const group of selected) {
       group.rank = ranking.get(group.id)?.rank ?? null;
       group.percentile = ranking.get(group.id)?.percentile ?? null;
-      const sector = groupMap.get(group.parent);
-      group.parentRelativeRS = finite(group.medianRS) && finite(sector?.medianRS) ? group.medianRS - sector.medianRS : null;
+      const parent = groupMap.get(group.parent);
+      group.parentRelativeRS = finite(group.medianRS) && finite(parent?.medianRS) ? group.medianRS - parent.medianRS : null;
+      group.parentRelativeReturn = finite(group.equalWeight) && finite(parent?.equalWeight) ? group.equalWeight - parent.equalWeight : null;
     }
   }
   return groups.sort((a, b) => (a.rank ?? 1e9) - (b.rank ?? 1e9) || a.name.localeCompare(b.name));

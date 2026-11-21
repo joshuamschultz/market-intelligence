@@ -185,7 +185,7 @@ export function startServer() {
   const token = process.env.MARKET_ACCESS_TOKEN || '';
   if (!loopbackNames.has(host) && token.length < 20) throw new Error('Set a workspace access token of at least 20 characters before using a non-loopback address');
   const db = openDatabase();
-  db.prepare("UPDATE jobs SET status='failed', error='Workspace stopped before job completion' WHERE status IN ('queued','running')").run();
+  db.prepare("UPDATE jobs SET status='failed', error='Workspace stopped before job completion' WHERE status='running'").run();
   const service = createService({ db });
   const server = createServer(createHandler({ service, token, host }));
   const timer = schedule(service, db, process.env.MARKET_SYNC_AFTER || '20:30',

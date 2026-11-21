@@ -31,12 +31,17 @@ export function reconcileCurrentCapture(db, {
     recipe.push(includeOtherListings, useCurrentRoster, benchmarks, hash(JSON.stringify(corporateActions)));
   }
   const capturedKey = `Verified current EODHD capture ${hash(JSON.stringify(recipe))}`;
-  const duplicates = db.prepare(`SELECT r.id,r.version,s.expected,s.eligible_received FROM ingestion_runs r
+  const duplicates = db.prepare(`SELECT r.id,r.version,r.detail,s.expected,s.received,s.eligible_received FROM ingestion_runs r
     JOIN session_imports s ON s.run_id=r.id WHERE r.provider='eodhd' AND r.dataset='bulk-eod' AND r.status='complete'
     AND s.date=? AND EXISTS (SELECT 1 FROM json_each(r.detail, '$.warnings') WHERE value=?)
     AND (s.expected IS NULL OR (SELECT count(*) FROM session_capture_expected m WHERE m.run_id=r.id AND m.date=s.date)=s.expected)
     LIMIT 1`).get(date, capturedKey);
-  if (!dryRun && duplicates) return { ...duplicates, date, duplicate: true };
+  if (!dryRun && duplicates) {
+    const receipt = JSON.parse(duplicates.detail).warnings.find((warning) => warning.startsWith('Verified benchmark receipts '));
+    const recorded = receipt ? JSON.parse(receipt.slice('Verified benchmark receipts '.length)) : {};
+    return { id: duplicates.id, version: duplicates.version, expected: duplicates.expected,
+      received: duplicates.received, eligibleReceived: duplicates.eligible_received, date, duplicate: true, ...recorded };
+  }
 
   const source = new Map();
   const coreSymbols = new Set();
@@ -146,7 +151,7 @@ export function reconcileCurrentCapture(db, {
         name: issuer.name, exchange: issuer.exchange, type: issuer.type, isin: issuer.isin, status: 'active',
       }), knownAt, identifiers: [{ symbol, providerSymbol: issuer.symbolProvider, exchange: issuer.exchange, validFrom: date }] };
     }
-    resolved.set(symbol, { id, declaration, quote, exchange: issuer.exchange });
+    resolved.set(symbol, { id, declaration, quote, exchange: issuer.exchange, type: issuer.type });
   }
   // A current capture has at most one confirmed symbol per permanent issue.
   const byId = new Map();
@@ -183,7 +188,15 @@ export function reconcileCurrentCapture(db, {
   }
   const expected = useCurrentRoster ? coreSymbols.size : null;
   const corePositiveVolume = [...coreSymbols].filter((symbol) => resolved.get(symbol)?.quote?.volume > 0).length;
-  const benchmarksReceived = [...benchmarkSymbols].filter((symbol) => resolved.get(symbol)?.quote?.volume > 0);
+  const benchmarksReceived = [...benchmarkSymbols].filter((symbol) => {
+    const record = resolved.get(symbol);
+    if (!record?.quote) return false;
+    const { open, high, low, close, volume } = record.quote;
+    return [open, high, low, close, volume].every((value) => value != null && value !== '' && Number.isFinite(Number(value)))
+      && Number(low) > 0 && Number(open) >= Number(low) && Number(open) <= Number(high)
+      && Number(close) >= Number(low) && Number(close) <= Number(high)
+      && (record.type === 'index' ? Number(volume) >= 0 : Number(volume) > 0);
+  });
   const result = { date, knownAt, expected, captureMatchingBars: [...bars.values()].flat().length,
     reconcilableBars: observed.length, positiveVolume: observed.filter((row) => row.volume > 0).length,
     corePositiveVolume, benchmarksReceived, currentOnlyIdentifiers: declarations.length, corporateActions: verifiedActions.length,
@@ -194,7 +207,8 @@ export function reconcileCurrentCapture(db, {
     provider: 'eodhd', dataset: 'bulk-eod', scope: 'full', catalogDate: knownAt, expected, sessions: [date],
     securities: declarations, prices: observed, corporateActions: verifiedActions,
     expectedRoster: useCurrentRoster ? [...coreSymbols].map((symbol) => ({ symbol, securityId: resolved.get(symbol)?.id ?? null })) : [],
-    warnings: [...warnings, capturedKey, `Source catalog SHA256 ${catalogHash}`, `Bulk price SHA256 ${pricesHash}`,
+    warnings: [capturedKey, `Source catalog SHA256 ${catalogHash}`, `Bulk price SHA256 ${pricesHash}`,
+      `Verified benchmark receipts ${JSON.stringify({ benchmarksReceived, corporateActions: verifiedActions.length, reasons })}`, ...warnings,
       'Unknown ticker and listing histories remain unknown.',
       'The source Common Stock category can still contain ADRs, REITs and other instrument subtypes.',
       ...Object.entries(reasons).filter(([, n]) => n).map(([reason, n]) => `${reason}: ${n}`)],

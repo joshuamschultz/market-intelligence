@@ -1,5 +1,5 @@
 import {
-  action, attr, blobDownload, count, dateLabel, empty, field, heading, icon, iconButton, names, notice, option, pathPart, pending, safe, stockLink,
+  action, attr, blobDownload, count, dateLabel, empty, field, heading, icon, iconButton, names, notice, option, pathPart, pending, safe, savedScreenRoute, stockLink,
 } from './ui.js';
 import { exportChart } from './charts.js';
 
@@ -31,6 +31,7 @@ let lastInteraction = Date.now();
 const batchRefreshMs = 30 * 60 * 1000;
 const startupRetryDelays = [400, 1200];
 const refreshableViews = new Set(['overview', 'monitor']);
+const listViews = new Set(['rankings', 'screener', 'watchlists']);
 for (const type of ['pointerdown', 'keydown', 'input', 'scroll']) {
   document.addEventListener(type, () => { lastInteraction = Date.now(); }, { capture: true, passive: true });
 }
@@ -159,7 +160,8 @@ function requestFor(context) {
 function snapshotContext() {
   const context = currentContext();
   const dataVersion = context.dataVersion ?? analysisStatus?.dataVersion;
-  return { ...context, ...(dataVersion == null ? {} : { dataVersion }) };
+  const liveListDate = currentListRoute() ? analysisStatus?.latestDate : null;
+  return { ...context, ...(dataVersion == null ? {} : { dataVersion }), ...(liveListDate ? { date: liveListDate } : {}) };
 }
 
 function toast(message) {
@@ -179,6 +181,26 @@ function applyAnalysisStatus(status) {
   } catch {
     // Analysis state remains available for the current page.
   }
+}
+function listAnalysisStatus(status) {
+  const ready = status?.latestAnalysis;
+  return ready && { ...status, latestDate: ready.date, dataVersion: ready.dataVersion, appliedAt: undefined };
+}
+function newerAnalysis(next, current) {
+  return next && (!current || next.latestDate > current.latestDate
+    || next.latestDate === current.latestDate && Number(next.dataVersion) > Number(current.dataVersion));
+}
+function currentListRoute() {
+  return listViews.has(route.page) && !route.state.date && !route.state.dataVersion;
+}
+function canRefreshList() {
+  if (!currentListRoute()) return false;
+  if (route.page === 'watchlists') return store.watchlists?.live === true;
+  if (route.page === 'screener') {
+    const screen = config?.screens.find(({ id }) => id === route.state.screen);
+    if (screen && savedScreenRoute(screen.definition).date) return false;
+  }
+  return !store[route.page]?.selected?.size;
 }
 function initialAnalysisStatus(status) {
   try {
@@ -219,9 +241,11 @@ function statusLine() {
 function updateContextIndicators() {
   const markup = [];
   if (nextBuildVersion) markup.push(action('Reload build', 'reload-build', 'refresh', { className: 'updated-button' }));
-  if (config?.status?.dataVersion != null && String(snapshotContext().dataVersion) !== String(config.status.dataVersion)) {
+  const ready = listViews.has(route.page) && listAnalysisStatus(config?.status);
+  const revision = ready?.dataVersion ?? config?.status?.dataVersion;
+  if (revision != null && (String(snapshotContext().dataVersion) !== String(revision) || currentListRoute() && newerAnalysis(ready, analysisStatus))) {
     markup.push(action('Update data', 'apply-data', 'pulse', { className: 'updated-button',
-      title: `View warehouse revision ${config.status.dataVersion}. Current view uses revision ${snapshotContext().dataVersion}.` }));
+      title: `View warehouse revision ${revision}. Current view uses revision ${snapshotContext().dataVersion}.` }));
   }
   const target = contextBar.querySelector('#context-updates');
   const content = markup.join('');
@@ -279,7 +303,7 @@ function contextControls() {
   const context = currentContext();
   contextBar.innerHTML = contextOptions(config.universes || [], 'universe', 'Universe') +
     `<label class="context-field"><span>As of</span><input type="date" aria-label="As-of date" data-change="context" data-value="date"${attr('value', context.date || analysisStatus?.latestDate || config.status?.latestDate)} max="${safe(config.status?.latestDate || '')}"></label>
-    ${context.date ? iconButton('Return to latest session', 'current', 'clock') : ''}` +
+    ${context.date || context.dataVersion ? iconButton('Return to latest session', 'current', 'clock') : ''}` +
     contextOptions(config.models || [], 'model', 'RS model') +
     contextOptions(['auto', ...(config.benchmarks || [])], 'benchmark', 'Benchmark', (item) =>
       item.id === 'auto' ? `Auto · ${context.benchmark}` : config.availableBenchmarks?.includes(item.id) ? item.name : `${item.name} (unavailable)`) +
@@ -364,6 +388,11 @@ async function render({ reload = false } = {}) {
       if (!loaded) throw new Error(configError || 'Could not connect to the market warehouse');
     }
     if (current !== generation) return;
+    const ready = currentListRoute() && listAnalysisStatus(config.status);
+    if (ready && (Number(analysisStatus?.dataVersion) !== Number(ready.dataVersion) || analysisStatus?.latestDate !== ready.latestDate)) {
+      applyAnalysisStatus(ready);
+      statusLine();
+    }
     if (!location.hash.includes('?')) {
       history.replaceState(null, '', routeUrl(route.page));
       route = routeFromUrl();
@@ -440,7 +469,11 @@ document.addEventListener('keydown', (event) => {
 });
 
 const globalActions = {
-  current() { return go(route.page, { date: null }); },
+  current() {
+    const screen = config?.screens.find(({ id }) => id === route.state.screen);
+    return go(route.page, { date: null, dataVersion: null,
+      ...(screen && savedScreenRoute(screen.definition).date ? { screen: null } : {}) });
+  },
   'retry-view'() { return render({ reload: true }); },
   async refresh() {
     if (!config || configError) return render({ reload: true });
@@ -449,7 +482,7 @@ const globalActions = {
   },
   async 'apply-data'() {
     if (!await reloadConfig()) return toast('New data could not be loaded. Try again.');
-    applyAnalysisStatus(config.status);
+    applyAnalysisStatus((listViews.has(route.page) && listAnalysisStatus(config.status)) || config.status);
     statusLine();
     return route.state.dataVersion ? go(route.page, { dataVersion: null }) : render();
   },
@@ -483,12 +516,11 @@ document.addEventListener('change', async (event) => {
   if (kind === 'context') {
     const key = control.dataset.value;
     const versions = key === 'universe' || key === 'model' ? { [`${key}Version`]: null } : {};
-    if (key === 'date' && control.value) versions.dataVersion = snapshotContext().dataVersion;
+    if (key === 'date') versions.dataVersion = control.value ? snapshotContext().dataVersion : null;
     go(route.page, { ...versions, [key]: control.value === 'auto' ? null : control.value });
   } else if (kind === 'saved-view' && control.value) {
     const saved = config.screens.find(({ id }) => id === control.value);
-    const savedContext = saved?.definition?.context || {};
-    go('screener', { ...savedContext, date: savedContext.date || null, screen: control.value });
+    go('screener', { ...savedScreenRoute(saved?.definition), screen: control.value });
   }
   else {
     try { await activeView?.[`change:${kind}`]?.(control.value, control, event); }
@@ -512,6 +544,8 @@ window.addEventListener('hashchange', () => {
 render();
 
 function hasFormDraft() {
+  const search = main.querySelector('#security-search');
+  if (search && search.value !== (store[route.page]?.search || '')) return true;
   const controls = main.querySelectorAll('form textarea:not([data-change]), form input:not([data-change]), form select:not([data-change])');
   return [...controls].some((control) => {
     if (control instanceof window.HTMLSelectElement) {
@@ -548,15 +582,29 @@ async function checkBuild(force = false) {
       config = { ...config, status: status.value };
       document.dispatchEvent(new window.CustomEvent('warehouse:status', { detail: status.value }));
     }
-    const canRefresh = refreshableViews.has(route.page) && !modal.open && !detail.open && !hasFormDraft();
+    const safeRefresh = !modal.open && !detail.open && !hasFormDraft();
+    const canRefresh = refreshableViews.has(route.page) && safeRefresh;
+    const canRefreshRankings = canRefreshList() && safeRefresh;
     const idleFor = document.visibilityState === 'hidden' ? Infinity : now - lastInteraction;
     if (nextBuildVersion && canRefresh && idleFor >= 120000) {
       location.reload();
       return;
     }
     const latest = config?.status;
+    const ready = canRefreshRankings && listAnalysisStatus(latest);
+    if (newerAnalysis(ready, analysisStatus) && (force || idleFor >= 120000)) {
+      const previousRoute = route;
+      const loaded = await reloadConfig();
+      const next = listAnalysisStatus(loaded?.status);
+      if (newerAnalysis(next, analysisStatus) && route === previousRoute && canRefreshList() && !modal.open && !detail.open && !hasFormDraft()) {
+        applyAnalysisStatus(next);
+        statusLine();
+        render();
+        return;
+      }
+    }
     const newData = latest && analysisStatus && Number(latest.dataVersion) > Number(analysisStatus.dataVersion);
-    const published = Number(latest?.latestPublication?.data_revision) > Number(analysisStatus?.dataVersion);
+    const published = Number(latest?.latestAnalysis?.dataVersion ?? latest?.latestPublication?.data_version) > Number(analysisStatus?.dataVersion);
     const batchDue = analysisStatus && now - analysisStatus.appliedAt >= batchRefreshMs;
     if (newData && canRefresh && !route.state.date && !route.state.dataVersion && idleFor >= 120000 && (published || batchDue)) {
       const previousRoute = route;

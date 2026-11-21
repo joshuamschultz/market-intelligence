@@ -1,7 +1,7 @@
 import {
   action, chip, compact, count, dateLabel, direction, empty, icon, iconButton, money, notice, number, numeric, panelHead, pathPart, pending, publishingHistory, rate, ratio, safe, segment, signed, summary, warming,
 } from './ui.js';
-import { chart } from './charts.js';
+import { chart, exportChart } from './charts.js';
 import { stockQualityPanel } from './data-quality.js';
 
 let drawerRequest = 0;
@@ -64,10 +64,15 @@ function currentSignals(data) {
     ['U/D volume (50D)', ratio(data.udv_50d, data.udv_state_50d), `${count(data.udv_obs_50d)} comparable observations`],
     ['Float turnover (20D)', rate(data.float_turnover_20d, 2, false)],
     ['From 52-week high', rate(data.distance_high_252d)],
-    ['From all-time high', rate(data.distance_all_time_high)],
+    ['From verified listing high', rate(data.distance_all_time_high)],
+    ['From verified loaded-history high', rate(data.distance_loaded_history_high), data.loadedHistoryHighFrom ? `Since ${dateLabel(data.loadedHistoryHighFrom)}` : ''],
     ['From 52-week low', rate(data.distance_low_252d)],
     ['1M vs benchmark', rate(data.relative_return_21d)],
     ['Price vs 20D SMA', rate(data.vs_sma_20d)], ['Price vs 50D SMA', rate(data.vs_sma_50d)], ['Price vs 200D SMA', rate(data.vs_sma_200d)],
+    ['Price vs 20D EMA', rate(data.vs_ema_20d)], ['20D EMA slope', rate(data.slope_ema_20d), '5-session change'],
+    ['14D ATR contraction', rate(data.atr_contraction)], ['Consolidation sessions', count(data.consolidation_duration)],
+    ['20D OBV change', compact(data.obv_slope_20d)], ['20D up days at 2× volume', count(data.high_volume_up_2x_20d)],
+    ['20D down days at 2× volume', count(data.high_volume_down_2x_20d)],
     ['20/50/200D alignment', data.ma_aligned == null ? '—' : data.ma_aligned ? 'Bullish' : 'Mixed'],
     ['Industry median RS', number(data.industryRS)], ['4W industry RS velocity', signed(data.industryVelocity)],
     ['20D annualized volatility', rate(data.risk?.annualizedVolatility, 2, false)], ['Maximum drawdown', rate(data.risk?.maximumDrawdown)],
@@ -126,7 +131,9 @@ export async function openStock(env, id) {
 
   async function loadScreenMembership(target) {
     try {
-      screenMembership ||= await env.api(`stocks/${pathPart(data.securityId)}/screens`);
+      screenMembership ||= await env.publishedSeries(`stocks/${pathPart(data.securityId)}/screens`, { signal }, (partial, job) => {
+        if (target.isConnected) target.innerHTML = publishingHistory(job);
+      });
       if (!target.isConnected) return;
       const matching = screenMembership.screens;
       target.innerHTML = matching.length ? `<div class="stack">${matching.map((screen) => {
@@ -144,13 +151,13 @@ export async function openStock(env, id) {
 
   function draw() {
     const bars = full.slice(-range);
-    const plot = cadence === 'weekly' ? toWeekly(bars) : bars;
+    const plot = cadence === 'weekly' && bars.length ? toWeekly(full).filter((bar) => bar.date >= bars[0].date) : bars;
     const sourceIssues = data.quality || [];
     const activeReasons = new Set(sourceIssues.map(({reason})=>reason));
     const otherWarnings = (data.warnings||[]).filter((reason)=>!activeReasons.has(reason));
     const currentPriceQuarantined = sourceIssues.some((row)=>row.kind==='price'&&row.effective_from<=data.date&&row.effective_to>=data.date);
     const tools = `${segment('stock-range-local', ranges, range)}${segment('stock-cadence-local', [['daily','Daily'],['weekly','Weekly']], cadence)}
-      ${segment('stock-style-local', [['line','Line'],['candles','Candles']], priceStyle)}${iconButton('Export prices CSV', 'stock-export-local', 'download')}`;
+      ${segment('stock-style-local', [['line','Line'],['candles','Candles']], priceStyle)}${iconButton('Export plotted prices CSV', 'stock-export-local', 'download')}`;
     body.innerHTML = `<div id="stock-warming">${warmup}</div><div class="stock-identity"><div class="inline-stack">${chip(data.exchange || 'Exchange unavailable')}${chip(data.type || 'Type unavailable')}
        ${chip(dateLabel(data.latestDate))}${data.rsStatus === 'NEW' ? chip('Newly ranked', 'accent') : ''}</div>
        ${action('Add to watchlist', 'stock-watch-local', 'watchlists')}</div>
@@ -166,6 +173,7 @@ export async function openStock(env, id) {
         ${chart(plot, [{ key: 'close', label: 'Close', format: money }, { key: 'sma_20', label: '20D SMA', format: money },
           { key: 'sma_50', label: '50D SMA', format: money }, { key: 'sma_200', label: '200D SMA', format: money }],
         { volume:true,fill:priceStyle==='line',candles:priceStyle==='candles',height:270,axisFormat:(value)=>`$${number(value,0)}`,
+          exportFields:['open','high','low','close','volume'],
           describePoint:(bar)=>[...(bar.priceQuarantined?['Source price quarantined · return unavailable']:[]),
             `Share volume: ${numeric(bar.volume)?compact(bar.volume):'Unavailable'}${bar.volumeQuarantined?' · reviewed source override':''}`] })}
         </section>
@@ -175,7 +183,9 @@ export async function openStock(env, id) {
           segment('stock-rs-local', [['daily','Daily'],['weekly','Weekly']], rsCadence) + iconButton('Export ranking chart CSV', 'export-chart', 'download', 'stock-rs-history.csv'))}
         <div id="stock-rs-chart">${pending('Loading stock ranks…')}</div></section>
         <div class="metric-grid section-space">${[1,4,12].map((n) => tile(`${n}W rank change`, signed(data[`rankChange${n}w`], 0),
-          `${signed(data[`velocity${n}w`])} percentile points`)).join('')}${tile('Top-decile weeks', count(data.leadingWeeks), `${count(data.leadingWeekCoverage)} comparable weeks`)}</div>`
+          `${signed(data[`velocity${n}w`])} percentile points`)).join('')}
+          ${[4,8,12].map((n)=>tile(`Top-decile weeks in ${n}W`, count(data[`topDecileWeeks${n}w`]))).join('')}
+          ${tile('4W U/D ratio change',signed(data.udvChange4w))}${tile('4W up-volume share change',rate(data.upVolumeShareChange4w))}</div>`
       : tab === 'screens' ? `<section class="panel panel-body">${panelHead('Saved screen membership', 'Screen matches evaluated on the selected historical session.')}
         <div id="stock-screens">${pending('Evaluating saved screens…')}</div></section>`
       : `<section class="panel panel-body">${panelHead('Price, liquidity, and technical metrics')}<div class="metric-grid">${currentSignals(data)}</div></section>
@@ -205,7 +215,7 @@ export async function openStock(env, id) {
       case 'stock-tab-local': tab = value; draw(); break;
       case 'stock-rs-local': rsCadence = value; draw(); break;
       case 'stock-export-local':
-        await env.exportFile(`stocks/${pathPart(data.securityId)}`, { params: { lookback: range, export: 'csv' } }, `${data.symbol}-daily-prices.csv`).catch((error) => env.toast(error.message));
+        exportChart(body.querySelector('[data-chart]'), `${data.symbol}-${cadence}-plotted-prices.csv`);
         break;
       case 'stock-watch-local': await env.openAddWatchlist([data.securityId]).catch((error) => env.toast(error.message)); break;
       default: break;

@@ -127,13 +127,16 @@ function movingAverage(bars) {
 }
 
 function emaFromCloses(continuous, lookback) {
-  if (continuous.length < lookback) return { value: null, seedDate: null, observations: continuous.length };
+  if (continuous.length < lookback) return { value: null, prior: null, seedDate: null, observations: continuous.length };
   const alpha = 2 / (lookback + 1);
   let value = movingAverage(continuous.slice(0, lookback));
+  const priorIndex = continuous.length - 6;
+  let prior = priorIndex === lookback - 1 ? value : null;
   for (let index = lookback; index < continuous.length; index++) {
     value = alpha * continuous[index].close + (1 - alpha) * value;
+    if (index === priorIndex) prior = value;
   }
-  return { value, seedDate: continuous[lookback - 1].date, observations: continuous.length };
+  return { value, prior, seedDate: continuous[lookback - 1].date, observations: continuous.length };
 }
 
 function continuousSuffix(series) {
@@ -175,7 +178,67 @@ function technicalExtremes(bars, last, size) {
   };
 }
 
-function priceVolumeFeatures(series, index, row) {
+function atrPercentage(series, index) {
+  const bars = windowBars(series, index - 14, index);
+  if (!bars) return null;
+  let total = 0;
+  for (let offset = 1; offset < bars.length; offset++) {
+    const { high, low } = bars[offset];
+    const previous = bars[offset - 1].close;
+    total += Math.max(high - low, Math.abs(high - previous), Math.abs(low - previous));
+  }
+  return ratio(total / 14, bars.at(-1).close);
+}
+
+function consolidationDuration(series, index) {
+  // Report the number of trailing sessions contained in a 10% range, up to one quarter.
+  let high = 0;
+  let low = Infinity;
+  for (let count = 0; count < 63; count++) {
+    const bar = series[index - count];
+    if (!bar?.traded) return null;
+    high = Math.max(high, bar.high);
+    low = Math.min(low, bar.low);
+    if (high / low > 1.1 + 1e-12) return count;
+    if (bar.unverifiedSplit && count < 62) return null;
+  }
+  return 63;
+}
+
+function highVolumeCounts(series, index, row) {
+  const bars = windowBars(series, index - 39, index);
+  const complete = bars?.every((bar) => finite(bar.volume));
+  let up = 0;
+  let down = 0;
+  let up2x = 0;
+  let down2x = 0;
+  if (complete) {
+    let total = bars.slice(0, 20).reduce((sum, bar) => sum + bar.volume, 0);
+    for (let step = 20; step < bars.length; step++) {
+      const current = bars[step];
+      const direction = Math.sign(current.close - bars[step - 1].close);
+      const baseline = total / 20;
+      if (baseline > 0 && current.volume >= 1.5 * baseline) {
+        if (direction > 0) {
+          up++;
+          if (current.volume >= 2 * baseline) up2x++;
+        } else if (direction < 0) {
+          down++;
+          if (current.volume >= 2 * baseline) down2x++;
+        }
+      }
+      total += current.volume - bars[step - 20].volume;
+    }
+  }
+  row.high_volume_up_20d = complete ? up : null;
+  row.high_volume_down_20d = complete ? down : null;
+  row.accumulation_20d = complete ? up - down : null;
+  row.high_volume_up_2x_20d = complete ? up2x : null;
+  row.high_volume_down_2x_20d = complete ? down2x : null;
+  row.accumulation_2x_20d = complete ? up2x - down2x : null;
+}
+
+function priceVolumeFeatures(series, index, row, volumeWindows) {
   let obv = 0;
   let gap = 0;
   let streak = 0;
@@ -201,22 +264,25 @@ function priceVolumeFeatures(series, index, row) {
   }
   row.obv = row.traded && obvComplete && finite(series[index]?.volume) ? obv : null;
   row.obv_start = recent.find((bar) => bar?.traded)?.date ?? null;
-  row.obv_slope = row.traded && obvSeries.slice(-21).every(finite) && obvSeries.length >= 21 ? obv - obvSeries.at(-21) : null;
+  for (const n of new Set([20, ...volumeWindows])) {
+    const comparable = row.traded && obvSeries.length > n && obvSeries.slice(-n - 1).every(finite);
+    row[`obv_slope_${n}d`] = comparable ? obv - obvSeries.at(-n - 1) : null;
+  }
+  row.obv_slope = row.obv_slope_20d;
   row.streak = row.traded ? streak : null;
   row.gap = row.traded ? gap : null;
   row.gap_up = finite(gap) ? gap > 0.02 : null;
   row.gap_down = finite(gap) ? gap < -0.02 : null;
   const data = windowBars(series, index - 20, index);
-  row.atr_14d = null;
+  row.atr_14d = atrPercentage(series, index);
+  row.atr_contraction = change(row.atr_14d, atrPercentage(series, index - 14));
   row.cmf_20d = null;
   row.mfi_14d = null;
   row.clv = row.traded && prev ? (prev.high === prev.low ? 0 : (2 * prev.close - prev.high - prev.low) / (prev.high - prev.low)) : null;
   row.up_frequency_20d = null;
-  row.high_volume_up_20d = null;
-  row.high_volume_down_20d = null;
-  row.accumulation_20d = null;
+  highVolumeCounts(series, index, row);
   if (!data) return;
-  const flows = { positive: 0, negative: 0, moneyFlow: 0, trueRange: 0, up: 0, volume: 0, highUp: 0, highDown: 0 };
+  const flows = { positive: 0, negative: 0, moneyFlow: 0, up: 0, volume: 0 };
   for (let step = 1; step < data.length; step++) {
     const current = data[step];
     const previous = data[step - 1];
@@ -225,30 +291,17 @@ function priceVolumeFeatures(series, index, row) {
     if (step > data.length - 15) {
       if (typical > lastTypical) flows.positive += typical * current.volume;
       if (typical < lastTypical) flows.negative += typical * current.volume;
-      flows.trueRange += Math.max(current.high - current.low, Math.abs(current.high - previous.close), Math.abs(current.low - previous.close));
     }
-    const observationIndex = index - 20 + step;
-    const baseline = windowBars(series, observationIndex - 20, observationIndex - 1);
-    const highVolume = baseline && current.volume >= 1.5 * mean(baseline.map((item) => item.volume));
-    if (current.close > previous.close) {
-      flows.up++;
-      if (highVolume) flows.highUp++;
-    }
-    if (current.close < previous.close && highVolume) flows.highDown++;
+    if (current.close > previous.close) flows.up++;
     if (current.high !== current.low) flows.moneyFlow += current.volume * ((2 * current.close - current.high - current.low) / (current.high - current.low));
     flows.volume += current.volume;
   }
-  row.atr_14d = ratio(flows.trueRange / 14, row.close);
   row.cmf_20d = data.slice(1).every((bar) => finite(bar.volume)) ? ratio(flows.moneyFlow, flows.volume) : null;
   row.mfi_14d = data.slice(-14).every((bar) => finite(bar.volume)) ? 100 * (ratio(flows.positive, flows.positive + flows.negative) ?? 0.5) : null;
   row.up_frequency_20d = flows.up / 20;
-  const volumeComplete = windowBars(series, index - 39, index)?.every((bar) => finite(bar.volume));
-  row.high_volume_up_20d = volumeComplete ? flows.highUp : null;
-  row.high_volume_down_20d = volumeComplete ? flows.highDown : null;
-  row.accumulation_20d = volumeComplete ? flows.highUp - flows.highDown : null;
 }
 
-export function stockMetrics(identity, series, { averages = AVERAGES, windows = DEFAULT_WINDOWS, volumeWindows = VOLUME_WINDOWS, benchmarkSeries = [], allTimeHigh = null, priorFundamentals = null } = {}) {
+export function stockMetrics(identity, series, { averages = AVERAGES, windows = DEFAULT_WINDOWS, volumeWindows = VOLUME_WINDOWS, benchmarkSeries = [], allTimeHigh = null } = {}) {
   const index = series.length - 1;
   const bar = series[index];
   const row = {
@@ -272,6 +325,8 @@ export function stockMetrics(identity, series, { averages = AVERAGES, windows = 
     row[`ema_${n}d`] = ema.value;
     row[`ema_seed_${n}d`] = ema.seedDate;
     row[`ema_observations_${n}d`] = ema.observations;
+    row[`vs_ema_${n}d`] = change(row.close, ema.value);
+    row[`slope_ema_${n}d`] = change(ema.value, ema.prior);
     row[`vs_sma_${n}d`] = change(row.close, sma);
     row[`above_${n}d`] = sma == null ? null : row.close > sma;
     row[`slope_sma_${n}d`] = change(sma, movingAverage(previous));
@@ -313,7 +368,7 @@ export function stockMetrics(identity, series, { averages = AVERAGES, windows = 
   row.ma_50_above_200 = row.sma_200d == null ? null : row.sma_50d > row.sma_200d;
   row.ma_rising_50 = row.slope_sma_50d == null ? null : row.slope_sma_50d > 0;
   row.ma_rising_200 = row.slope_sma_200d == null ? null : row.slope_sma_200d > 0;
-  row.market_cap_change = change(row.market_cap, priorFundamentals?.market_cap);
+  row.market_cap_change = change(row.market_cap, identity.priorMarketCap21d);
   row.relative_strength_line = ratio(row.close, benchmarkSeries.at(-1)?.close);
   const rel = series.slice(-21).map((item, offset) => ratio(item?.close, benchmarkSeries.at(-21 + offset)?.close));
   row.rs_line_new_high = rel.length === 21 && rel.every(finite) ? rel.at(-1) > Math.max(...rel.slice(0, -1)) : null;
@@ -326,6 +381,7 @@ export function stockMetrics(identity, series, { averages = AVERAGES, windows = 
   const priorVolatility = prior ? deviation(prior.slice(1).map((item, step) => change(item.close, prior[step].close))) * Math.sqrt(252) : null;
   row.volatility_compression = change(row.volatility_20d, priorVolatility);
   row.consolidation_range_20d = daily ? change(Math.max(...daily.slice(1).map((item) => item.high)), Math.min(...daily.slice(1).map((item) => item.low))) : null;
-  priceVolumeFeatures(series, index, row);
+  row.consolidation_duration = consolidationDuration(series, index);
+  priceVolumeFeatures(series, index, row, volumeWindows);
   return row;
 }

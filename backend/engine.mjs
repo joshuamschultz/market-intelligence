@@ -3,11 +3,12 @@ import { getHeapStatistics } from 'node:v8';
 import { createHash } from 'node:crypto';
 import { CALCULATION_VERSION, dataVersion, getWorkspace, isoDate, listWorkspace, marketDay, normalizeSymbol, qualityOverrides } from './database.mjs';
 import { expectedSessions, isMarketSession, shiftDate, weekEnd } from './calendar.mjs';
-import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, prepareBars, returnWindow, splitFactorBetween, stockMetrics } from './metrics.mjs';
-import { BUILTIN_MODELS, annotateVelocity, modelInputs, modelWindowBounds, onOrBefore, scoreRanking, validateModel } from './ranking.mjs';
+import { AVERAGES, DEFAULT_WINDOWS, alignSeries, change, finite, prepareBars, quantile, returnWindow, splitFactorBetween, stockMetrics } from './metrics.mjs';
+import { BUILTIN_MODELS, annotateVelocity, leadershipStatistics, modelInputs, modelWindowBounds, onOrBefore, scoreRanking, topDecileIds, validateModel } from './ranking.mjs';
 import { aggregateRows, BREADTH_METRICS, breadthMetric, calculateBreadth, calculateGroups } from './breadth.mjs';
 
 const coreExchanges = ['NYSE', 'NASDAQ'];
+const nasdaqCompositeSymbols = ['IXIC', '^IXIC', 'IXIC.INDX'];
 const refinements = ['adr', 'reit', 'preferred', 'warrant', 'right', 'unit', 'etf'];
 const builtinBreadthKeys = new Set(BREADTH_METRICS.map(({ key }) => key));
 export const UNIVERSES = [
@@ -56,6 +57,16 @@ function byLatestEffective(records, date, key, field = null) {
     && (!item.effective_to || item.effective_to >= date) && (!field || item[field] > 0));
 }
 
+function marketCapAt(facts, actions, bar, date, basis) {
+  if (!date || !bar?.traded) return null;
+  const cap = byLatestEffective(facts, date, 'effective_date', 'market_cap');
+  if (cap?.effective_date === date) return cap.market_cap;
+  const shares = byLatestEffective(facts, date, 'effective_date', 'shares');
+  if (!shares) return null;
+  const comparableActions = basis === 'known' ? actions.filter((action) => action.known_at <= date) : actions;
+  return shares.shares * splitFactorBetween(comparableActions, shares.effective_date, date) * bar.rawClose;
+}
+
 function snapshotValue(snapshot) {
   const payload = JSON.stringify(snapshot);
   return payload.length < 65536 ? payload : gzipSync(payload, { level: 1 });
@@ -73,7 +84,7 @@ function referenceCutoff(config) {
 }
 
 function basicEligibility(security, definition, date, basis, identifier, type = security.type) {
-  if (!identifier) return false;
+  if (!identifier || type === 'index' || identifier.exchange === 'INDX') return false;
   const listing = security.listing_date || (basis === 'reconstructed' ? security.first_seen : null);
   if (!listing || listing > date || (security.delisting_date && security.delisting_date < date)) return false;
   if (security.status === 'delisted' && !security.delisting_date && (basis === 'known' || !security.last_seen || security.last_seen < date)) return false;
@@ -127,6 +138,35 @@ function actionHistory(db, context, id, overrides = []) {
 function strippedStock(row) {
   const { rsRisk, ...value } = row;
   return value;
+}
+
+function historyHighs(record, sessions, series) {
+  const listing = !record.listing_inferred && record.listing_date;
+  const firstSession = listing && expectedSessions(listing, shiftDate(listing, 14))[0];
+  let high = 0;
+  let firstIndex = null;
+  let through = null;
+  let observations = 0;
+  let boundary = 'loaded_start';
+  for (let index = series.length - 1; index >= 0; index--) {
+    const bar = series[index];
+    if (firstSession && sessions[index] < firstSession) break;
+    if (bar?.priceQuarantined) { boundary = 'price_quarantine'; break; }
+    if (bar?.traded && finite(bar.high)) {
+      high = Math.max(high, bar.high);
+      through ??= bar.date;
+      firstIndex = index;
+      observations++;
+    }
+    if (bar?.unverifiedSplit && bar.date !== firstSession) { boundary = 'unverified_split'; break; }
+    if (sessions[index] === firstSession) { boundary = 'verified_listing'; break; }
+  }
+  const from = firstIndex == null ? null : sessions[firstIndex];
+  const expected = firstIndex == null ? 0 : sessions.length - firstIndex;
+  const complete = firstSession && firstSession === from && observations === expected;
+  return { allTimeHigh: complete ? high : null, loadedHistoryHigh: high || null,
+    loadedHistoryHighFrom: from, loadedHistoryHighThrough: through,
+    loadedHistoryHighObservations: observations, loadedHistoryHighExpected: expected, loadedHistoryHighBoundary: boundary };
 }
 
 export function createEngine(db) {
@@ -197,6 +237,7 @@ export function createEngine(db) {
       model: { ...model, definition },
       classification: input.classification || 'provider', currentVersion, dataVersion: requestedVersion,
       themes: input.themes ?? listWorkspace(db, 'theme'),
+      includeAllTimeHigh: [true, 'true', '1', 1].includes(input.includeAllTimeHigh),
       averages: [...new Set([...AVERAGES, ...numericList(input.averages)])],
       windows: [...new Set([...DEFAULT_WINDOWS, ...numericList([...numericList(input.windows), ...extraFromBreadth])])],
       volumeWindows: numericList(input.volumeWindows),
@@ -393,13 +434,27 @@ export function createEngine(db) {
     const classifications = readClassifications(config);
     const subtypes = readSubtypes(config);
     const referenceDate = referenceCutoff(config);
-    const benchmarkRef = [...refs.values()].find((item) => identifierAt(item, config.date)?.symbol === config.benchmark);
-    const benchmarkSeries = benchmarkRef ? securitySeries(config, benchmarkRef.id, dates) : [];
+    const benchmarkNames = new Set([config.benchmark, ...nasdaqCompositeSymbols, 'QQQ']);
+    const benchmarks = new Map();
+    const identifiers = new Map();
+    for (const item of refs.values()) {
+      const identifier = identifierAt(item, config.date);
+      identifiers.set(item.id, identifier);
+      const symbol = identifier?.symbol;
+      if (benchmarkNames.has(symbol) && !benchmarks.has(symbol) &&
+        (!nasdaqCompositeSymbols.includes(symbol) || item.type === 'index' || identifier.exchange === 'INDX')) {
+        benchmarks.set(symbol, item);
+      }
+    }
+    const benchmarkRef = benchmarks.get(config.benchmark);
+    const marks = benchmarkRef ? securitySeries(config, benchmarkRef.id, dates) : [];
+    const benchmarkSeries = benchmarkRef?.type === 'index' ? marks.map((bar) =>
+      bar?.close > 0 && !bar.traded ? { ...bar, traded: true } : bar) : marks;
     const benchmarkInputs = modelInputs(benchmarkSeries, modelBounds, config.model.definition);
     const groups = config.themes ?? listWorkspace(db, 'theme');
     const subtypeExclusions = new Map();
     for (const record of refs.values()) {
-      const identifier = identifierAt(record, config.date);
+      const identifier = identifiers.get(record.id);
       const instrument = instrumentType(record, subtypes.get(record.id), referenceDate);
       if (!basicEligibility(record, config.universe.definition, config.date, config.basis, identifier, instrument.type)) {
         if (config.universe.id === 'us-core' && instrument.subtype && record.provider === 'eodhd' && record.status === 'active'
@@ -432,24 +487,27 @@ export function createEngine(db) {
       };
       if (currentFacts && priceSeries.length) {
         const actions = actionHistory(db, config, record.id, securityQuality(config, record.id));
-        function marketCapAt(bar, date) {
-          if (!date || !bar?.traded) return null;
-          const cap = byLatestEffective(facts, date, 'effective_date', 'market_cap');
-          if (cap?.effective_date === date) return cap.market_cap;
-          const shares = byLatestEffective(facts, date, 'effective_date', 'shares');
-          return shares ? shares.shares * splitFactorBetween(actions, shares.effective_date, date) * bar.rawClose : null;
-        }
-        const tradeCap = marketCapAt(priceSeries.at(-1), config.date);
+        const tradeCap = marketCapAt(facts, actions, priceSeries.at(-1), config.date, config.basis);
         if (tradeCap != null) {
           metadata.calculatedMarketCap = tradeCap;
           metadata.marketCapDate = config.date;
         }
-        metadata.priorMarketCap = marketCapAt(priceSeries.at(-2), dates.at(-2));
+        metadata.priorMarketCap = marketCapAt(facts, actions, priceSeries.at(-2), dates.at(-2), config.basis);
+        metadata.priorMarketCap21d = marketCapAt(facts, actions, priceSeries.at(-22), dates.at(-22), config.basis);
       }
-      const stock = stockMetrics(metadata, priceSeries, {
+      let highs;
+      if (config.includeAllTimeHigh && priceSeries.at(-1)?.traded) {
+        const start = record.first_seen;
+        if (start < dates[0]) {
+          const allDates = expectedSessions(start, config.date);
+          highs = historyHighs(record, allDates, securitySeries(config, record.id, allDates));
+        } else highs = historyHighs(record, dates, priceSeries);
+      }
+      const stock = stockMetrics({ ...metadata, ...highs }, priceSeries, {
         averages: config.averages, windows: config.windows, volumeWindows: config.volumeWindows, benchmarkSeries,
-        priorFundamentals: byLatestEffective(facts, dates.at(-22) || config.date, 'effective_date'),
+        allTimeHigh: highs?.allTimeHigh,
       });
+      if (config.includeAllTimeHigh) stock.distance_loaded_history_high = change(stock.close, highs?.loadedHistoryHigh);
       if (!metricEligibility(stock, config.universe.definition)) continue;
       const inputs = modelInputs(priceSeries, modelBounds, config.model.definition);
       stock.rsComponents = inputs.components;
@@ -459,13 +517,41 @@ export function createEngine(db) {
     scoreRanking(result.stocks, config.model.definition, benchmarkInputs);
     const traded = result.stocks.filter((stock) => stock.traded);
     const intervalReturn = returnWindow(benchmarkSeries, dates.length - 22, dates.length - 1);
+    const priorTwenty = benchmarkSeries.slice(-21);
+    const benchmarkHigh20d = priorTwenty.length === 21 && priorTwenty.every((bar, index) => bar?.traded && (index === 0 || !bar.unverifiedSplit))
+      ? priorTwenty.at(-1).close > Math.max(...priorTwenty.slice(0, -1).map((bar) => bar.close)) : null;
     result.groups = calculateGroups(traded, groups, config.date, intervalReturn);
     result.breadth = calculateBreadth(traded, config.breadthKeys);
+    const nasdaqStocks = result.stocks.filter((row) => row.exchange === 'NASDAQ' && row.type === 'common'
+      && (!row.listingDate || row.listingDate <= dates.at(-2)));
+    const nasdaqReturns = nasdaqStocks.map((row) => row.return_1d).filter(finite);
+    const nasdaqDates = dates.slice(-2);
+    let nasdaqBenchmark = null;
+    let nasdaqReturn = null;
+    for (const symbol of [...nasdaqCompositeSymbols, 'QQQ']) {
+      const reference = benchmarks.get(symbol);
+      if (!reference) continue;
+      const bars = symbol === config.benchmark ? benchmarkSeries : securitySeries(config, reference.id, nasdaqDates);
+      const last = bars.at(-1);
+      const value = symbol === 'QQQ' ? returnWindow(bars, bars.length - 2, bars.length - 1)
+        : last?.unverifiedSplit ? null : change(last?.close, bars.at(-2)?.close);
+      if (!finite(value)) continue;
+      nasdaqBenchmark = symbol;
+      nasdaqReturn = value;
+      break;
+    }
+    const benchmarkReturn = returnWindow(benchmarkSeries, dates.length - 2, dates.length - 1);
+    const benchmarkComparable = finite(benchmarkReturn) ? traded.filter((row) => finite(row.return_1d)) : [];
     result.aggregates = {
       ...aggregateRows(traded),
-      benchmarkReturn: returnWindow(benchmarkSeries, dates.length - 2, dates.length - 1),
+      benchmarkReturn, benchmarkHigh20d,
       benchmarkReturn20d: returnWindow(benchmarkSeries, dates.length - 21, dates.length - 1),
       benchmarkReturn21d: intervalReturn, benchmarkClose: benchmarkSeries.at(-1)?.close ?? null,
+      nasdaqBenchmark, nasdaqReturn, nasdaqBenchmarkProxy: nasdaqBenchmark === 'QQQ',
+      nasdaqMedianReturn: quantile(nasdaqReturns, 0.5), nasdaqObservations: nasdaqReturns.length, nasdaqExpected: nasdaqStocks.length,
+      outperformBenchmarkShare: benchmarkComparable.length
+        ? benchmarkComparable.filter((row) => row.return_1d > benchmarkReturn).length / benchmarkComparable.length : null,
+      outperformBenchmarkObservations: benchmarkComparable.length,
     };
     const ledger = db.prepare(`SELECT session_imports.*, ingestion_runs.provider FROM session_imports
       JOIN ingestion_runs ON ingestion_runs.id=session_imports.run_id
@@ -540,6 +626,7 @@ export function createEngine(db) {
       benchmark: config.benchmark, basis: config.basis, classification: config.classification,
       referenceDate: config.referenceMode === 'latest' ? config.observedReferenceDate : null,
       averages: config.averages, windows: config.windows, volume: config.volumeWindows, breadth: config.breadthKeys,
+      allTimeHigh: config.includeAllTimeHigh,
       threshold: config.threshold, themes: (config.themes ?? listWorkspace(db, 'theme')).map(viewVersion),
     });
   }
@@ -625,8 +712,15 @@ export function createEngine(db) {
     const start = from && from > config.earliestDate ? from : config.earliestDate;
     const dates = expectedSessions(start, end);
     const list = cadence === 'weekly' ? dates.filter((date, index) => !dates[index + 1] || weekEnd(date) !== weekEnd(dates[index + 1])) : dates;
-    return list.slice(-Math.max(1, Math.min(2600, Number(limit) || 120))).map((date) =>
-      project(snapshot({ ...config, date, requestedDate: date }, { persist, velocity })));
+    let prior = null;
+    return list.slice(-Math.max(1, Math.min(2600, Number(limit) || 120))).map((date) => {
+      const current = snapshot({ ...config, date, requestedDate: date }, { persist, velocity });
+      const previousDate = expectedSessions(shiftDate(date, -12), shiftDate(date, -1)).at(-1);
+      const previousIds = prior?.date === previousDate ? prior.ids : previousDate >= config.earliestDate
+        ? topDecileIds(snapshot({ ...config, date: previousDate, requestedDate: previousDate }, { persist })) : null;
+      prior = { date, ids: topDecileIds(current) };
+      return project({ ...current, aggregates: { ...current.aggregates, ...leadershipStatistics(current, previousDate, previousIds) } });
+    });
   }
 
   function findSecurity(config, id) {
@@ -650,35 +744,32 @@ export function createEngine(db) {
     const bars = prices.filter(Boolean);
     const quality = securityQuality(config, record.id).filter((row) => row.effective_from <= config.date);
     const actions = actionHistory(db, config, record.id, quality);
-    const loadedHistoryHigh = bars.reduce((maximum, bar) => Math.max(maximum, bar.high), 0);
-    const listingFirstSession = record.listing_date ? expectedSessions(record.listing_date, shiftDate(record.listing_date, 12))[0] : null;
-    const allTimeHigh = listingFirstSession && bars[0]?.date === listingFirstSession && prices.every((bar) => bar?.traded && !bar.unverifiedSplit)
-      ? loadedHistoryHigh : null;
+    const highs = historyHighs(record, dates, prices);
     const selected = snapshot(config, { velocity }).stocks.find((row) => row.securityId === record.id);
     const lastTrade = bars.at(-1);
     const float = byLatestEffective(facts, referenceDate, 'effective_date', 'float');
     const shares = byLatestEffective(facts, referenceDate, 'effective_date', 'shares');
-    const datedShares = byLatestEffective(facts, config.date, 'effective_date', 'shares');
     const cap = byLatestEffective(facts, referenceDate, 'effective_date', 'market_cap');
     const currentCap = cap?.effective_date === referenceDate ? cap.market_cap
-      : lastTrade?.date === config.date && datedShares
-        ? lastTrade.rawClose * datedShares.shares * splitFactorBetween(actions, datedShares.effective_date, config.date) : null;
-    const stock = selected || stockMetrics({
+      : marketCapAt(facts, actions, prices.at(-1), config.date, config.basis);
+    const stock = selected ? { ...selected } : stockMetrics({
       securityId: record.id, symbol: identifier?.symbol || id, name: record.name, exchange: identifier?.exchange || record.exchange,
       ...instrument, float: float?.float ?? null, shares: shares?.shares ?? null, calculatedMarketCap: currentCap,
+      priorMarketCap: marketCapAt(facts, actions, prices.at(-2), dates.at(-2), config.basis),
+      priorMarketCap21d: marketCapAt(facts, actions, prices.at(-22), dates.at(-22), config.basis),
       fundamentalsDate: facts[0]?.effective_date ?? null, fundamentalsKnownAt: facts[0]?.known_at ?? null,
       floatDate: float?.effective_date ?? null, floatKnownAt: float?.known_at ?? null,
       sharesDate: shares?.effective_date ?? null, sharesKnownAt: shares?.known_at ?? null,
-    }, prices, { allTimeHigh, averages: config.averages, windows: config.windows, volumeWindows: config.volumeWindows });
-    stock.distance_all_time_high = stock.close > 0 && allTimeHigh > 0 ? stock.close / allTimeHigh - 1 : null;
+    }, prices, { allTimeHigh: highs.allTimeHigh, averages: config.averages, windows: config.windows, volumeWindows: config.volumeWindows });
+    stock.distance_all_time_high = change(stock.close, highs.allTimeHigh);
+    stock.distance_loaded_history_high = change(stock.close, highs.loadedHistoryHigh);
     return { ...stock, date: config.date, referenceDate, referenceMode: referenceDate !== config.date ? 'latest' : 'as-of',
-      classificationSystem: config.classification, allTimeHigh, loadedHistoryHigh: loadedHistoryHigh || null,
-      distance_loaded_history_high: stock.close > 0 && loadedHistoryHigh > 0 ? stock.close / loadedHistoryHigh - 1 : null,
+      classificationSystem: config.classification, ...highs,
       bars: bars.slice(-lookback), chartBars: dates.slice(-lookback).map((date, index, sessions) =>
         prices[dates.length - sessions.length + index] || { date, close: null, volume: null, traded: false, missing: true }),
       actions, quality, dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION,
       aliases: record.identifiers, earliestDate: bars[0]?.date || null, latestDate: bars.at(-1)?.date || null,
-      warnings: [!selected && 'Security falls outside the selected analysis universe.', !facts.length && 'Dated float and shares outstanding are unavailable.', stock.fundamentalsAgeDays > 90 && 'The most recent dated fundamentals are more than 90 calendar days old.', config.basis === 'reconstructed' && 'Price history uses the selected ingested data version.', !allTimeHigh && 'Full history since listing is unavailable.',
+      warnings: [!selected && 'Security falls outside the selected analysis universe.', !facts.length && 'Dated float and shares outstanding are unavailable.', stock.fundamentalsAgeDays > 90 && 'The most recent dated fundamentals are more than 90 calendar days old.', config.basis === 'reconstructed' && 'Price history uses the selected ingested data version.', !highs.allTimeHigh && 'Full history since listing is unavailable.',
         ...quality.map((row) => row.reason)].filter(Boolean),
     };
   }

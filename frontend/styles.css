@@ -143,6 +143,9 @@ button.summary-card:hover { border-color: #4a7772; }
 .chart-svg { width: 100%; display: block; overflow: visible; touch-action: pan-y; }
 .chart-line { stroke-linecap: round; stroke-linejoin: round; }
 .chart-frame { position: relative; min-width: 0; }
+.chart-navigation { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+.chart-navigation .button { padding: 3px 8px; min-height: 27px; font-size: 11px; }
+.chart-navigation span { color: var(--muted); font-size: 11px; }
 .chart-tooltip { display: grid; gap: 5px; position: absolute; z-index: 2; top: 9px; max-width: calc(100% - 10px); min-width: 145px; background: #0e171bf5; border: 1px solid #3c4d57; padding: 8px 10px; border-radius: 8px; box-shadow: 0 4px 14px #0007; font-size: 11px; pointer-events: none; }
 .chart-tooltip strong { font: 600 11px var(--mono); }
 .legend { display: flex; gap: 13px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 11px; }
@@ -267,6 +270,13 @@ dialog.drawer { right: 0; left: auto; top: 0; bottom: 0; margin: 0; height: 100d
 .workplace-table .table-scroll { border-radius: 0; border-inline: 0; }
 .table-groups { padding: 7px 15px; background: var(--surface-raised); border-top: 1px solid var(--subtle-border); }
 .model-summary { margin-bottom: 14px; padding: 14px 15px; }
+.ranking-lists { margin-bottom: 14px; }
+.ranking-lists .query-options { gap: 12px 18px; }
+.ranking-lists .query-options p { font-size: 11px; margin-bottom: 4px; }
+.ranking-lists form { align-items: flex-end; }
+.ranking-lists input[name="cutoff"] { min-height: 32px; width: 107px; }
+.tradingview-link { display: inline-flex; align-items: center; gap: 4px; }
+.tradingview-link .icon { width: 12px; height: 12px; }
 .checkbox-label { display: inline-flex; align-items: center; gap: 7px; min-height: 32px; color: var(--muted); font-size: 12px; }
 .filter-group { min-inline-size: 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; margin: 0; }
 .filter-group legend, .model-window legend { padding: 0 5px; color: var(--muted); font-size: 11px; }
@@ -339,6 +349,7 @@ dialog.drawer { right: 0; left: auto; top: 0; bottom: 0; margin: 0; height: 100d
 .breadth-bar .bar-fill { width: var(--bar-size); height: 100%; position: absolute; top: 0; left: 0; background: var(--fill-color); z-index: -1; }
 .breadth-bar.down .bar-fill { left: auto; right: 0; }
 .breadth-bar .bar-count { font-size: 9px; color: #c1d0d4; line-height: 1; }
+.breadth-bar.with-statistics { height: auto; min-height: 58px; }
 .breadth-bar.missing { color: var(--quiet); background: repeating-linear-gradient(-45deg,#131d23,#131d23 4px,#18242b 4px,#18242b 5px); }
 .breadth-bar.extreme-high { border-color: var(--extreme-color); }
 .breadth-bar.extreme-high .bar-fill { filter: brightness(1.3); }

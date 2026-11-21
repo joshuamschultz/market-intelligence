@@ -1,6 +1,6 @@
 import {
   action, blobDownload, chip, count, dateLabel, empty, field, heading, icon, iconButton, notice, number, option,
-  panelHead, pagination, pathPart, pending, percent, safe, segment, summary, table,
+  panelHead, pagination, pathPart, pending, percent, publishingHistory, safe, savedScreenRoute, segment, summary, table, tradingViewLink,
 } from './ui.js';
 import { partialCoverage } from './overview.js';
 import { modelEditor } from './screener.js';
@@ -20,7 +20,7 @@ const healthParts = {
   shortBreadth: 'Short-term breadth', intermediateBreadth: 'Intermediate-term breadth', longBreadth: 'Long-term breadth',
   priceMomentum: 'Price momentum', volumeParticipation: 'Volume participation', industryLeadership: 'Industry leadership', highsLows: 'Highs vs lows',
 };
-const savedContext = (screen) => ({ ...screen?.definition?.context, date: screen?.definition?.context?.date || null });
+const savedContext = (screen) => savedScreenRoute(screen?.definition);
 const screenUrl = (env, screen) => env.routeUrl('screener', { ...savedContext(screen), screen: screen.id });
 const splitValues = (value) => String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
 const timestamp = (value) => value ? `${dateLabel(value)} ${String(value).slice(11,16)} UTC` : '—';
@@ -182,17 +182,29 @@ async function renderWatchlists(env) {
   const selected = all.find(({id})=>id===env.params.list) || all[0];
   const currentScreen = env.config.screens.find(({id})=>id===selected?.definition?.screenId);
   const dynamic = !!selected?.definition?.screenId;
-  let page = 1;
+  const source = currentScreen?.definition;
+  const fixed = source && savedScreenRoute(source).date;
+  env.state.live = !!source && !fixed;
+  if (env.state.selectedList !== selected?.id) {
+    env.state.selectedList = selected?.id;
+    env.state.page = 1;
+  }
   async function load() {
     const target = env.main.querySelector('#members');
     if (!target || !selected) return;
     target.innerHTML = pending('Loading members…');
     try {
-      const result = await env.api(`${itemPath('watchlists',selected.id)}/members`,{signal:env.signal,params:{page,perPage:50}});
+      const result = await env.publishedSeries(`${itemPath('watchlists',selected.id)}/members`,{signal:env.signal,params:{page:env.state.page,perPage:50}},
+        (partial, job) => { if (target.isConnected) target.innerHTML = publishingHistory(job); });
       if (!target.isConnected) return;
+      const lastPage = Math.max(1, Math.ceil(result.total / result.perPage));
+      if (env.state.page > lastPage) { env.state.page = lastPage; return load(); }
       target.innerHTML = (result.unavailable?.length ? notice('Some members are unavailable', `${count(result.unavailable.length)} saved securities fall outside the selected universe or session.`) : '') +
-        table(result.rows,listColumns,{emptyText:'No tracked securities in this context.',
-          rowAction:dynamic ? null : (row)=>iconButton('Remove from watchlist','remove-member','trash',row.securityId)}) + pagination(result,'members-page');
+        (result.date ? `<p class="muted">Session ${safe(dateLabel(result.date))}${result.period ? ` · ${count(result.period.comparable)} period-comparable stocks` : ''}</p>` : '') +
+        table(result.rows, result.period ? ['symbol','name','periodRank','periodPercentile','periodReturn',...rateKeys] : listColumns,
+          {emptyText:'No tracked securities in this context.',
+            rowAction: dynamic ? tradingViewLink : (row) => `<div class="actions">${tradingViewLink(row)}
+              ${iconButton('Remove from watchlist','remove-member','trash',row.securityId)}</div>`}) + pagination(result,'members-page');
     } catch(error) { if (target.isConnected && error.name!=='AbortError') target.innerHTML=notice('Members unavailable',error.message,'',true); }
   }
   env.setActions({
@@ -200,7 +212,7 @@ async function renderWatchlists(env) {
     'select-watch':(id)=>env.go('watchlists',{list:id}),
     'edit-watch':()=>watchEditor(env,env.config.screens,selected),
     'delete-watch':()=>confirmDelete(env,'watchlist',()=>env.api(itemPath('watchlists',selected.id),{method:'DELETE',plain:true})),
-    'members-page'(value) { page=Number(value); return load(); },
+    'members-page'(value) { env.state.page=Number(value); return load(); },
     async 'remove-member'(id) {
       await env.api(`${itemPath('watchlists',selected.id)}/members`,{plain:true,body:{remove:[id]}});
       env.toast('Removed from watchlist');
@@ -225,7 +237,7 @@ async function renderWatchlists(env) {
     action('Create watchlist','new-watch','plus',{className:'primary'})) +
     (selected ? `<div class="library-layout"><section class="panel panel-body library-nav">${panelHead('Your lists')}${all.map((item)=>`<button type="button" class="library-option"
       data-action="select-watch" data-value="${safe(item.id)}" aria-pressed="${item.id===selected.id}">${icon('watchlists')}<span>${safe(item.name)}</span></button>`).join('')}</section>
-      <section class="panel panel-body">${panelHead(selected.name,dynamic ? `Dynamic · ${currentScreen?.name || 'Source screen unavailable'}` : 'Manual watchlist',
+      <section class="panel panel-body">${panelHead(selected.name,dynamic ? `Dynamic · ${currentScreen?.name || 'Source screen unavailable'}${source ? fixed || env.context.date || env.context.dataVersion ? ' · pinned replay' : ' · live EOD' : ''}` : 'Manual watchlist',
       (dynamic ? currentScreen ? `<a class="button" href="${safe(screenUrl(env,currentScreen))}">Source screen ${icon('chevron-right')}</a>` : '' : action('Add stocks','add-members','plus'))+
       iconButton('Edit watchlist','edit-watch','edit')+iconButton('Delete watchlist','delete-watch','trash'))}<div id="members">${pending()}</div></section></div>`
       : empty('No watchlists','Create a manual list or connect a saved screen.','watchlists',action('Create watchlist','new-watch','plus')));
@@ -236,6 +248,7 @@ const alertTypes = [['breadth','Breadth threshold crossing'],['stocks','Stock co
 function alertLabel(def, config) {
   if (def.type==='breadth') {
     const metric=config.breadthMetrics.find(({key})=>key===def.metric)?.label || def.metric;
+    if (def.trigger==='surge') return `${metric} ${def.direction==='below' ? 'falls' : 'rises'} by at least ${number(def.threshold)} pp in ${count(def.lookback)} sessions`;
     return `${metric} crosses ${def.direction || 'above'} ${percent(def.threshold)}`;
   }
   if (def.type==='screen') return `${def.direction || 'Membership changes'} · ${config.screens.find(({id})=>id===def.screenId)?.name || 'Saved screen'}`;
@@ -257,8 +270,10 @@ function alertEditor(env, existing = null) {
   function update(type) {
     target.querySelector('#alert-form-details').innerHTML = type === 'breadth' ? `<div class="form-grid">
       ${field('Breadth metric',`<select name="metric">${env.config.breadthMetrics.map(({key,label})=>option(key,label,current.metric || 'above_50d')).join('')}</select>`)}
-      ${field('Direction',`<select name="direction">${option('above','Crosses above',current.direction || 'above')}${option('below','Crosses below',current.direction)}</select>`)}
-      ${field('Threshold (%)',`<input type="number" step=".01" min="0" max="100" name="threshold" required value="${safe(current.threshold ?? 50)}">`)}</div>`
+      ${field('Breadth event',`<select name="trigger">${option('crossing','Threshold crossing',current.trigger || 'crossing')}${option('surge','Change over sessions',current.trigger)}</select>`)}
+      ${field('Direction',`<select name="direction">${option('above','Above / rising',current.direction || 'above')}${option('below','Below / falling',current.direction)}</select>`)}
+      ${field('Threshold (% or percentage points)',`<input type="number" step=".01" min="0" max="200" name="threshold" required value="${safe(current.threshold ?? 50)}">`)}
+      ${field('Change lookback',`<input type="number" min="1" max="252" name="lookback" required value="${safe(current.lookback ?? 5)}">`,'Used for change events only.')}</div>`
       : type==='stocks' ? `<div class="stack">${field('Screen expression',`<input name="expression" maxlength="1000" required value="${safe(current.filter?.expression || '')}" placeholder="rsPercentile &gt;= 95">`, 'Use screener metric IDs and comparison operators.')}${directionField()}</div>`
       : type==='screen' ? `<div class="form-grid">${field('Saved screen',`<select name="screen" required>${option('','Choose a saved screen','')}
         ${env.config.screens.map(({id,name})=>option(id,name,current.screenId)).join('')}</select>`)}${directionField()}</div>`
@@ -273,7 +288,8 @@ function alertEditor(env, existing = null) {
     delete context.date;
     delete context.dataVersion;
     const details = { type:entries.type,active:!!entries.active,context,...(entries.direction ? {direction:entries.direction} : {}) };
-    if (entries.type==='breadth') Object.assign(details,{metric:entries.metric,threshold:Number(entries.threshold)});
+    if (entries.type==='breadth') Object.assign(details,{metric:entries.metric,threshold:Number(entries.threshold),
+      trigger:entries.trigger,...(entries.trigger==='surge' ? {lookback:Number(entries.lookback)} : {})});
     if (entries.type==='stocks') details.filter={expression:entries.expression};
     if (entries.type==='screen') details.screenId=entries.screen;
     if (entries.type==='industry') details.top=Number(entries.top);

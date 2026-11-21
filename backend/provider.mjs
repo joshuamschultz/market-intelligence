@@ -6,6 +6,7 @@ import { verifiedCorrectionSymbols } from '../scripts/apply-verified-correction.
 
 const BASE_URL = 'https://eodhd.com/api/';
 export const BENCHMARKS = ['SPY', 'QQQ', 'IWM', 'DIA', 'XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY'];
+const nasdaqComposite = { symbol: 'IXIC', name: 'NASDAQ Composite', exchange: 'INDX', type: 'index', providerSymbol: 'IXIC.INDX' };
 const DEFAULT_SAMPLE = [...BENCHMARKS.slice(0, 3), 'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'JPM', 'XOM', 'UNH', 'V', 'PG', 'HD', 'AVGO', 'AMD', 'COST', 'LLY', 'TSLA'];
 const symbolPattern = /^[A-Z0-9^][A-Z0-9._^=-]{0,32}$/i;
 
@@ -26,7 +27,12 @@ function requireArray(value, dataset) {
 function safeSymbol(value) {
   const symbol = String(value || '').trim().toUpperCase();
   if (!symbolPattern.test(symbol)) throw new Error('A provider symbol is invalid');
-  return symbol.includes('.') ? symbol : `${symbol}.US`;
+  return [nasdaqComposite.symbol, `${nasdaqComposite.symbol}.US`].includes(symbol)
+    ? nasdaqComposite.providerSymbol : symbol.includes('.') ? symbol : `${symbol}.US`;
+}
+
+function canonicalSymbol(symbol) {
+  return String(symbol || '').toUpperCase() === nasdaqComposite.providerSymbol ? nasdaqComposite.symbol : normalizeSymbol(symbol);
 }
 
 function factorFrom(raw) {
@@ -151,13 +157,14 @@ export function EodhdProvider({
   async function getDailyPrices({ symbol, from, to, date } = {}) {
     if (symbol) {
       return requireArray(await request(`eod/${encodeURIComponent(safeSymbol(symbol))}`, { from, to, period: 'd', order: 'a' }), 'price history')
-        .map((row) => ({ ...row, symbol: normalizeSymbol(symbol) }));
+        .map((row) => ({ ...row, symbol: canonicalSymbol(symbol) }));
     }
     const rows = requireArray(await request('eod-bulk-last-day/US', { date, type: 'eod' }), 'bulk price');
     return rows.map((row) => ({ ...row, symbol: row.code || row.Code || row.symbol, exchange: row.exchange_short_name || row.exchange }));
   }
 
   async function getCorporateActions({ symbol, from, to, date } = {}) {
+    if (symbol && safeSymbol(symbol) === nasdaqComposite.providerSymbol) return [];
     const splitPath = symbol ? `splits/${encodeURIComponent(safeSymbol(symbol))}` : 'eod-bulk-last-day/US';
     const dividendPath = symbol ? `div/${encodeURIComponent(safeSymbol(symbol))}` : 'eod-bulk-last-day/US';
     const [splits, dividends] = await Promise.all([
@@ -232,7 +239,8 @@ export function EodhdProvider({
     return { provider: 'eodhd', checkedAt: new Date().toISOString(), ...results, pointInTimeFloat: false, pointInTimeClassifications: false };
   }
 
-  return { getSecurities, getDailyPrices, getCorporateActions, getReference, getBulkReference, getListingEvents, getQuota, capabilities };
+  const getIndexDailyPrices = (date) => getDailyPrices({ symbol: nasdaqComposite.symbol, from: date, to: date });
+  return { getSecurities, getDailyPrices, getIndexDailyPrices, getCorporateActions, getReference, getBulkReference, getListingEvents, getQuota, capabilities };
 }
 
 async function optional(query, warnings, label) {
@@ -269,7 +277,8 @@ export async function importProviderData(options, { provider = EodhdProvider(), 
     if (!db) throw new Error('Bulk EODHD import requires a warehouse for identity reconciliation');
     const dates = providerDates(options, config);
     if (!dates.length) throw new Error('No exchange sessions in the selected range');
-    const catalog = await provider.getSecurities();
+    const catalog = (await provider.getSecurities()).filter((row) => canonicalSymbol(row.symbol || row.Code) !== nasdaqComposite.symbol);
+    if (provider.getIndexDailyPrices) catalog.push(nasdaqComposite);
     const identityDate = latestFinalizableSession(new Date(), process.env.MARKET_SYNC_AFTER || '20:30');
     if (config.delisted) warnings.push('Bulk daily capture uses the active catalog. Use the historical bootstrap for delisted issues.');
     const expectsCurrent = (date) => date >= shiftDate(catalogDate, -7);
@@ -277,37 +286,46 @@ export async function importProviderData(options, { provider = EodhdProvider(), 
     const captures = [];
     for (const [index, date] of dates.entries()) {
       if (hasBulkDate(date) && !options.force) { progress((index + 1) / dates.length); continue; }
-      const prices = (await provider.getDailyPrices({ date })).filter((row) => row.date === date);
+      const prices = (await provider.getDailyPrices({ date })).filter((row) => row.date === date
+        && canonicalSymbol(row.symbol || row.code || row.Code) !== nasdaqComposite.symbol);
       if (!prices.length) throw new Error(`No finalized EODHD bars for ${date}`);
       const corporateActions = config.actions ? await provider.getCorporateActions({ date }) : [];
+      if (provider.getIndexDailyPrices) {
+        const received = await optional(() => provider.getIndexDailyPrices(date), warnings, `Nasdaq Composite for ${date}`);
+        const indexPrices = received?.filter((row) => row.date === date) || [];
+        if (!indexPrices.length && received) warnings.push(`Nasdaq Composite for ${date}: finalized index observation unavailable`);
+        prices.push(...indexPrices.map((row) => ({ ...row, symbol: nasdaqComposite.symbol, exchange: nasdaqComposite.exchange })));
+      }
       const result = reconcileCurrentCapture(db, {
         catalog, prices, corporateActions, date, capturedAt: catalogDate, identityDate, useCurrentRoster: expectsCurrent(date),
-        includeOtherListings: true, benchmarks: BENCHMARKS, warnings,
+        includeOtherListings: true, benchmarks: [...BENCHMARKS, nasdaqComposite.symbol], warnings,
       });
       ingested += result.duplicate ? 0 : result.imported;
       captures.push({ date, expected: result.expected, received: result.received, eligibleReceived: result.eligibleReceived,
-        benchmarks: result.benchmarksReceived, actions: result.corporateActions, identityExclusions: result.reasons });
+        benchmarks: result.benchmarksReceived?.filter((symbol) => symbol !== nasdaqComposite.symbol),
+        indexReceived: !!result.benchmarksReceived?.includes(nasdaqComposite.symbol), actions: result.corporateActions, identityExclusions: result.reasons });
       loadedDates.push(date);
       progress((index + 1) / dates.length);
     }
     return { provider: 'eodhd', scope: 'full', dates: loadedDates, imported: ingested, captures, warnings };
   }
 
-  const securities = await optional(() => provider.getSecurities({ symbols: config.symbols }), warnings, 'Symbol catalog') || [];
+  const securities = (await optional(() => provider.getSecurities({ symbols: config.symbols }), warnings, 'Symbol catalog') || [])
+    .filter((row) => canonicalSymbol(row.symbol) !== nasdaqComposite.symbol);
   const seen = new Set(securities.map(({ symbol }) => normalizeSymbol(symbol)));
-  for (const symbol of config.symbols.map(normalizeSymbol).filter((value) => !seen.has(value))) {
-    securities.push({ symbol, type: BENCHMARKS.includes(symbol) ? 'ETF' : 'unknown' });
+  for (const symbol of config.symbols.map(canonicalSymbol).filter((value) => !seen.has(value))) {
+    securities.push(symbol === nasdaqComposite.symbol ? nasdaqComposite : { symbol, type: BENCHMARKS.includes(symbol) ? 'ETF' : 'unknown' });
   }
   const batch = { provider: 'eodhd', dataset: 'eod', scope: 'sample', catalogDate, prices: [], corporateActions: [], fundamentals: [], classifications: [], securities, warnings };
   for (const [index, symbol] of config.symbols.entries()) {
     const bars = await optional(() => provider.getDailyPrices({ symbol, from: config.from, to: config.to }), warnings, `Price history for ${symbol}`);
     if (bars?.length) {
       batch.prices.push(...bars);
-      if (config.actions) {
+      if (config.actions && canonicalSymbol(symbol) !== nasdaqComposite.symbol) {
         const actions = await optional(() => provider.getCorporateActions({ symbol, from: config.from, to: config.to }), warnings, `Corporate actions for ${symbol}`);
         if (actions) batch.corporateActions.push(...actions);
       }
-      if (config.reference) {
+      if (config.reference && canonicalSymbol(symbol) !== nasdaqComposite.symbol) {
         const reference = await optional(() => provider.getReference(symbol), warnings, `Current fundamentals for ${symbol}`);
         if (reference) {
           batch.fundamentals.push(reference.fundamentals);

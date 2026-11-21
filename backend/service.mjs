@@ -8,7 +8,7 @@ import { expectedSessions, isMarketSession, latestFinalizableSession, shiftDate,
 import { backupRetention, createCompressedBackup } from './backup.mjs';
 import { BREADTH_METRICS, breadthMetric, binaryMetric } from './breadth.mjs';
 import { createEngine, UNIVERSES, validateUniverse } from './engine.mjs';
-import { alignSeries, finite, mean, quantile, volumeRatio } from './metrics.mjs';
+import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, quantile, volumeRatio } from './metrics.mjs';
 import {
   generateJournal, getJournalDate, getJournalSettings, journalFactorSelection, journalNoteDates,
   listJournalEntries, listJournalPrompts, runJournalBacktest, saveJournalNote, saveJournalPrompt, saveJournalSettings,
@@ -17,9 +17,10 @@ import { parquetAvailable, parquetBackup, parquetRows } from './parquet.mjs';
 import { materializeHistory, readMaterializedHistory } from './materialization.mjs';
 import { precomputeProduction, precomputeWorkspace } from './precompute.mjs';
 import { BENCHMARKS, EodhdProvider, importProviderData, importProviderReference, providerDates, providerOptions } from './provider.mjs';
-import { BUILTIN_MODELS, RANKING_METHODS, validateModel } from './ranking.mjs';
+import { BUILTIN_MODELS, RANKING_METHODS, rankBy, validateModel } from './ranking.mjs';
 import { readRankArchive, writeRankArchive } from './rank-archive.mjs';
-import { analyzeCohort, calculateMarketHealth, DEFAULT_HEALTH_MODEL, marketHealthHistory, runEventStudy } from './research.mjs';
+import { analyzeCohort, calculateMarketHealth, DEFAULT_HEALTH_MODEL, findHistoricalAnalogs, leadershipTransitionMatrix,
+  marketHealthHistory, runEventStudy } from './research.mjs';
 import { csvRows, screenStocks, validateFilter, validateScreen } from './screener.mjs';
 
 const collections = {
@@ -83,6 +84,22 @@ const extremeDefinition = { lookback: 252, minimum: 60, high: 90, low: 10,
   definition: 'Current value compared with the prior 252 sessions, requiring at least 60 valid values. Ties use their midpoint.' };
 const defaultColumns = ['symbol', 'name', 'exchange', 'close', 'return_1d', 'return_21d', 'return_63d', 'return_252d',
   'rsRank', 'rsPercentile', 'velocity4w', 'udv_50d', 'adv_20d', 'float', 'distance_high_252d', 'industry'];
+const rankingPeriods = [['1w', '1W', 5], ['1m', '1M', 21], ['3m', '3M', 63], ['6m', '6M', 126], ['1y', '1Y', 252]]
+  .map(([id, label, sessions]) => ({ id, label, sessions }));
+const rankingLists = [
+  { id: 'top-rs', label: 'Top RS', description: 'Stocks in the top decile of the selected RS model.', rankField: 'rsRank' },
+  { id: 'fast-improvers', label: 'Fast Improvers', description: 'Stocks with a positive four-week RS percentile change, strongest improvement first.',
+    rankField: 'velocity4w', direction: 'desc', needsVelocity: true },
+  { id: 'new-top-decile', label: 'New Top-Decile Entries', description: 'Now in the top decile after ranking below it at the prior completed weekly observation.',
+    rankField: 'rsRank', needsVelocity: true },
+  { id: 'emerging-leaders', label: 'Emerging Leaders', description: 'Stocks in the model’s Emerging lifecycle: more than 10 points of four-week RS improvement and a current percentile below 75.',
+    rankField: 'velocity4w', direction: 'desc', needsVelocity: true },
+  { id: 'industry-leaders', label: 'Industry Leaders', description: 'Highest-ranked stock in each classified industry. Unclassified stocks are excluded.',
+    rankField: 'rsRank' },
+  { id: 'weakening-leaders', label: 'Weakening Leaders', description: 'Current or prior four-week top-decile stocks with falling RS percentile, largest declines first.',
+    rankField: 'velocity4w', direction: 'asc', needsVelocity: true },
+];
+const periodColumns = ['symbol', 'name', 'periodRank', 'periodPercentile', 'periodReturn', 'rsRank', 'rsPercentile', 'industry'];
 const asError = (message, status = 400) => Object.assign(new Error(message), { status });
 const dateString = (value, fallback) => {
   if (value == null || value === '') return fallback;
@@ -97,6 +114,8 @@ const download = (data, filename, contentType = 'text/csv; charset=utf-8') => ({
 const exportFormats = ['csv', 'parquet'];
 const smoothingPeriods = [5, 10, 20, 50];
 const changePeriods = [1, 5, 21];
+const leadershipHistoryMetrics = new Set(['leadershipPersistence', 'leadershipTurnover']);
+const leadershipHistoryContext = ['leadershipRankObservations', 'leaderReturnExpected', 'previousLeaderDate'];
 
 async function exportTable(rows, columns, filename, format, config) {
   const response = format === 'parquet'
@@ -139,8 +158,15 @@ function formatHistory(rows, keys, monitor = false) {
       equalWeight: snapshot.aggregates.equalWeightReturn, capWeight: snapshot.aggregates.capWeightReturn,
       largestPositiveDollarShare: finite(snapshot.aggregates.largestPositiveDollarShare)
         ? 100 * snapshot.aggregates.largestPositiveDollarShare : null,
+      netAdvances: snapshot.breadth.advancers?.denominator ? snapshot.breadth.adSpread?.numerator : null,
       adSpread: snapshot.breadth.adSpread?.value };
     for (const key of selected) {
+      if (leadershipHistoryMetrics.has(key)) {
+        const fraction = snapshot.aggregates[key];
+        row[key] = finite(fraction) ? 100 * fraction : null;
+        for (const field of leadershipHistoryContext) row[field] = snapshot.aggregates[field] ?? null;
+        continue;
+      }
       const current = snapshot.breadth[key];
       if (!current) continue;
       const prior = trailing(key, index - 1, extremeDefinition.lookback).filter(finite);
@@ -175,20 +201,21 @@ function formatHistory(rows, keys, monitor = false) {
     }
     return row;
   });
-  let cumulative = 0;
-  for (const [index, row] of values.entries()) {
-    const advancers = rows[index].breadth.advancers;
-    if (advancers?.denominator) cumulative += rows[index].breadth.adSpread.numerator;
-    row.advanceDeclineLine = advancers?.denominator ? cumulative : null;
-  }
   return values;
 }
 
 function indexSeries(rows, returns) {
   const levels = new Map();
-  return rows.map((row) => ({ ...row, ...Object.fromEntries(returns.map(([field, index]) => {
-    if (!finite(row[field])) return [index, null];
-    const level = levels.has(index) ? levels.get(index) * (1 + row[field]) : 100;
+  return rows.map((row) => ({ ...row, ...Object.fromEntries(returns.map(([field, index, anchor]) => {
+    if (!levels.has(index) && (finite(row[field]) || anchor && row[anchor])) {
+      levels.set(index, 100);
+      return [index, 100];
+    }
+    if (!finite(row[field])) {
+      if (levels.has(index)) levels.set(index, null);
+      return [index, null];
+    }
+    const level = levels.get(index) == null ? null : levels.get(index) * (1 + row[field]);
     levels.set(index, level);
     return [index, level];
   })) }));
@@ -198,24 +225,36 @@ function compound(rows, field, complete) {
   return complete && rows.every((row) => finite(row?.[field])) ? rows.reduce((value, row) => value * (1 + row[field]), 1) - 1 : null;
 }
 
-function weekGroups(rows, start, end) {
+function alignedHistory(rows, start, end) {
   if (!rows.length) return [];
   const byDate = new Map(rows.map((row) => [row.date, row]));
+  return expectedSessions(start || rows[0].date, end || rows.at(-1).date).map((date) => byDate.get(date) || { date, missing: true });
+}
+
+function weekGroups(rows, start, end) {
   const buckets = new Map();
-  for (const date of expectedSessions(start || rows[0].date, end || rows.at(-1).date)) {
-    const week = weekEnd(date);
+  for (const row of alignedHistory(rows, start, end)) {
+    const week = weekEnd(row.date);
     if (!buckets.has(week)) buckets.set(week, []);
-    buckets.get(week).push(byDate.get(date) || { date, missing: true });
+    buckets.get(week).push(row);
   }
-  return [...buckets.values()].filter((days) => days.some((row) => !row.missing));
+  return [...buckets.values()];
 }
 
 function marketHistoryRows(rows, { cadence, limit, from, to }) {
   const sliced = cadence === 'weekly' ? weekGroups(rows, from, to).map((days) => {
     const complete = !days.some((row) => row.missing);
-    return { ...days.at(-1), equalWeight: compound(days, 'equalWeight', complete), capWeight: compound(days, 'capWeight', complete) };
-  }).slice(-limit) : rows.slice(-limit);
-  return indexSeries(sliced, [['equalWeight', 'equalWeightIndex'], ['capWeight', 'capWeightIndex']]);
+    const netAdvances = complete && days.every((day) => finite(day.netAdvances)) ? days.reduce((sum, day) => sum + day.netAdvances, 0) : null;
+    const closing = days.at(-1);
+    return { ...closing, netAdvances, equalAnchor: finite(closing.equalWeight), capAnchor: finite(closing.capWeight),
+      equalWeight: compound(days, 'equalWeight', complete), capWeight: compound(days, 'capWeight', complete) };
+  }).slice(-limit) : alignedHistory(rows, from, to).slice(-limit);
+  let cumulative;
+  return indexSeries(sliced, [['equalWeight', 'equalWeightIndex', 'equalAnchor'], ['capWeight', 'capWeightIndex', 'capAnchor']]).map((row) => {
+    if (finite(row.netAdvances)) cumulative = cumulative === undefined ? 0 : cumulative == null ? null : cumulative + row.netAdvances;
+    else if (cumulative !== undefined) cumulative = null;
+    return { ...row, advanceDeclineLine: finite(cumulative) ? cumulative : null };
+  }).filter((row) => !row.missing);
 }
 
 function groupHistoryRows(history, ids, { cadence, limit, from, to }) {
@@ -227,15 +266,16 @@ function groupHistoryRows(history, ids, { cadence, limit, from, to }) {
       const closing = groups.at(-1);
       if (!closing) return [];
       const complete = groups.every(Boolean);
-      return [{ ...closing, dailyReturn: compound(groups, 'dailyReturn', complete),
+      return [{ ...closing, equalAnchor: finite(closing.dailyReturn), capAnchor: finite(closing.capWeightedDaily),
+        dailyReturn: compound(groups, 'dailyReturn', complete),
         capWeightedDaily: compound(groups, 'capWeightedDaily', complete) }];
     }),
-  })) : daily;
+  })) : alignedHistory(daily, from, to);
   const visible = periods.slice(-limit);
-  const indexed = new Map(ids.map((id) => [id, indexSeries(visible.map((row) => row.groups.find((group) => group.id === id) || {}),
-    [['dailyReturn', 'index'], ['capWeightedDaily', 'capWeightIndex']])]));
+  const indexed = new Map(ids.map((id) => [id, indexSeries(visible.map((row) => row.groups?.find((group) => group.id === id) || {}),
+    [['dailyReturn', 'index', 'equalAnchor'], ['capWeightedDaily', 'capWeightIndex', 'capAnchor']])]));
   return visible.map(({ date, groups }, position) => ({
-    date, groups: groups.map(({ id }) => indexed.get(id)[position]),
+    date, groups: (groups || []).map(({ id }) => indexed.get(id)[position]),
   }));
 }
 
@@ -297,7 +337,10 @@ function workspaceDefinition(kind, input) {
     case 'universe': return validateUniverse({ ...value, members: validMembers(value.members, { dated: true }) });
     case 'screen':
       validateScreen(value);
-      return value;
+      if (value.rankingPeriod) rankingPeriod(value);
+      if (value.rankingList) rankingList(value);
+      if (value.rankingPeriod && value.rankingList) throw asError('Choose a period or an RS signal list');
+      return { ...value, context: savedScreenContext(value) };
     case 'watchlist': return { mode: value.screenId ? 'dynamic' : 'manual', screenId: value.screenId || null, members: validMembers(value.members) };
     case 'theme': return { members: validMembers(value.members, { dated: true }) };
     case 'health-model':
@@ -307,9 +350,90 @@ function workspaceDefinition(kind, input) {
       if (!['breadth', 'stocks', 'screen', 'industry', 'regime'].includes(value.type)) throw asError('Unknown alert type');
       if (value.type === 'stocks') validateFilter(value.filter);
       if (value.type === 'breadth' && (!breadthMetric(value.metric) || !finite(value.threshold))) throw asError('Choose a breadth metric and a threshold');
+      if (value.type === 'breadth' && value.trigger != null && !['crossing', 'surge'].includes(value.trigger)) throw asError('Unknown breadth trigger');
+      if (value.type === 'breadth' && value.trigger === 'surge' && (!(value.threshold > 0 && value.threshold <= 200)
+          || !Number.isInteger(value.lookback) || value.lookback < 1 || value.lookback > 252)) {
+        throw asError('Choose a positive percentage-point change and a 1–252 session lookback');
+      }
       return value;
     default: return value;
   }
+}
+
+function savedScreenContext(definition) {
+  const context = { ...definition.context };
+  if (definition.dateMode === 'latest') {
+    delete context.date;
+    delete context.dataVersion;
+  }
+  return context;
+}
+
+function rankingPeriod(input) {
+  const period = rankingPeriods.find(({ id }) => id === input.rankingPeriod);
+  if (!period) throw asError('Choose a supported leadership period');
+  const topPercent = input.topPercent == null || input.topPercent === '' ? 2 : Number(input.topPercent);
+  if (!finite(topPercent) || topPercent < 0.1 || topPercent > 100) throw asError('Top percentage must be between 0.1 and 100');
+  return { ...period, topPercent };
+}
+
+function rankingList(input) {
+  const list = rankingLists.find(({ id }) => id === input.rankingList);
+  if (!list) throw asError('Choose a supported RS signal list');
+  return list;
+}
+
+function listFilter(input, field) {
+  const membership = { field, op: 'true' };
+  return input.filter ? { operator: 'and', filters: [membership, input.filter] } : membership;
+}
+
+function periodScreen(snapshot, input) {
+  const period = rankingPeriod(input);
+  const field = `return_${period.sessions}d`;
+  const ranks = rankBy(snapshot.stocks, (row) => row.traded ? row[field] : null);
+  const cutoff = Math.ceil(ranks.size * period.topPercent / 100);
+  const stocks = snapshot.stocks.map((row) => {
+    const ranking = ranks.get(row.securityId);
+    return { ...row, periodRank: ranking?.rank ?? null, periodPercentile: ranking?.percentile ?? null,
+      periodReturn: ranking ? row[field] : null, periodLeader: !!ranking && ranking.rank <= cutoff };
+  });
+  return {
+    snapshot: { ...snapshot, stocks },
+    input: { ...input, filter: listFilter(input, 'periodLeader'),
+      sort: input.sort || [{ field: 'periodRank', direction: 'asc' }], columns: input.columns || periodColumns },
+    period: { ...period, comparable: ranks.size, cutoff, priceMode: 'split',
+      selection: 'The cutoff rounds up to a whole stock. Equal returns share a percentile; permanent security ID breaks ties for list membership.' },
+  };
+}
+
+function signalScreen(snapshot, input) {
+  const list = rankingList(input);
+  const ranked = snapshot.stocks.filter((row) => row.traded && finite(row.rsRank));
+  const bestByIndustry = new Map();
+  let unclassified = 0;
+  if (list.id === 'industry-leaders') {
+    for (const row of ranked) {
+      if (!row.industryId) unclassified++;
+      else if ((bestByIndustry.get(row.industryId)?.rsRank ?? Infinity) > row.rsRank) bestByIndustry.set(row.industryId, row);
+    }
+  }
+  const industryWinners = new Set([...bestByIndustry.values()].map(({ securityId }) => securityId));
+  const matchers = {
+    'top-rs': (row) => row.rsPercentile >= 90,
+    'fast-improvers': (row) => finite(row.velocity4w) && row.velocity4w > 0,
+    'new-top-decile': (row) => row.enteredTop10 === true,
+    'emerging-leaders': (row) => row.lifecycle === 'Emerging',
+    'industry-leaders': (row) => industryWinners.has(row.securityId),
+    'weakening-leaders': (row) => finite(row.velocity4w) && row.velocity4w < 0
+      && (row.rsPercentile >= 90 || row.rsPercentile - row.velocity4w >= 90),
+  };
+  const matches = new Set(ranked.filter(matchers[list.id]).map(({ securityId }) => securityId));
+  const stocks = snapshot.stocks.map((row) => ({ ...row, signalLeader: matches.has(row.securityId) }));
+  return { snapshot: { ...snapshot, stocks }, input: { ...input, filter: listFilter(input, 'signalLeader'),
+    sort: input.sort || [{ field: list.rankField, direction: list.direction || 'asc' }] },
+    list: { ...list, ranked: ranked.length, qualifying: matches.size,
+      ...(list.id === 'industry-leaders' ? { unclassified, industries: bestByIndustry.size } : {}) } };
 }
 
 function sessionsBetween(from, end) {
@@ -318,6 +442,9 @@ function sessionsBetween(from, end) {
 }
 
 function historicalScreen(engine, config, input, snapshot) {
+  if (input.rankingPeriod && input.rankingList) throw asError('Choose a period or an RS signal list');
+  const list = input.rankingPeriod ? periodScreen(snapshot, input) : input.rankingList ? signalScreen(snapshot, input) : null;
+  if (list) ({ snapshot, input } = list);
   const lags = new Map();
   function previous(field, id, period) {
     const lag = Number(period);
@@ -330,7 +457,27 @@ function historicalScreen(engine, config, input, snapshot) {
     return lags.get(lag).get(id)?.[field] ?? null;
   }
   const result = screenStocks(snapshot, input, { previous, all: exportFormats.includes(input.export) || input.all === true });
-  return { ...result, referenceDate: snapshot.referenceDate, referenceMode: snapshot.referenceMode, classificationSystem: snapshot.classificationSystem };
+  return { ...result, ...(list?.period ? { period: list.period } : {}), ...(list?.list ? { rankingList: list.list } : {}), referenceDate: snapshot.referenceDate,
+    referenceMode: snapshot.referenceMode, classificationSystem: snapshot.classificationSystem };
+}
+
+function screenDataNeeds(body) {
+  const source = JSON.stringify(body);
+  const context = body.context || {};
+  const definitions = [
+    ['windows', /\breturn_(\d+)d\b/g, DEFAULT_WINDOWS],
+    ['averages', /\b(?:ema|sma|vs_(?:ema|sma)|slope_(?:ema|sma)|above)_(\d+)d\b/g, AVERAGES],
+    ['volumeWindows', /\b(?:obv_slope|udv|rvol|adv|avg_volume|float_turnover|up_volume)_(\d+)d\b/g, [1, 10, 20, 50, 100]],
+  ];
+  return {
+    ...(/\bdistance_(?:all_time|loaded_history)_high\b/.test(source) ? { includeAllTimeHigh: true } : {}),
+    ...Object.fromEntries(definitions.flatMap(([key, pattern, builtIn]) => {
+      const additions = [...source.matchAll(pattern)].map(([, period]) => Number(period)).filter((period) => !builtIn.includes(period));
+      if (!additions.length) return [];
+      const configured = Array.isArray(context[key]) ? context[key] : context[key] ? String(context[key]).split(',') : [];
+      return [[key, [...new Set([...configured.map(Number), ...additions])]]];
+    })),
+  };
 }
 
 function resolveScreen(engine, config, body, { velocity = true } = {}) {
@@ -381,7 +528,30 @@ function workspaceDefaults(db) {
 }
 
 function localStatus(db) {
-  return { ...warehouseStatus(db), bootstrap: bootstrapProgress(db) };
+  const status = warehouseStatus(db);
+  return { ...status, bootstrap: bootstrapProgress(db), latestAnalysis: latestAnalysis(db, status.dataVersion) };
+}
+
+function latestAnalysis(db, version) {
+  const published = db.prepare(`SELECT date, data_version AS dataVersion, published_at AS publishedAt
+    FROM daily_publications WHERE calculation_version=? AND data_version<=?
+    ORDER BY date DESC, data_version DESC LIMIT 1`).get(CALCULATION_VERSION, version);
+  const prepared = db.prepare(`
+    SELECT json_extract(result,'$.date') AS date, json_extract(result,'$.dataVersion') AS dataVersion, updated_at AS publishedAt
+    FROM jobs WHERE type='production-precompute' AND status='complete'
+      AND json_extract(result,'$.calculationVersion')=?
+      AND json_extract(result,'$.dataVersion')<=?
+      AND json_extract(payload,'$.jobKey')=(? || json_extract(result,'$.date') || ':' || json_extract(result,'$.dataVersion'))
+      AND EXISTS (SELECT 1 FROM daily_publications p WHERE p.date=json_extract(jobs.result,'$.date')
+        AND p.calculation_version=? AND p.data_version<=json_extract(jobs.result,'$.dataVersion'))
+    ORDER BY date DESC, dataVersion DESC LIMIT 1
+  `).get(CALCULATION_VERSION, version, `production-precompute:${CALCULATION_VERSION}:`, CALCULATION_VERSION);
+  const requirePrecompute = process.env.MARKET_PRECOMPUTE === '1';
+  const ready = prepared && (requirePrecompute || !published || prepared.date > published.date
+    || prepared.date === published.date && prepared.dataVersion >= published.dataVersion)
+    ? { ...prepared, stage: 'production-precompute' }
+    : !requirePrecompute && published ? { ...published, stage: 'daily-publication' } : null;
+  return ready && { ...ready, calculationVersion: CALCULATION_VERSION };
 }
 
 function quality(db, engine, config) {
@@ -465,21 +635,29 @@ function updateAlerts(db, engine, params = {}) {
   let fired = 0;
   const at = new Date().toISOString();
   const persist = db.prepare('INSERT OR IGNORE INTO alert_events VALUES (?, ?, ?, ?)');
-  for (const rule of listWorkspace(db, 'alert-rule')) {
+  const rules = listWorkspace(db, 'alert-rule');
+  for (const rule of rules) {
     const def = rule.definition;
     if (def.active === false) continue;
-    const config = engine.context({ ...params, ...def.context });
+    const saved = def.type === 'screen' ? getWorkspace(db, 'screen', def.screenId) : null;
+    if (def.type === 'screen' && !saved) continue;
+    const config = engine.context({ ...params, ...def.context, ...saved?.definition.context,
+      ...(saved ? { date: params.date, dataVersion: params.dataVersion } : {}),
+      ...(def.type === 'breadth' ? { breadthKeys: [def.metric] } : screenDataNeeds(saved?.definition ?? def)) });
     if (!config.date) continue;
-    const dates = expectedSessions(shiftDate(config.date, -12), config.date);
-    const previousDate = dates.at(-2);
+    const lag = def.type === 'breadth' && def.trigger === 'surge' ? def.lookback : 1;
+    const dates = expectedSessions(shiftDate(config.date, -2 * lag - 16), config.date);
+    const previousDate = dates.at(-1 - lag);
     if (!previousDate) continue;
-    const beforeConfig = { ...config, date: previousDate };
+    const beforeConfig = { ...config, date: previousDate, requestedDate: previousDate };
     const stockRule = def.type === 'screen' || def.type === 'stocks';
     const current = engine.snapshot(config, { velocity: stockRule });
     const before = engine.snapshot(beforeConfig, { velocity: stockRule });
     const base = { ruleId: rule.id, name: rule.name, rule: def, date: config.date,
       observedAt: at, sourceTimestamp: db.prepare("SELECT finished_at FROM ingestion_runs WHERE version=? AND status='complete' LIMIT 1").get(config.dataVersion)?.finished_at || null,
-      universe: current.universe.id, dataVersion: config.dataVersion, coverage: current.coverage.state };
+      universe: current.universe.id, universeVersion: current.universe.version,
+      model: current.model.id, modelVersion: current.model.version, dataVersion: config.dataVersion, coverage: current.coverage.state,
+      ...(saved ? { screenId: saved.id, screenVersion: saved.version } : {}) };
     function event(subject, details) {
       fired += persist.run(rule.id, config.date, subject, JSON.stringify({ ...base, subject, ...details })).changes;
     }
@@ -487,21 +665,37 @@ function updateAlerts(db, engine, params = {}) {
       if ([current, before].some((snapshot) => snapshot.coverage.state !== 'complete') && def.context?.universe !== 'sample') continue;
       const todayValue = current.breadth[def.metric]?.value;
       const oldValue = before.breadth[def.metric]?.value;
-      if ([todayValue, oldValue].every(finite) && (def.direction === 'below'
-        ? oldValue >= def.threshold && todayValue < def.threshold : oldValue <= def.threshold && todayValue > def.threshold)) {
-        event('market', { metric: def.metric, value: todayValue, previous: oldValue });
+      if ([todayValue, oldValue].every(finite)) {
+        const change = todayValue - oldValue;
+        const down = def.direction === 'below';
+        const matches = def.trigger === 'surge' ? (down ? change <= -def.threshold : change >= def.threshold)
+          : down ? oldValue >= def.threshold && todayValue < def.threshold : oldValue <= def.threshold && todayValue > def.threshold;
+        if (matches) event('market', { metric: def.metric, value: todayValue, previous: oldValue, change, comparisonDate: previousDate,
+          trigger: def.trigger || 'crossing' });
       }
     }
     if (stockRule) {
-      const screen = def.type === 'screen' ? getWorkspace(db, 'screen', def.screenId)?.definition : { filter: def.filter };
-      if (!screen) continue;
-      const options = { ...screen, all: true };
-      const currentRows = historicalScreen(engine, config, options, current).rows;
-      const priorRows = historicalScreen(engine, beforeConfig, options, before).rows;
-      const active = new Set(currentRows.map(({ securityId }) => securityId));
-      const older = new Set(priorRows.map(({ securityId }) => securityId));
-      for (const row of currentRows) if (!older.has(row.securityId) && def.direction !== 'leaves') event(row.securityId, { symbol: row.symbol, action: 'enters' });
-      for (const row of priorRows) if (!active.has(row.securityId) && def.direction !== 'enters') event(row.securityId, { symbol: row.symbol, action: 'leaves' });
+      const screen = saved?.definition ?? { filter: def.filter };
+      const expression = def.type === 'stocks' ? screen.filter?.expression : null;
+      const options = expression ? { all: true, computed: [{ field: 'custom_alert_condition', expression }] } : { ...screen, all: true };
+      const latest = historicalScreen(engine, config, options, current).rows;
+      const previous = historicalScreen(engine, beforeConfig, options, before).rows;
+      const comparable = (snapshot) => new Set(snapshot.stocks.filter((row) => row.traded && alertComparable(def.filter, row)).map((row) => row.securityId));
+      const states = (selected, snapshot) => {
+        if (expression) return new Map(selected.map((row) => [row.securityId, row.custom_alert_condition]));
+        const comparableIds = def.type === 'stocks' ? comparable(snapshot) : new Set();
+        return new Map([...comparableIds].map((id) => [id, false]).concat(selected.map((row) => [row.securityId, true])));
+      };
+      const active = states(latest, current);
+      const older = states(previous, before);
+      const priorRows = new Map(previous.map((row) => [row.securityId, row]));
+      const currentRows = new Map(latest.map((row) => [row.securityId, row]));
+      for (const [id, state] of active) if (state === true && (saved ? !older.has(id) : older.get(id) === false) && def.direction !== 'leaves') {
+        event(id, { symbol: currentRows.get(id).symbol, action: 'enters' });
+      }
+      for (const [id, state] of older) if (state === true && (saved ? !active.has(id) : active.get(id) === false) && def.direction !== 'enters') {
+        event(id, { symbol: priorRows.get(id).symbol, action: 'leaves' });
+      }
     }
     if (def.type === 'industry') {
       const old = new Map(before.groups.map((group) => [group.id, group]));
@@ -519,7 +713,38 @@ function updateAlerts(db, engine, params = {}) {
       }
     }
   }
-  return { evaluated: listWorkspace(db, 'alert-rule').length, fired };
+  return { evaluated: rules.length, fired };
+}
+
+function alertComparable(filter, row) {
+  if (!filter) return true;
+  const children = filter.filters || filter.rules || filter.children;
+  if (children) return children.every((child) => alertComparable(child, row));
+  if (filter.expression) return false;
+  return filter.op === 'missing' || filter.op === 'present' || row[filter.field] != null
+    || /^udv_/.test(filter.field) && row[filter.field.replace(/^udv_/, 'udv_state_')] === 'infinity';
+}
+
+function divergenceLedger(db, engine, config, model, events, from, coverage = { coverageMode: 'verified' }) {
+  const recipe = createHash('sha256').update(JSON.stringify([
+    engine.definitionKey(config), config.universe.id, config.universe.version, config.model.id, config.model.version, model, coverage,
+  ])).digest('hex');
+  const key = [recipe, config.dataVersion, CALCULATION_VERSION];
+  if (events.length) {
+    db.exec(`CREATE TABLE IF NOT EXISTS divergence_events (
+      recipe TEXT NOT NULL, data_version INTEGER NOT NULL, calculation_version TEXT NOT NULL,
+      date TEXT NOT NULL, event TEXT NOT NULL, observed_at TEXT NOT NULL, payload TEXT NOT NULL,
+      PRIMARY KEY(recipe, data_version, calculation_version, date, event)
+    ) WITHOUT ROWID`);
+    const record = db.prepare('INSERT OR IGNORE INTO divergence_events VALUES (?,?,?,?,?,?,?)');
+    const observedAt = new Date().toISOString();
+    for (const event of events) record.run(...key, event.date, event.id, observedAt, JSON.stringify(event));
+  }
+  if (!db.prepare("SELECT 1 FROM sqlite_schema WHERE name='divergence_events'").get()) return [];
+  return db.prepare(`SELECT payload,observed_at FROM divergence_events
+    WHERE recipe=? AND data_version=? AND calculation_version=? AND date BETWEEN ? AND ? ORDER BY date,event`)
+    .all(...key, from || config.date, config.date).map(({ payload, observed_at }) => ({ ...JSON.parse(payload), observedAt: observed_at,
+      dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION }));
 }
 
 function materializationContext(config) {
@@ -529,7 +754,7 @@ function materializationContext(config) {
     basis: config.basis, classification: config.classification, reference: config.referenceMode,
     observedReferenceDate: config.observedReferenceDate, threshold: config.threshold,
     averages: config.averages, windows: config.windows, volumeWindows: config.volumeWindows,
-    breadthKeys: config.breadthKeys, themes: config.themes,
+    breadthKeys: config.breadthKeys, themes: config.themes, includeAllTimeHigh: config.includeAllTimeHigh,
   };
 }
 
@@ -612,10 +837,35 @@ function thinHistory(db, engine, config, options = {}, enqueue = null) {
   return { rows, materialization };
 }
 
-function marketHealth(db, engine, config, { model, history, snapshot = engine.snapshot(config) } = {}) {
-  let prior = history ?? (snapshot.coverage.state === 'complete'
-    ? thinHistory(db, engine, config, { limit: 45, materializedOnly: true }).rows : []);
-  if (snapshot.coverage.state === 'complete' && config.date) {
+function researchCoverage(input = {}) {
+  if (input.coverageMode != null && !['verified', 'observed'].includes(input.coverageMode)) throw asError('Choose verified or observed coverage');
+  if (input.coverageMode !== 'observed') return { coverageMode: 'verified' };
+  const numeric = (value, fallback) => value == null ? fallback
+    : (typeof value === 'number' || typeof value === 'string' && value.trim()) ? Number(value) : NaN;
+  const observedMinimum = numeric(input.observedMinimum, 20);
+  const observedThreshold = numeric(input.observedThreshold, 0.8);
+  if (!Number.isInteger(observedMinimum) || observedMinimum < 1 || observedMinimum > 100_000) {
+    throw asError('Observed minimum must be a whole number from 1 to 100,000');
+  }
+  if (!(observedThreshold > 0 && observedThreshold <= 1)) {
+    throw asError('Observed comparable fraction must be greater than 0 and at most 1');
+  }
+  return { coverageMode: 'observed', observedMinimum, observedThreshold };
+}
+
+function healthBaseline(model = DEFAULT_HEALTH_MODEL) {
+  const calibration = Object.values(model.calibration || {}).filter((entry) => entry.type === 'percentile')
+    .map((entry) => Number(entry.lookback ?? 252));
+  return Math.max(44, ...calibration, Number(model.changeLookback ?? 0), Number(model.benchmarkLookback ?? 0), Number(model.weaknessLookback ?? 0));
+}
+
+function marketHealth(db, engine, config, { model, history, snapshot = engine.snapshot(config), ...coverage } = {}) {
+  const eligible = snapshot.coverage.state === 'complete' || coverage.coverageMode === 'observed';
+  let prior = history ?? (eligible
+    ? thinHistory(db, engine, config, { limit: healthBaseline(model) + 1, materializedOnly: true }).rows : []);
+  const archivedCurrent = prior.find((row) => row.date === snapshot.date);
+  if (archivedCurrent) snapshot = { ...snapshot, aggregates: { ...snapshot.aggregates, ...archivedCurrent.aggregates } };
+  if (eligible && config.date) {
     const priorWeek = weekEnd(shiftDate(config.date, -28));
     const exact = expectedSessions(shiftDate(priorWeek, -4), priorWeek).at(-1);
     if (exact && !prior.some((row) => row.date === exact)) {
@@ -624,7 +874,7 @@ function marketHealth(db, engine, config, { model, history, snapshot = engine.sn
   }
   const first = prior.reduce((min, row) => row.date < min ? row.date : min, config.date);
   const sessions = first && config.date ? expectedSessions(first, config.date) : undefined;
-  return calculateMarketHealth(snapshot, { model, history: prior, sessions });
+  return calculateMarketHealth(snapshot, { model, history: prior, sessions, ...coverage });
 }
 
 function researchPrices(engine, config, ids, from, to) {
@@ -636,13 +886,33 @@ function researchPrices(engine, config, ids, from, to) {
   return prices;
 }
 
+function conditionMetrics(node) {
+  if (!node || typeof node !== 'object') return [];
+  const children = node.all || node.any;
+  return [node.metric, node.after?.metric, ...(Array.isArray(children) ? children.flatMap(conditionMetrics) : [])].filter((key) => breadthMetric(key));
+}
+
+function conditionLookback(node) {
+  if (!node || typeof node !== 'object') return 0;
+  const children = node.all || node.any;
+  return Math.max(['crossesAbove', 'crossesBelow'].includes(node.op) ? 1 : 0,
+    node.after ? parseCount(node.after.within, 1, 1008, 20) : 0,
+    ...(Array.isArray(children) ? children.map(conditionLookback) : []));
+}
+
 async function research(db, engine, kind, payload) {
-  const config = engine.context({ basis: 'known', ...payload.context });
+  const coverage = kind === 'event-study' ? researchCoverage(payload) : {};
+  const config = engine.context({ basis: 'known', ...payload.screen?.context, ...payload.context,
+    ...screenDataNeeds(payload.screen ?? {}),
+    ...(kind === 'event-study' ? { breadthKeys: conditionMetrics(payload.condition) } : {}) });
   const end = dateString(payload.asOf, config.latestDate);
   const start = dateString(payload.start, config.earliestDate);
   if (!start || !end) throw asError('Research requires imported trading sessions');
   if (end > config.latestDate) throw asError('Research end exceeds the latest available session');
-  const sessions = sessionsBetween(start, end);
+  const prior = kind === 'event-study' ? conditionLookback(payload.condition) : 0;
+  const beforeStart = prior ? expectedSessions(shiftDate(start, -2 * prior - 16), shiftDate(start, -1)).at(-prior) : start;
+  const supportFrom = !beforeStart || beforeStart < config.earliestDate ? config.earliestDate : beforeStart;
+  const sessions = sessionsBetween(supportFrom, end);
   if (kind === 'cohort') {
     const date = dateString(payload.date, config.date);
     if (!date || date < start || date > end || !isMarketSession(date)) throw asError('Cohort date is outside the trading session range');
@@ -659,13 +929,20 @@ async function research(db, engine, kind, payload) {
   }
   const dates = sessions.filter((date) => date <= dateString(payload.end, end));
   const symbols = Array.isArray(payload.benchmarks) ? payload.benchmarks.slice(0, 10).map(String) : [config.benchmark, 'QQQ', 'IWM'];
-  const observations = [];
+  const historyConfig = { ...config, date: end, requestedDate: end };
+  const archived = dates.length ? readMaterializedHistory(db, engine, historyConfig, { from: supportFrom,
+    to: dates.at(-1), limit: Math.min(7560, dates.length) }).rows : [];
+  const byDate = new Map(archived.map((row) => [row.date, row]));
+  const observations = dates.map((date) => byDate.get(date)
+    || project(engine.snapshot({ ...config, date, requestedDate: date }, { persist: false, cache: false })));
+  const options = { sessions, observations, condition: payload.condition,
+    horizons: payload.horizons, asOf: end, start, end: payload.end, overlap: payload.overlap, minEventGap: payload.minEventGap,
+    maePrice: payload.maePrice, ...coverage };
   const cohorts = new Map();
   const ids = new Set();
-  for (const date of dates) {
-    const snapshot = engine.snapshot({ ...config, date }, { persist: false, cache: false });
-    observations.push(project(snapshot));
-    if (payload.medianStocks) {
+  if (payload.medianStocks) {
+    for (const { date } of runEventStudy(options).events) {
+      const snapshot = engine.snapshot({ ...config, date, requestedDate: date }, { persist: false, cache: false });
       const members = snapshot.stocks.filter((row) => row.traded).map((row) => ({
         securityId: row.securityId, industry: row.industry, industryKnownAt: row.classificationKnownAt, delistingDate: row.delistingDate,
       }));
@@ -675,8 +952,9 @@ async function research(db, engine, kind, payload) {
   }
   const benchmarks = Object.fromEntries(researchPrices(engine, config, symbols, start, end));
   const securityPrices = payload.medianStocks ? researchPrices(engine, config, ids, start, end) : undefined;
-  return { ...runEventStudy({ sessions, observations, condition: payload.condition, benchmarks, cohorts, securityPrices,
-    horizons: payload.horizons, asOf: end, start, end: payload.end, overlap: payload.overlap, minEventGap: payload.minEventGap, maePrice: payload.maePrice }),
+  return { ...runEventStudy({ ...options, benchmarks, cohorts, securityPrices }),
+    observationSources: { archived: archived.length, computed: dates.length - archived.length,
+      ...(supportFrom < start ? { supportingSessions: dates.filter((date) => date < start).length } : {}) },
     priceAvailabilityBasis: config.basis, dataVersion: config.dataVersion };
 }
 
@@ -745,6 +1023,19 @@ function journalCsv(entries) {
 
 export async function performJob(db, type, payload, { provider = EodhdProvider(), progress = () => {}, journalClient } = {}) {
   const engine = createEngine(db);
+  if (type === 'leadership-transitions') {
+    const config = engine.context(payload.context || {});
+    if (!config.date || !config.earliestDate) throw asError('Load market history before comparing weekly leadership');
+    const count = parseCount(payload.weeks, 2, 25, 8);
+    const dates = expectedSessions(shiftDate(config.date, -7 * (count + 2)), config.date)
+      .filter((date) => date >= config.earliestDate && expectedSessions(shiftDate(weekEnd(date), -4), weekEnd(date)).at(-1) === date).slice(-count);
+    const snapshots = dates.map((date, index) => {
+      const snapshot = engine.snapshot({ ...config, date, requestedDate: date }, { persist: false, cache: false });
+      progress((index + 1) / dates.length);
+      return snapshot;
+    });
+    return { ...leadershipTransitionMatrix(snapshots), dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION };
+  }
   if (type === 'journal-generate') {
     if (!getJournalSettings(db).configured) throw new Error('Configure an Anthropic API key in Market Journal settings');
     const { config, context } = journalContext(db, engine, payload);
@@ -824,16 +1115,27 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
       }
       progress(0.7 + 0.3 * (index + 1) / dates.length);
     }
-    if (!published.length && sourceError) throw sourceError;
-    if (payload.verifiedOnly && !published.length && stillPending.length) {
+    const hasPublication = published.length > 0 || alreadyPublished.length > 0;
+    if (!hasPublication && sourceError) throw sourceError;
+    if (payload.verifiedOnly && !hasPublication && stillPending.length) {
       throw new Error('Finalized price response was too incomplete to publish analytics');
     }
     if (sourceError) result.warnings.push(sourceError.message);
+    if (stillPending.length) {
+      result.warnings.push(`Verified analytics remain pending for ${stillPending.length} requested trading session${stillPending.length === 1 ? '' : 's'} with incomplete coverage.`);
+    }
     return { ...result, published, alreadyPublished, stillPending };
   }
   if (type === 'workspace-precompute') return precomputeWorkspace(db, engine, engine.context(payload.context || {}), { ...payload, progress });
-  if (type === 'production-precompute') return precomputeProduction(db, engine,
-    engine.context({ ...workspaceDefaults(db), ...payload.context }), { ...payload, progress });
+  if (type === 'production-precompute') {
+    const config = engine.context({ ...workspaceDefaults(db), ...payload.context });
+    const result = precomputeProduction(db, engine, config, { ...payload, progress });
+    const history = readMaterializedHistory(db, engine, config, { limit: 45 }).rows;
+    const sessions = history.length ? expectedSessions(history[0].date, config.date) : [];
+    divergenceLedger(db, engine, config, DEFAULT_HEALTH_MODEL,
+      marketHealthHistory(history, { sessions }).flatMap((day) => day.divergences), history[0]?.date);
+    return result;
+  }
   if (type === 'rank-materialize') return writeRankArchive(db, engine, engine.context(payload.context || {}), { ...payload, progress });
   if (type === 'materialize') {
     const config = engine.context(payload.context || {});
@@ -845,18 +1147,101 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
   throw asError('Unknown background job');
 }
 
+function checkpointJobWrites(db) {
+  if (db.isTransaction || !db.location()) return;
+  try {
+    const { busy, log, checkpointed } = db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();
+    if (busy || log <= 0 || log !== checkpointed) return;
+    const { timeout } = db.prepare('PRAGMA busy_timeout').get();
+    db.exec('PRAGMA busy_timeout=0');
+    try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get(); }
+    finally { db.exec(`PRAGMA busy_timeout=${timeout}`); }
+  } catch {
+    // Checkpoint contention or failure must not change the outcome of a finished job.
+  }
+}
+
+export async function runQueuedJob(db, job, { provider, journalClient } = {}) {
+  try {
+    const progress = (step) => updateJob(db, job.id, 'running', Math.max(1, Math.min(99, Math.round(step * 99))));
+    const result = await performJob(db, job.type, job.payload, { provider, journalClient, progress });
+    updateJob(db, job.id, 'complete', 100, result);
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    updateJob(db, job.id, 'failed', 0, null, error.message);
+  } finally {
+    checkpointJobWrites(db);
+  }
+}
+
 export function createService({ db, provider, journalClient, workers = true } = {}) {
   const engine = createEngine(db);
   const workerPath = new URL('./job-worker.mjs', import.meta.url);
-  const runInline = async (job) => {
+  let pumpScheduled = false;
+  let activeJob = null;
+
+  function schedulePump(wait = 0) {
+    if (pumpScheduled || activeJob || !db.isOpen) return;
+    pumpScheduled = true;
+    const run = () => {
+      pumpScheduled = false;
+      startNext();
+    };
+    if (wait) setTimeout(run, wait).unref();
+    else setImmediate(run);
+  }
+
+  function finishJob(job, error) {
+    if (activeJob !== job.id) return;
     try {
-      updateJob(db, job.id, 'running', 1);
-      const result = await performJob(db, job.type, job.payload, { provider, journalClient, progress: (step) => updateJob(db, job.id, 'running', Math.round(step * 99)) });
-      updateJob(db, job.id, 'complete', 100, result);
-    } catch (error) {
-      updateJob(db, job.id, 'failed', 0, null, error.message);
+      if (db.isOpen) {
+        const current = db.prepare('SELECT status FROM jobs WHERE id=?').get(job.id);
+        if (current?.status === 'running') {
+          updateJob(db, job.id, 'failed', 0, null, error || 'Background worker exited before reporting a result');
+        }
+      }
+    } catch (writeError) {
+      console.error('Background job result could not be recorded:', writeError.message);
+      setTimeout(() => finishJob(job, error), 1000).unref();
+      return;
     }
-  };
+    activeJob = null;
+    schedulePump();
+  }
+
+  function startNext() {
+    if (activeJob || !db.isOpen) return;
+    if (db.isTransaction) { schedulePump(1000); return; }
+    let job;
+    try {
+      const waiting = db.prepare("SELECT id FROM jobs WHERE status='queued' ORDER BY rowid LIMIT 1").get();
+      if (!waiting) return;
+      const claimed = db.prepare(`UPDATE jobs SET status='running',progress=1,updated_at=?
+        WHERE id=? AND status='queued' AND NOT EXISTS (SELECT 1 FROM jobs WHERE status='running') RETURNING id`)
+        .get(new Date().toISOString(), waiting.id);
+      if (!claimed) { schedulePump(1000); return; }
+      activeJob = claimed.id;
+      job = jobById(db, claimed.id);
+    } catch (error) {
+      if (activeJob) finishJob({ id: activeJob }, error.message);
+      else {
+        console.error('Background job dispatch could not claim a queued job:', error.message);
+        schedulePump(1000);
+      }
+      return;
+    }
+    if (!(workers && !provider && !journalClient && db.location())) {
+      runQueuedJob(db, job, { provider, journalClient }).then(() => finishJob(job), (error) => finishJob(job, error.message));
+      return;
+    }
+    try {
+      let failure;
+      const worker = new Worker(workerPath, { workerData: { filename: db.location(), job }, execArgv: [] });
+      worker.once('error', (error) => { failure = error.message; });
+      worker.once('exit', (code) => finishJob(job, failure || (code === 0 ? null : `Background worker exited with code ${code}`)));
+    } catch (error) { finishJob(job, error.message); }
+  }
+
   function enqueue(type, payload, key = null) {
     let job;
     if (key) {
@@ -867,6 +1252,7 @@ export function createService({ db, provider, journalClient, workers = true } = 
           AND json_extract(payload, '$.jobKey')=? ORDER BY created_at DESC LIMIT 1`).get(type, Number(retainAttempt), key);
         if (existing) {
           db.exec('COMMIT');
+          schedulePump();
           return jobById(db, existing.id);
         }
         job = createJob(db, type, { ...payload, jobKey: key });
@@ -876,13 +1262,11 @@ export function createService({ db, provider, journalClient, workers = true } = 
         throw error;
       }
     } else job = createJob(db, type, payload);
-    if (workers && !provider && !journalClient && db.location()) {
-      const worker = new Worker(workerPath, { workerData: { filename: db.location(), job }, execArgv: [] });
-      worker.on('error', (error) => updateJob(db, job.id, 'failed', 0, null, error.message));
-      worker.on('exit', (code) => { if (code !== 0 && jobById(db, job.id)?.status !== 'failed') updateJob(db, job.id, 'failed', 0, null, 'Background worker exited'); });
-    } else setImmediate(runInline, job);
+    schedulePump();
     return job;
   }
+
+  if (db.prepare("SELECT 1 FROM jobs WHERE status='queued' LIMIT 1").get()) schedulePump();
 
   function velocityOptions(config) {
     if (!requiresArchive(db) || engine.snapshotAvailable(config, { velocity: true })) return { velocity: true };
@@ -891,6 +1275,14 @@ export function createService({ db, provider, journalClient, workers = true } = 
     const context = materializationContext(config);
     const key = createHash('sha256').update(JSON.stringify(['workspace', context])).digest('hex');
     return { velocity: false, materialization: pendingJob(enqueue('workspace-precompute', { context }, key)) };
+  }
+
+  function pendingScreen(config, options, body = {}) {
+    const needsSignal = body.rankingList && rankingList(body).needsVelocity;
+    if (!(config.includeAllTimeHigh || needsSignal) || !options.materialization) return null;
+    return response({ date: config.date, dataVersion: config.dataVersion, rows: [], total: null,
+      columns: validateScreen(body).columns, pendingOnly: true,
+      pendingReason: needsSignal ? 'Weekly RS signals' : 'Verified high history', ...options }, 202);
   }
 
   async function dispatch({ method = 'GET', url = '/', body = {} } = {}) {
@@ -902,6 +1294,12 @@ export function createService({ db, provider, journalClient, workers = true } = 
       const asContext = (extra = {}) => {
         const config = engine.context({ ...query, ...extra });
         return bootstrapProgress(db, { activeOnly: true }) ? { ...config, currentVersion: false } : config;
+      };
+      const listContext = (extra = {}) => {
+        const requested = { ...query, ...extra };
+        if (requested.date || requested.dataVersion) return asContext(extra);
+        const ready = latestAnalysis(db, dataVersion(db));
+        return asContext(ready ? { ...extra, date: ready.date, dataVersion: ready.dataVersion } : extra);
       };
       const rowPage = () => [parseCount(query.page, 1, 100_000, 1), parseCount(query.perPage, 1, 250, 50)];
 
@@ -1014,7 +1412,7 @@ export function createService({ db, provider, journalClient, workers = true } = 
           universes: [...UNIVERSES, ...listWorkspace(db, 'universe')],
           models: [...BUILTIN_MODELS, ...listWorkspace(db, 'ranking-model')],
           healthModels: [DEFAULT_HEALTH_MODEL, ...listWorkspace(db, 'health-model')],
-          rankingMethods: RANKING_METHODS, breadthMetrics: BREADTH_METRICS, columns: defaultColumns,
+          rankingMethods: RANKING_METHODS, rankingPeriods, rankingLists, breadthMetrics: BREADTH_METRICS, columns: defaultColumns,
           benchmarks: [...new Set([...BENCHMARKS, ...observedBenchmarks])], availableBenchmarks: observedBenchmarks,
           ...classificationStatus(db),
           status: localStatus(db), exportFormats: await parquetAvailable() ? exportFormats : ['csv'],
@@ -1024,6 +1422,18 @@ export function createService({ db, provider, journalClient, workers = true } = 
         const requestedMetrics = query.metrics ? String(query.metrics).split(',').filter((key) => breadthMetric(key) || key === 'adSpread') : [];
         const keys = [...new Set(requestedMetrics.length ? requestedMetrics : item === 'monitor' ? monitorMetrics : [])].slice(0, 24);
         const config = asContext({ breadthKeys: [item === 'breadth' ? action : null, ...keys].filter(Boolean) });
+        if (item === 'analogs') {
+          const coverage = researchCoverage(query);
+          const horizon = parseCount(query.horizon, 1, 126, 20);
+          const source = thinHistory(db, engine, config, { cadence: 'daily', limit: parseCount(query.historyLimit, 30, 2600, 252) }, enqueue);
+          const sessions = source.rows.length ? expectedSessions(source.rows[0].date, config.date) : [];
+          if (source.materialization?.pending || sessions.length < 2) {
+            return response({ matches: [], materialization: source.materialization, asOf: config.date,
+              descriptive: coverage.coverageMode === 'observed', ...coverage });
+          }
+          return response({ ...findHistoricalAnalogs({ snapshots: source.rows, sessions, asOf: config.date, horizon,
+            limit: parseCount(query.limit, 1, 30, 10), ...coverage }), materialization: source.materialization, dataVersion: config.dataVersion });
+        }
         if (item === 'monitor') {
           const metrics = keys.map((key) => {
             const definition = breadthMetric(key);
@@ -1041,7 +1451,8 @@ export function createService({ db, provider, journalClient, workers = true } = 
             .filter((row) => !query.from || row.date >= query.from).slice(-limit);
           if (exportFormats.includes(query.export) && source.materialization?.pending) return response({ materialization: source.materialization }, 202);
           if (exportFormats.includes(query.export)) return await exportTable(rows,
-            ['date', ...keys, ...ratioDefinitions.map(({ key }) => key), 'coverage', 'eligible', 'traded'],
+            ['date', ...historyColumns(keys), ...keys.map((key) => `${key}_extreme_percentile`),
+              ...ratioDefinitions.flatMap(({ key }) => [key, `${key}_state`, `${key}_numerator`, `${key}_denominator`]), 'coverage', 'eligible', 'traded'],
             'market-monitor', query.export, config);
           const snapshot = engine.snapshot(config);
           return response({ date: config.date, coverage: snapshot.coverage, metrics, rows, ratioDefinitions, extremeDefinition,
@@ -1054,9 +1465,13 @@ export function createService({ db, provider, journalClient, workers = true } = 
           const traded = stocks.filter((row) => row.traded);
           const leaders = traded.filter(({ rsRank }) => rsRank != null).sort((a, b) => a.rsRank - b.rsRank).slice(0, 8);
           const movers = traded.filter((row) => finite(row.return_1d)).sort((a, b) => b.return_1d - a.return_1d);
+          const model = chooseHealthModel(db, query.healthModel);
+          const support = snapshot.coverage.state === 'complete' && healthBaseline(model) > 44
+            ? thinHistory(db, engine, config, { limit: healthBaseline(model) + 1, cadence: 'daily' }, enqueue) : null;
           return response({ ...thin, groups: thin.groups.slice(0, 12).map(({ memberIds, ...group }) => group), leaders,
             movers: { gainers: movers.slice(0, 5), losers: movers.slice(-5).reverse() },
-            health: marketHealth(db, engine, config, { snapshot, model: chooseHealthModel(db, query.healthModel) }) });
+            ...(support?.materialization ? { materialization: support.materialization } : {}),
+            health: marketHealth(db, engine, config, { snapshot, model, history: support?.rows }) });
         }
         if (item === 'breadth') {
           if (sub === 'contributors') {
@@ -1069,7 +1484,8 @@ export function createService({ db, provider, journalClient, workers = true } = 
             return response(result);
           }
           if (query.series === '1' || query.from || query.to) {
-            const keys = String(query.metrics || action || 'above_50d,above_200d,up_4pct,down_4pct').split(',').filter((key) => breadthMetric(key) || key === 'adSpread');
+            const keys = String(query.metrics || action || 'above_50d,above_200d,up_4pct,down_4pct').split(',')
+              .filter((key) => breadthMetric(key) || key === 'adSpread' || leadershipHistoryMetrics.has(key));
             const limit = parseCount(query.limit, 1, query.materializedOnly ? 7560 : 260, 80);
             const dailyLimit = query.cadence === 'weekly' ? Math.min(7560, limit * 5) : limit;
             const requestedFrom = dateString(query.from, null);
@@ -1079,10 +1495,15 @@ export function createService({ db, provider, journalClient, workers = true } = 
               cadence: 'daily', limit: Math.min(7560, dailyLimit + (onlyStored ? 0 : extremeDefinition.lookback)),
               materializedOnly: onlyStored, visibleRequested: limit }, enqueue);
             const mapped = formatHistory(history.rows, keys).filter((row) => !requestedFrom || row.date >= requestedFrom);
-            const rows = (query.cadence === 'weekly'
-              ? mapped.filter((row, index) => !mapped[index + 1] || weekEnd(row.date) !== weekEnd(mapped[index + 1].date)) : mapped).slice(-limit);
+            const rows = marketHistoryRows(mapped, { cadence: query.cadence, limit,
+              from: requestedFrom, to: query.to && query.to < config.date ? query.to : config.date });
             if (exportFormats.includes(query.export) && history.materialization?.pending) return response({ materialization: history.materialization }, 202);
-            if (exportFormats.includes(query.export)) return await exportTable(rows, ['date', ...keys, 'coverage', 'eligible', 'traded'], 'market-history', query.export, config);
+            if (exportFormats.includes(query.export)) {
+              const leadership = keys.filter((key) => leadershipHistoryMetrics.has(key));
+              return await exportTable(rows, ['date', ...historyColumns(keys.filter((key) => !leadershipHistoryMetrics.has(key))),
+                ...leadership, ...(leadership.length ? leadershipHistoryContext : []), 'equalWeight', 'capWeight',
+                'equalWeightIndex', 'capWeightIndex', 'largestPositiveDollarShare', 'coverage', 'eligible', 'traded'], 'market-history', query.export, config);
+            }
             return response({ date: config.date, metrics: keys, rows, materialization: history.materialization, dataVersion: config.dataVersion });
           }
           const snap = engine.snapshot(config);
@@ -1090,32 +1511,44 @@ export function createService({ db, provider, journalClient, workers = true } = 
             classificationSystem: snap.classificationSystem, coverage: snap.coverage, metrics: action ? { [action]: snap.breadth[action] } : snap.breadth });
         }
         if (item === 'health' || item === 'events') {
+          const coverage = researchCoverage(query);
           const snapshot = engine.snapshot(config);
           const model = chooseHealthModel(db, query.healthModel);
-          const source = snapshot.coverage.state === 'complete' || query.series === '1' || item === 'events'
-            ? thinHistory(db, engine, config, { ...query, cadence: 'daily', limit: parseCount(query.limit, 1, 260, 45) }, enqueue) : { rows: [] };
-          const health = marketHealth(db, engine, config, { model, history: source.rows, snapshot });
-          const series = query.series === '1' || item === 'events' ? marketHealthHistory(source.rows, { model }) : [];
-          return response(item === 'events' ? { date: config.date, events: series.flatMap((day) => day.divergences), materialization: source.materialization }
-            : { ...health, history: series, materialization: source.materialization });
+          const visible = parseCount(query.limit, 1, 260, 45);
+          const warmup = healthBaseline(model);
+          const requestedFrom = dateString(query.from, null);
+          const source = snapshot.coverage.state === 'complete' || coverage.coverageMode === 'observed' || query.series === '1' || item === 'events'
+            ? thinHistory(db, engine, config, { ...query, cadence: 'daily', limit: visible + warmup, visibleRequested: visible,
+              from: requestedFrom && shiftDate(requestedFrom, -2 * warmup - 16) }, enqueue) : { rows: [] };
+          const health = marketHealth(db, engine, config, { model, history: source.rows, snapshot, ...coverage });
+          const sessions = source.rows.length ? expectedSessions(source.rows[0].date, source.rows.at(-1).date) : [];
+          const all = query.series === '1' || item === 'events' ? marketHealthHistory(source.rows, { model, sessions, ...coverage }) : [];
+          const series = all.filter((row) => !requestedFrom || row.date >= requestedFrom).slice(-visible);
+          const events = divergenceLedger(db, engine, config, model, series.flatMap((day) => day.divergences), series[0]?.date, coverage);
+          return response(item === 'events' ? { date: config.date, events, ...coverage, materialization: source.materialization }
+            : { ...health, events, history: series, materialization: source.materialization });
         }
       }
       if (area === 'rankings' && method === 'GET') {
-        const config = asContext();
+        const config = query.series === '1' ? asContext() : listContext();
         if (query.series === '1') {
           return response(rankSeries(db, engine, config, { ...query, cadence: query.cadence || 'weekly',
             limit: parseCount(query.limit, 1, 7560, 60) }, enqueue));
         }
         const options = velocityOptions(config);
-        const result = resolveScreen(engine, config, { ...query, sort: [{ field: 'rsRank', direction: 'asc' }] }, options);
+        const pending = pendingScreen(config, options, query);
+        if (pending) return pending;
+        const result = resolveScreen(engine, config, query, options);
         return response({ ...result, ...options, model: config.model, universe: config.universe, dataVersion: config.dataVersion });
       }
       if (area === 'screens' && item === 'query' && method === 'POST') {
-        const config = asContext(body.context);
+        const config = listContext({ ...body.context, ...screenDataNeeds(body) });
         const options = velocityOptions(config);
+        const pending = pendingScreen(config, options, body);
+        if (pending) return pending;
         const result = resolveScreen(engine, config, body, options);
         if (exportFormats.includes(body.export)) return await exportTable(result.rows, result.columns.length ? result.columns : defaultColumns, 'market-screen', body.export, config);
-        return response({ ...result, ...options });
+        return response({ ...result, ...options, dataVersion: config.dataVersion });
       }
       if (area === 'stocks' && method === 'GET' && item) {
         const config = asContext();
@@ -1124,9 +1557,13 @@ export function createService({ db, provider, journalClient, workers = true } = 
           const saved = listWorkspace(db, 'screen');
           const matched = [];
           for (const screen of saved) {
-            const screenConfig = engine.context({ ...screen.definition.context, ...query,
+            const screenConfig = engine.context({ ...query, ...savedScreenContext(screen.definition), ...screenDataNeeds(screen.definition),
               date: config.date, dataVersion: config.dataVersion });
-            const snapshot = engine.snapshot(screenConfig, velocityOptions(screenConfig));
+            const options = velocityOptions(screenConfig);
+            const pending = pendingScreen(screenConfig, options, screen.definition);
+            if (pending) return response({ date: config.date, screens: matched, evaluated: null,
+              pendingOnly: true, materialization: options.materialization }, 202);
+            const snapshot = engine.snapshot(screenConfig, options);
             const filters = [screen.definition.filter, { field: 'securityId', op: 'eq', value: security.id }].filter(Boolean);
             const results = historicalScreen(engine, screenConfig, { ...screen.definition, page: 1, perPage: 1,
               filter: { operator: 'and', filters } }, snapshot);
@@ -1156,15 +1593,13 @@ export function createService({ db, provider, journalClient, workers = true } = 
           classificationSystem: snap.classificationSystem, coverage: snap.coverage, groups: snap.groups.filter((group) => !query.level || group.level === query.level) });
         if (item === 'compare') {
           const ids = String(query.ids || '').split(',').filter(Boolean).slice(0, 8);
-          const { rows: history, materialization } = thinHistory(db, engine, config, { ...query, limit: parseCount(query.limit, 1, 260, 80) }, enqueue);
-          const indices = new Map(ids.map((id) => [id, 100]));
-          return response({ date: snap.date, materialization, rows: history.map((day) => ({ date: day.date,
-            groups: day.groups.filter((group) => ids.includes(group.id)).map((group) => {
-              const base = indices.get(group.id);
-              const next = finite(group.dailyReturn) ? base * (1 + group.dailyReturn) : null;
-              if (next != null) indices.set(group.id, next);
-              return { ...group, index: next };
-            }) })) });
+          const limit = parseCount(query.limit, 1, 260, 80);
+          const cadence = query.cadence === 'weekly' ? 'weekly' : 'daily';
+          const { rows: history, materialization } = thinHistory(db, engine, config, { ...query, cadence: 'daily',
+            limit: cadence === 'weekly' ? limit * 5 : limit, visibleRequested: limit }, enqueue);
+          const rows = groupHistoryRows(history, ids, { cadence, limit, from: query.from,
+            to: query.to && query.to < config.date ? query.to : config.date });
+          return response({ date: snap.date, cadence, materialization, rows });
         }
         const group = exists(snap.groups.find((g) => g.id === item), 'Industry group');
         if (action === 'members') {
@@ -1174,9 +1609,10 @@ export function createService({ db, provider, journalClient, workers = true } = 
         return response(group);
       }
       if (area === 'research' && method === 'POST') {
-        if (item === 'event-studies') return response(enqueue('event-study', body), 202);
+        if (item === 'event-studies') return response(enqueue('event-study', { ...body, ...researchCoverage(body) }), 202);
+        if (item === 'leadership-transitions') return response(enqueue('leadership-transitions', body), 202);
         if (item === 'cohorts') {
-          const config = asContext(body.context);
+          const config = asContext({ ...body.screen?.context, ...body.context, ...screenDataNeeds(body.screen ?? {}) });
           const date = dateString(body.date, config.date);
           if (body.name && date) {
             const selected = resolveScreen(engine, { ...config, date }, { ...body.screen, all: true });
@@ -1208,23 +1644,30 @@ export function createService({ db, provider, journalClient, workers = true } = 
             return response(storeWorkspace(db, kind, { name: body.name || `${saved.name} copy`, definition: saved.definition }), 201);
           }
           if (method === 'POST' && action === 'execute' && kind === 'screen') {
-            const config = asContext({ ...saved.definition.context, ...body.context });
+            const config = listContext({ ...savedScreenContext(saved.definition), ...body.context, ...screenDataNeeds({ ...saved.definition, ...body }) });
             const options = velocityOptions(config);
+            const pending = pendingScreen(config, options, { ...saved.definition, ...body });
+            if (pending) return pending;
             const result = resolveScreen(engine, config, { ...saved.definition, ...body }, options);
             if (exportFormats.includes(body.export)) return await exportTable(result.rows, result.columns.length ? result.columns : defaultColumns, 'saved-screen', body.export, config);
-            return response({ ...result, ...options });
+            return response({ ...result, ...options, dataVersion: config.dataVersion });
           }
           if (method === 'POST' && action === 'execute' && kind === 'cohort') return response(enqueue('cohort', { ...saved.definition, ...body }), 202);
           if (kind === 'watchlist' && action === 'members' && method === 'GET') {
-            const config = asContext();
-            const options = velocityOptions(config);
-            const snapshot = engine.snapshot(config, options);
             const screen = saved.definition.screenId && getWorkspace(db, 'screen', saved.definition.screenId);
             if (screen) {
-              const screenConfig = asContext({ ...screen.definition.context, ...query });
+              const screenConfig = listContext({ ...savedScreenContext(screen.definition), ...screenDataNeeds(screen.definition) });
               const screenOptions = velocityOptions(screenConfig);
-              return response({ ...resolveScreen(engine, screenConfig, { ...screen.definition, ...query }, screenOptions), ...screenOptions });
+              const pending = pendingScreen(screenConfig, screenOptions, screen.definition);
+              if (pending) return pending;
+              return response({ ...resolveScreen(engine, screenConfig, { ...screen.definition, page: query.page, perPage: query.perPage }, screenOptions),
+                ...screenOptions, dataVersion: screenConfig.dataVersion });
             }
+            const config = asContext();
+            const options = velocityOptions(config);
+            const pending = pendingScreen(config, options);
+            if (pending) return pending;
+            const snapshot = engine.snapshot(config, options);
             const wanted = new Set(saved.definition.members);
             const list = snapshot.stocks.filter((stock) => wanted.has(stock.securityId));
             const included = new Set(list.map((stock) => stock.securityId));

@@ -2,10 +2,11 @@ import { gzipSync, gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { referenceArchiveScopes, reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import { prepareRankArchiveWriter } from './rank-archive.mjs';
-import { expectedSessions, weekEnd } from './calendar.mjs';
+import { leadershipStatistics, topDecileIds } from './ranking.mjs';
+import { expectedSessions, shiftDate, weekEnd } from './calendar.mjs';
 import { CALCULATION_VERSION, isoDate, listWorkspace } from './database.mjs';
 
-const PROJECTION_VERSION = 1;
+const PROJECTION_VERSION = 2;
 const MAX_SESSIONS = 7560;
 
 const createMarketHistory = `
@@ -45,9 +46,11 @@ function archiveRows(db, config, key, dates, withValues = false) {
 
 const thinGroupFields = [
   'id', 'level', 'name', 'parent', 'count', 'rankedCount', 'rank', 'percentile', 'medianRS', 'meanRS',
-  'equalWeight', 'dailyReturn', 'capWeightedDaily', 'relativeReturn', 'parentRelativeRS', 'marketCap',
+  'equalWeight', 'dailyReturn', 'capWeightedDaily', 'relativeReturn', 'parentRelativeRS', 'parentRelativeReturn', 'marketCap',
   'topDecile', 'above50', 'above200', 'positiveMomentum', 'newHighBreadth', 'upDownDollar', 'upDollar', 'downDollar',
-  'leadingConcentration', 'counts', 'velocity4w', 'velocity12w', 'rankChange4w', 'rankChange12w', 'breadthChange',
+  'leadingConcentration', 'largestPositiveDollarShare', 'emergingLeaderCount', 'emergingLeaderObservations',
+  'counts', 'velocity4w', 'velocity12w', 'rankChange4w', 'rankChange12w', 'breadthChange',
+  'medianRSChange4w', 'topDecileChange4w', 'relativeReturnChange4w', 'emerging',
 ];
 
 function historyDates(config, { from, to, limit = 120, cadence = 'daily' }) {
@@ -86,15 +89,21 @@ function materializationKey(db, engine, config) {
   return { pinned, definitionKey, values: [universe, model, pinned.dataVersion, calculationVersion, definitionKey] };
 }
 
-function narrowSnapshot(snapshot, date) {
+function narrowSnapshot(snapshot, date, leaders, leadership) {
   if (snapshot.date !== date) throw new Error('The market engine returned a different session than requested');
   return {
     date, universe: snapshot.universe, model: snapshot.model, benchmark: snapshot.benchmark, basis: snapshot.basis,
+    classificationSystem: snapshot.classificationSystem, referenceMode: snapshot.referenceMode, referenceDate: snapshot.referenceDate,
     dataVersion: snapshot.dataVersion, calculationVersion: snapshot.calculationVersion, knownAt: snapshot.knownAt ?? null,
-    coverage: snapshot.coverage, breadth: snapshot.breadth, aggregates: snapshot.aggregates,
+    coverage: snapshot.coverage, breadth: snapshot.breadth, aggregates: { ...snapshot.aggregates, ...leadership },
+    topDecileIds: leaders,
     groups: (snapshot.groups ?? []).map((group) => Object.fromEntries(thinGroupFields.filter((key) =>
       Object.hasOwn(group, key)).map((key) => [key, group[key]]))),
   };
+}
+
+function decodeProjection(value) {
+  return JSON.parse(typeof value === 'string' ? value : gunzipSync(value));
 }
 
 function rangeMetadata(dates, cadence, config, definitionKey) {
@@ -143,6 +152,8 @@ export function materializeHistory(db, engine, config, options = {}) {
   };
   progress(null);
   let timeline = key.pinned;
+  let prior = null;
+  const dated = materializationKey(db, engine, { ...config, referenceMode: 'as-of' });
   for (const [index, date] of dates.entries()) {
     ensureActive(options);
     if (index % 60 === 0 && engine.historyBatch) timeline = engine.historyBatch(key.pinned, dates.slice(index, index + 60));
@@ -154,7 +165,18 @@ export function materializeHistory(db, engine, config, options = {}) {
       const snapshot = engine.snapshot({ ...timeline, date, requestedDate: date }, { persist: false, cache: false });
       ensureActive(options);
       if (!breadthExists) {
-        const json = JSON.stringify(narrowSnapshot(snapshot, date));
+        const previousDate = expectedSessions(shiftDate(date, -12), shiftDate(date, -1)).at(-1);
+        let previousIds = prior?.date === previousDate ? prior.ids : null;
+        if (previousIds == null && previousDate >= config.earliestDate) {
+          const stored = archiveRows(db, dated.pinned, dated, [previousDate], true)[0];
+          previousIds = stored ? decodeProjection(stored.value).topDecileIds : topDecileIds(engine.snapshot({
+            ...dated.pinned, date: previousDate, requestedDate: previousDate,
+          }, { persist: false, cache: false }));
+        }
+        const currentIds = topDecileIds(snapshot);
+        const leadership = leadershipStatistics(snapshot, previousDate, previousIds);
+        const json = JSON.stringify(narrowSnapshot(snapshot, date, currentIds, leadership));
+        prior = { date, ids: currentIds };
         const value = json.length < 65536 ? json : gzipSync(json, { level: 1 });
         if (write.run(...archive.values, date, value, new Date().toISOString()).changes) written++;
         else skipped++;
@@ -186,7 +208,10 @@ export function readMaterializedHistory(db, engine, config, options = {}) {
     complete: missingDates.length === 0,
     missingDates,
     reused: stored.filter((row) => row.data_version !== config.dataVersion).length,
-    rows: stored.map((row) => ({ ...JSON.parse(typeof row.value === 'string' ? row.value : gunzipSync(row.value)), materializedAt: row.created_at,
-      ...(row.data_version !== config.dataVersion ? { sourceDataVersion: row.data_version, requestedDataVersion: config.dataVersion } : {}) })),
+    rows: stored.map((row) => {
+      const { topDecileIds: _internal, ...projection } = decodeProjection(row.value);
+      return { ...projection, materializedAt: row.created_at,
+        ...(row.data_version !== config.dataVersion ? { sourceDataVersion: row.data_version, requestedDataVersion: config.dataVersion } : {}) };
+    }),
   };
 }

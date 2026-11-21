@@ -1,6 +1,6 @@
 import {
   action, attr, bindVirtualTable, chip, count, dateLabel, empty, field, fieldDetails, fields, heading, icon, notice, number, numeric, option,
-  panelHead, pagination, pathPart, pending, rankColumns, safe, screenColumns, table, warming,
+  panelHead, pagination, pathPart, pending, rankColumns, safe, savedScreenRoute, screenColumns, segment, table, tradingViewLink, warming,
 } from './ui.js';
 import { partialCoverage } from './overview.js';
 
@@ -14,6 +14,8 @@ const valueLess = new Set(['true', 'false', 'missing', 'present']);
 const pinned = ['symbol', 'name'];
 const defaultFilter = () => ({ operator: 'and', filters: [] });
 const defaultSort = [{ field: 'rsRank', direction: 'asc' }];
+const periodColumns = ['periodRank', 'periodPercentile', 'periodReturn'];
+const standardPeriodColumns = [...pinned, ...periodColumns, 'rsRank', 'rsPercentile', 'industry'];
 const periodLabels = { windows: 'Return lengths', averages: 'Moving-average lengths', volumeWindows: 'Volume lengths' };
 const periodDefaults = () => ({ windows: [], averages: [], volumeWindows: [] });
 const initialColumns = (ranking) => [...(ranking ? rankColumns : screenColumns)];
@@ -24,14 +26,22 @@ const preset = {
     { operator: 'or', filters: [{ field: 'distance_high_252d', op: 'gte', value: -.10 }, { field: 'new_high_50d', op: 'true' }] }] },
   volume: { operator: 'and', filters: [{ field: 'udv_50d', op: 'gte', value: 1.3 }, { field: 'rvol_20d', op: 'gte', value: 1.5 }] },
   trend: { operator: 'and', filters: [{ field: 'above_50d', op: 'true' }, { field: 'above_200d', op: 'true' }] },
+  emerging: { operator: 'and', filters: [{ field: 'industryEmerging', op: 'true' }] },
 };
 const groups = [['', 'No grouping'], ['sector', 'Sector'], ['industry', 'Industry'], ['marketCapBucket', 'Market cap']];
 const windowKinds = [['sessions', 'Trading sessions'], ['months', 'Calendar months'], ['quarters', 'Calendar quarters'], ['years', 'Calendar years'], ['ytd', 'Year to date'], ['fixed', 'Fixed dates']];
 
 function definition(state, context) {
-  return { filter: state.filter, search: state.search, sort: state.sort, columns: state.columns,
+  const list = state.rankingPeriod || state.rankingList;
+  return { filter: state.filter, search: state.search, ...(list && !state.sortCustomized ? {} : { sort: state.sort }),
+    columns: visibleColumns(state), ...(state.rankingPeriod ? { rankingPeriod: state.rankingPeriod, topPercent: state.topPercent } : {}),
+    ...(state.rankingList ? { rankingList: state.rankingList } : {}),
     computed: state.computed, groupBy: state.groupBy, includeUntraded: state.includeUntraded,
     context: { ...context, ...Object.fromEntries(Object.entries(state.customPeriods).filter(([, values]) => values.length)) }, dateMode: context.date ? 'fixed' : 'latest' };
+}
+function visibleColumns(state) {
+  if (!state.rankingPeriod) return state.columns;
+  return state.columnsCustomized ? [...new Set([...pinned, ...periodColumns, ...state.columns])] : standardPeriodColumns;
 }
 const choices = (computed = []) => [...fields.values(), ...computed.map((item) => ({ id: item.field, label: item.label, format: 'decimal' }))];
 const fieldOptions = (selected, computed = []) => choices(computed).map(({ id, label }) => option(id, label, selected)).join('');
@@ -64,12 +74,15 @@ function registerPeriods(periods) {
     register(`vs_sma_${days}d`, `Price vs ${days}D SMA`, 'rate');
     register(`above_${days}d`, `Above ${days}D SMA`, 'bool');
     register(`slope_sma_${days}d`, `${days}D SMA slope`, 'rate');
+    register(`vs_ema_${days}d`, `Price vs ${days}D EMA`, 'rate');
+    register(`slope_ema_${days}d`, `${days}D EMA slope`, 'rate');
   }
   for (const days of periods.volumeWindows) {
     register(`udv_${days}d`, `U/D volume ${days}D`, 'ratio');
     register(`rvol_${days}d`, `Relative volume ${days}D`, 'ratio');
     register(`adv_${days}d`, `Avg dollar volume ${days}D`, 'compactMoney');
     register(`float_turnover_${days}d`, `Float turnover ${days}D`, 'rate');
+    register(`obv_slope_${days}d`, `${days}D OBV change`, 'compact');
   }
 }
 
@@ -281,7 +294,7 @@ function saveEditor(env, state, saved) {
       env.modal.close();
       await env.reloadConfig();
       env.toast(`Saved ${result.name}`);
-      env.go('screener', { screen: result.id, ...context, date: context.date || '' });
+      env.go('screener', { screen: result.id, ...savedScreenRoute(body.definition) });
     } catch (error) {
       const output = target.querySelector('.form-error');
       output.hidden = false;
@@ -356,10 +369,17 @@ export async function render(env) {
   if (params.screen !== state.screen || !state.columns) {
     const data = saved?.definition || {};
     Object.assign(state, { screen: params.screen, filter: data.filter || defaultFilter(), search: data.search || '',
-      sort: data.sort || structuredClone(defaultSort), columns: columnSort(data.columns || initialColumns(ranking)), computed: data.computed || [],
+      sort: data.sort || structuredClone(defaultSort), sortCustomized: !!data.sort,
+      columns: columnSort(data.columns || initialColumns(ranking)), columnsCustomized: !!data.columns, computed: data.computed || [],
       groupBy: data.groupBy || '', perPage: 50, page: 1, selected: new Set(), includeUntraded: !!data.includeUntraded,
       customPeriods: Object.fromEntries(Object.keys(periodLabels).map((key) => [key, listPeriods(data.context?.[key])])) });
   }
+  const selectedList = ranking ? params.rankList : saved?.definition?.rankingPeriod || saved?.definition?.rankingList;
+  const period = config.rankingPeriods?.find(({ id }) => id === selectedList);
+  const rankList = config.rankingLists?.find(({ id }) => id === selectedList);
+  const topPercent = Number(ranking ? params.topPercent || 2 : saved?.definition?.topPercent ?? 2);
+  if (state.rankingPeriod !== period?.id || state.rankingList !== rankList?.id || state.topPercent !== topPercent) state.page = 1;
+  Object.assign(state, { rankingPeriod: period?.id, rankingList: rankList?.id, topPercent });
   state.customPeriods ||= periodDefaults();
   registerPeriods(state.customPeriods);
   const contextKey = JSON.stringify(context);
@@ -379,21 +399,41 @@ export async function render(env) {
   let searchTimer = null;
 
   function columns() {
-    return [...new Set([...state.columns, ...(state.groupBy ? ['group', 'groupRank'] : []),
+    return [...new Set([...visibleColumns(state), ...(state.groupBy ? ['group', 'groupRank'] : []),
       ...(ranking && state.compareModel ? ['compareRank', 'comparePercentile'] : []),
       ...(state.compareDate ? [state.compareMetric || 'rsPercentile', 'compareDateMetric', 'compareDateDelta'] : [])])];
   }
+  function sortOrder() {
+    if (state.sortCustomized || !period && !rankList) return state.sort;
+    return [{ field: period ? 'periodRank' : rankList.rankField, direction: rankList?.direction || 'asc' }];
+  }
   function draw() {
     const rankDescription = `Rank 1 is strongest. Percentiles are relative to the comparable securities in the selected universe.`;
+    const replay = context.date || context.dataVersion;
+    const visibleName = period ? `${period.label} leaders` : rankList?.label;
+    const timing = replay ? 'Historical replay · pinned session or data revision' : 'Live EOD · follows completed daily publications';
+    const listDescription = period ? `Ranked by split-adjusted return over ${period.sessions} trading sessions. Filters apply after period ranks are assigned.`
+      : rankList?.description || 'Ranks use the selected RS model.';
     main.innerHTML = heading(ranking ? 'RS Rankings' : 'Stock Screener', ranking ? rankDescription : 'Filter, rank, and compare securities in a historical session.',
       ranking ? action('Build model', 'new-model', 'plus', { className: 'primary' }) : action('Save view', 'save-screen', 'screens', { className: 'primary' })) +
       partialCoverage(coverage, env.routeUrl) +
+      (ranking ? `<section class="panel panel-body ranking-lists">${panelHead('RS stock lists', timing, action('Save list', 'save-screen', 'screens'))}
+        <div class="query-options"><div><p class="muted">Period return leaders</p>${segment('ranking-list',
+          (config.rankingPeriods || []).map(({ id, label }) => [id, label]), period?.id)}</div>
+          <label class="field">RS model lists<select data-change="ranking-list">
+          ${period ? option('','Select an RS model list','') : option('', 'Composite / selected RS model', selectedList || '')}
+          ${period ? option('composite', 'Composite / selected RS model', selectedList) : ''}
+          ${(config.rankingLists || []).map(({ id, label }) => option(id, label, selectedList)).join('')}
+        </select></label>
+        ${period ? `<form id="rs-cutoff-form" class="inline-stack"><label class="field">Top percent<input name="cutoff" type="number" min="0.1" max="100" step="any" required value="${safe(topPercent)}"></label>
+          <button class="button" type="submit">Apply cutoff</button></form>` : ''}</div><p class="muted">${safe(listDescription)}</p>
+      </section>` : '') +
       (ranking ? `<section class="panel model-summary">${panelHead(model?.name || 'Ranking model',
         `${methodLabels[model?.definition?.method] || 'Custom scoring'} · ${model?.definition?.priceMode === 'total' ? 'Total return' : 'Split-adjusted'} · version ${context.modelVersion || model?.version || 1}`,
         action(['composite','short-momentum','benchmark-relative'].includes(model?.id) ? 'Copy model' : 'Edit model', 'edit-model', 'edit'))}
         <div class="inline-stack">${(model?.definition?.windows || []).map((row) => chip(`${row.kind === 'fixed' ? `${row.start}–${row.end}` : row.kind === 'ytd' ? 'YTD' : `${row.length} ${row.kind}`}${row.offset ? ` · lag ${row.offset}` : ''} · ${number(row.weight * 100, 0)}%`)).join('')}</div></section>` : '') +
       `<section class="panel workplace-table">
-        <header class="results-head"><div><h2>${safe(saved?.name || (ranking ? 'Ranking warehouse' : 'Security results'))}</h2><p id="results-meta" class="muted"></p></div>
+        <header class="results-head"><div><h2>${safe(saved?.name || visibleName || (ranking ? 'Ranking warehouse' : 'Security results'))}</h2><p id="results-meta" class="muted"></p></div>
         <div class="actions" id="selection-tools"></div></header>
         <div class="query-toolbar">
           <label class="search-field">${icon('search')}<span class="sr-only">Search stocks</span><input type="search" id="security-search" value="${safe(state.search)}" placeholder="Ticker, company, industry"></label>
@@ -407,17 +447,23 @@ export async function render(env) {
           ${ranking ? `<label class="field">Compare model<select data-change="compare-model">${option('', 'No comparison', state.compareModel || '')}
           ${config.models.filter(({ id }) => id !== context.model).map(({ id,name }) => option(id,name,state.compareModel)).join('')}</select></label>`
           : `<label class="field">Filter preset<select data-change="screen-preset">${option('', 'Select a preset', '')}
-          ${option('leaders','Emerging leaders','')}${option('volume','Volume demand','')}${option('trend','Above 50D and 200D','')}${option('clear','Clear filters','')}</select></label>`}
+          ${option('leaders','Emerging leaders','')}${option('emerging','Stocks in emerging industries','')}${option('volume','Volume demand','')}${option('trend','Above 50D and 200D','')}${option('clear','Clear filters','')}</select></label>`}
           <label class="checkbox-label"><input type="checkbox" data-change="include-untraded" ${state.includeUntraded ? 'checked' : ''}> Include untraded</label>
         </div>
-        <div class="inline-stack sort-chips" id="sort-chips">${state.compareDate ? chip(`Compared with ${dateLabel(state.compareResolvedDate || state.compareDate)}`, 'accent') : ''}${state.sort.map((sort, index) => chip(`${index + 1} · ${fieldDetails(sort.field, state.computed).label} · ${sort.direction === 'asc' ? 'Ascending' : 'Descending'}`)).join('')}</div>
+        <div class="inline-stack sort-chips" id="sort-chips">${state.compareDate ? chip(`Compared with ${dateLabel(state.compareResolvedDate || state.compareDate)}`, 'accent') : ''}${sortOrder().map((sort, index) => chip(`${index + 1} · ${fieldDetails(sort.field, state.computed).label} · ${sort.direction === 'asc' ? 'Ascending' : 'Descending'}`)).join('')}</div>
         <div id="screen-warming"></div>
         <div id="result-table">${pending('Querying securities…')}</div></section>`;
     const search = main.querySelector('#security-search');
+    const cutoff = main.querySelector('#rs-cutoff-form');
+    if (cutoff) cutoff.onsubmit = (event) => {
+      event.preventDefault();
+      env.go('rankings', { topPercent: new FormData(cutoff).get('cutoff') });
+    };
     search.oninput = () => {
       clearTimeout(searchTimer);
       searchTimer = setTimeout(() => {
         state.search = search.value;
+        search.defaultValue = state.search;
         state.page = 1;
         load();
       }, 220);
@@ -436,7 +482,13 @@ export async function render(env) {
     state.result = result;
       const references = result.referenceMode === 'latest' && result.referenceDate ? ` · reference ${dateLabel(result.referenceDate)}` : '';
       const comparedDate = state.compareResolvedDate ? ` · compared with ${dateLabel(state.compareResolvedDate)}` : '';
-      main.querySelector('#results-meta').textContent = `${count(result.total)} of ${count(result.universeCount)} securities · ${dateLabel(result.date)}${references}${comparedDate}`;
+    const population = result.period
+      ? `${count(result.total)} shown · top ${number(result.period.topPercent, 2)}% cutoff: ${count(result.period.cutoff)} of ${count(result.period.comparable)} comparable · ${result.period.sessions} sessions`
+      : result.rankingList ? `${count(result.total)} shown · ${count(result.rankingList.qualifying)} qualify of ${count(result.rankingList.ranked)} ranked${result.rankingList.unclassified == null ? '' : ` · ${count(result.rankingList.unclassified)} unclassified excluded`}`
+      : `${count(result.total)} of ${count(result.universeCount)} securities`;
+    const meta = main.querySelector('#results-meta');
+    meta.textContent = `${population} · ${dateLabel(result.date)}${references}${comparedDate}`;
+    if (result.period) meta.title = result.period.selection;
       const reportField = fieldDetails(compareMetric, state.computed);
       const computed = [...state.computed, { field: 'compareRank', label: 'Comparison rank', format: 'integer' },
         { field: 'comparePercentile', label: 'Comparison percentile', format: 'decimal' },
@@ -444,7 +496,8 @@ export async function render(env) {
         { field: 'compareDateDelta', label: `${reportField.label} Δ`, format: reportField.format === 'rate' ? 'rate' : 'signed' },
       ];
       target.innerHTML = (result.groups?.length ? `<div class="inline-stack table-groups">${result.groups.map(({ name,count: n }) => chip(`${name} · ${count(n)}`)).join('')}</div>` : '') +
-        table(result.rows, columns(), { computed, sort: state.sort, sortable: true, selectable: true, selected: state.selected, virtualRows: true, label: 'Screener results' }) + pagination(result);
+        table(result.rows, columns(), { computed, sort: sortOrder(), sortable: true, selectable: true, selected: state.selected, virtualRows: true,
+          label: 'Screener results', rowAction: ranking || period || rankList ? tradingViewLink : null }) + pagination(result);
       bindVirtualTable(target);
   }
 
@@ -463,9 +516,10 @@ export async function render(env) {
       const query = { ...definition(state, context), page: state.page, perPage: state.perPage };
       const result = await env.publishedSeries('screens/query',{body:query,signal:querySignal},(partial,job)=>{
         if (run!==request || !env.isActive()) return;
-        if (!baseShown) { paintResults(partial,target);baseShown=true; }
+        if (partial.pendingOnly) target.innerHTML = pending(`Preparing ${(partial.pendingReason || 'verified high history').toLowerCase()}…`);
+        else if (!baseShown) { paintResults(partial,target);baseShown=true; }
         target.removeAttribute('aria-busy');
-        initialMessage.innerHTML = warming(job,'Historical comparison metrics') +
+        initialMessage.innerHTML = partial.pendingOnly ? warming(job,partial.pendingReason || 'Verified high history') : warming(job,'Historical comparison metrics') +
           '<p class="muted warming-note">Changes and filters that depend on historical ranks may be incomplete.</p>';
         main.querySelectorAll('[data-action="export-screen"]').forEach((button)=>{button.disabled=true;});
       });
@@ -476,6 +530,7 @@ export async function render(env) {
         const chunks = [ids.slice(0, 200), ids.slice(200)].filter((group) => group.length);
         const compare = (patch) => Promise.all(chunks.map((value) => env.api('screens/query', {
           body: { filter: { field: 'securityId', op: 'in', value }, context: { ...query.context, ...patch },
+            ...(period ? { rankingPeriod: period.id, topPercent: 100 } : {}),
             computed: state.computed, includeUntraded: state.includeUntraded, all: true }, signal:querySignal,
         })));
         const [models, dates] = await Promise.all([
@@ -540,23 +595,25 @@ export async function render(env) {
   env.setActions({
     'compare-date-editor': compareDateEditor,
     filters: () => filterEditor(env, state, (filter) => validate({ filter })),
-    columns: () => columnEditor(env, state, (columns) => update({ columns })),
+    columns: () => columnEditor(env, { ...state, columns: visibleColumns(state) }, (columns) => update({ columns, columnsCustomized: true })),
     periods: () => periodEditor(env, state, (customPeriods) => validate({ customPeriods })),
-    'sort-editor': () => sortEditor(env, state, (sort) => update({ sort })),
+    'sort-editor': () => sortEditor(env, { ...state, sort: sortOrder() }, (sort) => update({ sort, sortCustomized: true })),
     computed: () => computedEditor(env, state, (computed, removed, added) => validate({ computed,
       columns: [...state.columns.filter((id) => id !== removed), ...(added ? [added] : [])], sort: state.sort.filter(({ field }) => field !== removed) })),
     sort(field, element, event) {
       if (field.startsWith('compare')) return env.toast('Comparison values are shown for the active result set.');
-      const active = state.sort.find((item) => item.field === field);
+      const activeSort = sortOrder();
+      const active = activeSort.find((item) => item.field === field);
       const first = { field, direction: active?.direction === 'asc' ? 'desc' : active?.direction === 'desc' ? 'asc'
-        : ['symbol', 'name', 'rsRank', 'subsetRank', 'groupRank'].includes(field) ? 'asc' : 'desc' };
-      const sort = event.shiftKey ? active ? state.sort.map((item) => item.field === field ? first : item) : [...state.sort, first] : [first];
-      return update({ sort });
+        : ['symbol', 'name', 'rsRank', 'periodRank', 'subsetRank', 'groupRank'].includes(field) ? 'asc' : 'desc' };
+      const sort = event.shiftKey ? active ? activeSort.map((item) => item.field === field ? first : item) : [...activeSort, first] : [first];
+      return update({ sort, sortCustomized: true });
     },
     page: (value) => update({}, { redraw: false, page: Number(value) }),
     'retry-screen': () => load(),
     'new-model': () => modelEditor(env),
     'edit-model': () => modelEditor(env, model),
+    'ranking-list': (value) => env.go('rankings', { rankList: value || null }),
     'save-screen': () => saveEditor(env, state, saved),
     'export-screen': (format = 'csv') => env.exportFile('screens/query', { body: { ...definition(state, context), export: format } }, `stock-screener.${format}`),
     'add-selected': () => env.openAddWatchlist([...state.selected]),
@@ -581,6 +638,7 @@ export async function render(env) {
     'change:screen-preset': (value) => value && update({ filter: structuredClone(preset[value] || defaultFilter()) }),
     'change:include-untraded': (value, box) => update({ includeUntraded: box.checked }),
     'change:compare-model': (value) => update({ compareModel: value }),
+    'change:ranking-list': (value) => env.go('rankings', { rankList: value === 'composite' ? null : value || null }),
   });
   draw();
   await load();

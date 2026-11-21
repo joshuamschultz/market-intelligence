@@ -95,7 +95,53 @@ export const chip = (label, style = '') => `<span class="chip ${style}">${safe(l
 export const segment = (name, choices, selected, classes = 'segmented') => `<div class="${classes}">${choices.map(([value, label]) =>
   `<button type="button" data-action="${name}" data-value="${safe(value)}" aria-pressed="${String(value) === String(selected)}">${safe(label)}</button>`).join('')}</div>`;
 export const field = (label, control, tip = '') => `<label class="field"><span>${safe(label)}</span>${control}${tip ? `<small>${safe(tip)}</small>` : ''}</label>`;
+export function observedCoverageFields(settings = {}) {
+  const enabled = settings.coverageMode === 'observed';
+  const disabled = enabled ? '' : ' disabled';
+  return `<div class="inline-form" data-observed-coverage${enabled ? '' : ' hidden'}>
+    ${field('Minimum traded sample', `<input name="observedMinimum" type="number" min="1" max="100000" step="1" required value="${safe(settings.observedMinimum ?? 20)}"${disabled}>`)}
+    ${field('Comparable fraction', `<input name="observedThreshold" type="number" min=".001" max="1" step=".001" required value="${safe(settings.observedThreshold ?? 0.8)}"${disabled}>`, '0.80 = 80%')}
+  </div>`;
+}
+export function bindObservedCoverage(form) {
+  const select = form?.querySelector('[name="coverageMode"]');
+  const fields = form?.querySelector('[data-observed-coverage]');
+  if (!select || !fields) return;
+  select.addEventListener('change', () => {
+    fields.hidden = select.value !== 'observed';
+    for (const input of fields.querySelectorAll('input')) input.disabled = fields.hidden;
+  });
+}
+export function observedCoverageParams(values) {
+  return values.coverageMode === 'observed'
+    ? { coverageMode: 'observed', observedMinimum: Number(values.observedMinimum), observedThreshold: Number(values.observedThreshold) }
+    : { coverageMode: 'verified' };
+}
+export function observedCoverageSummary(result) {
+  return `Minimum ${count(result.observedMinimum)} traded securities · ${rate(result.observedThreshold, 1, false)} comparable coverage.`;
+}
 export const stockLink = (row) => `<button type="button" class="stock-link mono" data-action="stock" data-value="${safe(row.securityId || row.symbol)}">${safe(row.symbol || row.securityId)}</button>`;
+export function tradingViewUrl(symbol, exchange) {
+  const ticker = String(symbol || '').trim().toUpperCase();
+  if (!/^[A-Z0-9][A-Z0-9.-]{0,39}$/.test(ticker)) return null;
+  const venue = String(exchange || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const prefix = /^(NASDAQ(?:GS|GM|CM|GLOBALSELECT(?:MARKET)?|GLOBALMARKET|CAPITALMARKET)?|XNAS)$/.test(venue) ? 'NASDAQ'
+    : /^(NYSE|XNYS)$/.test(venue) ? 'NYSE'
+    : /^(NYSEAMERICAN|NYSEMKT|NYSEARCA|ARCA|AMEX|XASE|ARCX)$/.test(venue) ? 'AMEX'
+    : /^(OTC(?:ID|QX|QB|BB|MKTS|MARKETS)?|PINK(?:CURRENT|LIMITED)?|EXPERTMARKET)$/.test(venue) ? 'OTC' : '';
+  const chartSymbol = prefix ? `${prefix}:${ticker.replace(/-([A-Z])$/, '.$1')}` : ticker;
+  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(chartSymbol)}`;
+}
+export function tradingViewLink(row) {
+  const href = tradingViewUrl(row.symbol, row.exchange);
+  return href ? `<a class="text-link tradingview-link" href="${safe(href)}" target="_blank"
+    rel="noopener noreferrer" aria-label="Open ${safe(row.symbol)} chart in TradingView, new tab">TradingView ${icon('arrow-up-right')}</a>` : '';
+}
+export function savedScreenRoute(definition = {}) {
+  const context = { ...definition.context };
+  const fixed = definition.dateMode === 'fixed' || definition.dateMode !== 'latest' && !!context.date;
+  return { ...context, date: fixed ? context.date || null : null, dataVersion: fixed ? context.dataVersion ?? null : null };
+}
 
 const baseFields = [
   ['symbol', 'Ticker'], ['name', 'Company'], ['exchange', 'Exchange'], ['type', 'Security type'], ['close', 'Close', 'money'],
@@ -110,9 +156,10 @@ const baseFields = [
   ['udv_50d', 'U/D volume 50D', 'ratio'], ['udv_100d', 'U/D volume 100D', 'ratio'], ['rvol_20d', 'Relative volume 20D', 'ratio'],
   ['volume', 'Share volume', 'compact'], ['dollar_volume', 'Dollar volume', 'compactMoney'], ['adv_20d', 'Avg dollar volume 20D', 'compactMoney'],
   ['adv_50d', 'Avg dollar volume 50D', 'compactMoney'], ['float', 'Public float', 'compact'], ['shares', 'Shares outstanding', 'compact'],
-  ['market_cap', 'Market cap', 'compactMoney'], ['market_cap_change', 'Market cap change', 'rate'], ['marketCapBucket', 'Market cap bucket'],
+  ['market_cap', 'Market cap', 'compactMoney'], ['market_cap_change', '21D market cap change', 'rate'], ['marketCapBucket', 'Market cap bucket'],
   ['float_turnover_20d', 'Float turnover 20D', 'rate'], ['distance_high_252d', 'From 52W high', 'rate'],
-  ['distance_low_252d', 'From 52W low', 'rate'], ['distance_all_time_high', 'From all-time high', 'rate'],
+  ['distance_low_252d', 'From 52W low', 'rate'], ['distance_all_time_high', 'From verified listing high', 'rate'],
+  ['distance_loaded_history_high', 'From verified loaded-history high', 'rate'],
   ['relative_return_21d', '1M vs benchmark', 'rate'], ['volatility_20d', '20D volatility', 'rate'], ['atr_14d', 'ATR 14D', 'rate'],
   ['obv', 'On-balance volume', 'compact'], ['obv_slope', 'OBV slope', 'decimal'],
   ['mfi_14d', 'Money flow index', 'decimal'], ['cmf_20d', 'Chaikin money flow', 'decimal'], ['clv', 'Close location value', 'decimal'],
@@ -122,6 +169,7 @@ const baseFields = [
   ['industryBreadth', 'Industry 50D breadth', 'percent'], ['industryRelativeRS', 'RS vs industry', 'signed'],
   ['industryRelativeReturn', 'Return vs industry', 'rate'], ['sectorRelativeRS', 'RS vs sector', 'signed'],
   ['subsetRank', 'Result rank', 'integer'], ['groupRank', 'Group rank', 'integer'], ['group', 'Group'],
+  ['periodRank', 'Period rank', 'integer'], ['periodPercentile', 'Period percentile', 'decimal'], ['periodReturn', 'Period return', 'rate'],
   ['traded', 'Traded', 'bool'], ['listingDate', 'Listing date', 'date'], ['fundamentalsDate', 'Fundamentals date', 'date'],
   ['breadthSelection', 'Participation'], ['contribution','Contribution','signed'], ['rsHighBeforePrice', 'RS high before price high', 'bool'],
   ['deterioratingOnPriceStrength', 'RS deteriorating on price strength', 'bool'], ['momentumImproving', 'Improving 3M momentum', 'bool'],
@@ -131,10 +179,20 @@ const baseFields = [
   ['volume_trend', '20D vs 50D volume', 'rate'], ['volume_contraction', '10D vs 50D volume', 'rate'], ['breakout_volume', 'Breakout volume', 'ratio'],
   ['rs_line_new_high', 'New benchmark RS line high', 'bool'], ['gap', 'Opening gap', 'rate'], ['volatility_compression', 'Volatility contraction', 'rate'],
   ['consolidation_range_20d', 'Consolidation range 20D', 'rate'], ['intraday_return', 'Intraday return', 'rate'],
+  ['atr_contraction', '14D ATR contraction', 'rate'], ['consolidation_duration', 'Consolidation sessions', 'integer'],
+  ['high_volume_up_2x_20d', '20D up days at 2× volume', 'integer'], ['high_volume_down_2x_20d', '20D down days at 2× volume', 'integer'],
+  ['accumulation_2x_20d', '20D net 2× volume days', 'integer'], ['obv_slope_20d', '20D OBV change', 'compact'],
+  ['industryEmerging', 'Emerging industry', 'bool'], ['volumeDemandImproving', 'Improving volume demand', 'bool'],
+  ['udvChange4w', '4W U/D ratio change', 'signed'], ['upVolumeShareChange4w', '4W up-volume share change', 'rate'],
 ];
+for (const weeks of [4, 8, 12]) {
+  baseFields.push([`topDecileWeeks${weeks}w`, `Top-decile weeks in ${weeks}W`, 'integer'],
+    [`topDecilePersistence${weeks}w`, `Top decile throughout ${weeks}W`, 'bool']);
+}
 for (const days of [10, 20, 50, 100, 150, 200]) {
   baseFields.push([`sma_${days}d`, `${days}D SMA`, 'money'], [`ema_${days}d`, `${days}D EMA`, 'money'],
-    [`above_${days}d`, `Above ${days}D SMA`, 'bool'], [`vs_sma_${days}d`, `Price vs ${days}D SMA`, 'rate'], [`slope_sma_${days}d`, `${days}D SMA slope`, 'rate']);
+    [`above_${days}d`, `Above ${days}D SMA`, 'bool'], [`vs_sma_${days}d`, `Price vs ${days}D SMA`, 'rate'], [`slope_sma_${days}d`, `${days}D SMA slope`, 'rate'],
+    [`vs_ema_${days}d`, `Price vs ${days}D EMA`, 'rate'], [`slope_ema_${days}d`, `${days}D EMA slope`, 'rate']);
 }
 for (const band of [1, 5, 10, 20]) baseFields.push([`enteredTop${band}`, `Entered top ${band}% RS`, 'bool']);
 for (const days of [20, 50, 100, 252]) baseFields.push([`new_high_${days}d`, `New ${days}D high`, 'bool'], [`new_low_${days}d`, `New ${days}D low`, 'bool']);
@@ -187,7 +245,8 @@ export function bindVirtualTable(container) {
     const active = document.activeElement;
     const focused = body.contains(active);
     const rowIndex = focused ? Number(active.closest('tr').getAttribute('aria-rowindex')) : null;
-    const selector = active?.matches('[data-change="select-stock"]') ? '[data-change="select-stock"]' : '[data-action="stock"]';
+    const selector = active?.matches('[data-change="select-stock"]') ? '[data-change="select-stock"]'
+      : active?.matches('.tradingview-link') ? '.tradingview-link' : '[data-action="stock"]';
     current = start;
     body.innerHTML = windowRows(config.rows, start, visibleTableRows, config.columns);
     for (const input of body.querySelectorAll('[data-change="select-stock"]')) input.checked = config.selected?.has(input.value) || false;

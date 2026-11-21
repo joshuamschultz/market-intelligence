@@ -37,11 +37,17 @@ const xLabel = (date, showYear) => showYear
 const yLabel = (value) => Math.abs(value) > 100 || Number.isInteger(value) ? number(value, 0) : number(value, 1);
 
 export function chart(rows, input, options = {}) {
+  return drawChart({ rows, input, options, first: 0, end: rows.length });
+}
+
+function drawChart(view) {
+  const { input, options } = view;
+  const rows = view.rows.slice(view.first, view.end);
   if (!rows.length) return empty('No observations', 'Choose an available session or a longer date range.', 'chart');
   const id = `plot-${++chartId}`;
   const series = input.map((item, index) => ({ color: chartColors[index % chartColors.length], format: (value) => number(value, 2), ...item }));
   const content = series.map((item) => valuesFor(item, rows));
-  if (!content.some((values) => values.some(numeric))) return empty('No comparable observations', 'This selection has no values in the loaded range.', 'chart');
+  if (rows.length === view.rows.length && !content.some((values) => values.some(numeric))) return empty('No comparable observations', 'This selection has no values in the loaded range.', 'chart');
 
   const width = options.width || 650;
   const height = options.height || 218;
@@ -92,19 +98,55 @@ export function chart(rows, input, options = {}) {
   }).join('') : '';
   const showYear = Date.parse(rows.at(-1).date) - Date.parse(rows[0].date) >= 31536000000;
   const axisLabels = ticks.map((index) => `<text x="${x(index)}" y="${height - 6}" text-anchor="${index === 0 ? 'start' : index === rows.length - 1 ? 'end' : 'middle'}">${safe(xLabel(rows[index].date, showYear))}</text>`).join('');
-  plots.set(id, { rows, series, content, width, left, right, top, bottom, x, y, active: -1, candles: options.candles, onPick: options.onPick, describePoint: options.describePoint });
+  plots.set(id, { rows, series, content, width, left, right, top, bottom, x, y, active: -1, view,
+    candles: options.candles, onPick: options.onPick, describePoint: options.describePoint });
   if (plots.size > 100) {
     for (const key of plots.keys()) if (!document.getElementById(key) && key !== id) plots.delete(key);
   }
   const legend = series.map((item) => `<span class="legend-item"><i class="legend-mark" style="--series-color:${item.color}"></i>${safe(item.label)}</span>`).join('');
+  const minimum = Math.min(5, view.rows.length);
+  const zoomed = rows.length < view.rows.length;
+  const controls = view.rows.length > minimum ? `<div class="chart-navigation" role="group" aria-label="Chart zoom and position">
+    <button type="button" class="button" data-chart-command="earlier" ${view.first === 0 ? 'disabled' : ''}>Earlier</button>
+    <button type="button" class="button" data-chart-command="zoom" ${rows.length <= minimum ? 'disabled' : ''}>Zoom in</button>
+    <button type="button" class="button" data-chart-command="zoom-out" ${zoomed ? '' : 'disabled'}>Zoom out</button>
+    <button type="button" class="button" data-chart-command="later" ${view.end === view.rows.length ? 'disabled' : ''}>Later</button>
+    <button type="button" class="button" data-chart-command="reset" ${zoomed ? '' : 'disabled'}>Reset</button>
+    <span aria-live="polite">${safe(`${dateLabel(rows[0].date, true)} – ${dateLabel(rows.at(-1).date, true)}`)}</span></div>` : '';
   return `<div class="chart-frame" id="${id}" data-chart>
     <svg class="chart-svg" viewBox="0 0 ${width} ${height}" tabindex="0" role="img" aria-label="${safe(options.label || series.map(({ label }) => label).join(' and '))}. Use arrow keys to inspect sessions." data-plot="${id}">
       <defs><linearGradient id="${id}-gradient" x2="0" y2="1" gradientUnits="objectBoundingBox"><stop stop-color="${series[0].color}" stop-opacity=".18"/><stop offset="1" stop-color="${series[0].color}" stop-opacity=".015"/></linearGradient></defs>
       <g fill="#98aab3" font-size="10.5" font-family="monospace">${grid}${axisLabels}</g>${candles}${lines}${volume}
       <g class="chart-crosshair" hidden></g>
     </svg>
-    <div class="chart-tooltip" hidden></div><div class="legend chart-legend">${legend}${options.volume ? '<span class="legend-item"><i class="legend-mark" style="--series-color:#5d8278"></i>Share volume</span>' : ''}</div>
+    <div class="chart-tooltip" hidden></div><div class="legend chart-legend">${legend}${options.volume ? '<span class="legend-item"><i class="legend-mark" style="--series-color:#5d8278"></i>Share volume</span>' : ''}</div>${controls}
   </div>`;
+}
+
+function changeView(frame, plot, command, fromKeyboard = false) {
+  const { view, active } = plot;
+  const length = view.rows.length;
+  const size = view.end - view.first;
+  if ((command === 'reset' && length === size) || (command === 'zoom' && size <= 5)) return;
+  let first = view.first;
+  let nextSize = size;
+  if (command === 'zoom' || command === 'zoom-out') {
+    nextSize = command === 'zoom' ? Math.max(5, Math.ceil(size / 2)) : Math.min(length, size * 2);
+    first = active < 0 ? view.end - nextSize : view.first + active - Math.floor(nextSize / 2);
+  } else if (command === 'reset') {
+    nextSize = length;
+    first = 0;
+  } else first += (command === 'earlier' ? -1 : 1) * Math.max(1, Math.floor(size / 2));
+  first = Math.max(0, Math.min(length - nextSize, first));
+  if (first === view.first && nextSize === size) return;
+  const markup = drawChart({ ...view, first, end: first + nextSize });
+  const parent = frame.parentElement;
+  const index = [...parent.children].indexOf(frame);
+  plots.delete(frame.id);
+  frame.outerHTML = markup;
+  const replacement = parent.children[index];
+  const choice = !fromKeyboard && replacement.querySelector(`[data-chart-command="${command}"]:not([disabled])`);
+  (choice || replacement.querySelector('[data-plot]'))?.focus();
 }
 
 function showPoint(node, plot, index) {
@@ -166,8 +208,19 @@ document.addEventListener('keydown', (event) => {
     showPoint(node, plot, index);
   }
   if (event.key === 'Enter' && plot.active >= 0 && plot.onPick) plot.onPick(plot.rows[plot.active]);
+  if (['+', '-', '0'].includes(event.key)) {
+    event.preventDefault();
+    changeView(node.parentElement, plot, event.key === '+' ? 'zoom' : event.key === '-' ? 'zoom-out' : 'reset', true);
+  }
 });
 document.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-chart-command]');
+  if (button) {
+    const frame = button.closest('[data-chart]');
+    const plot = plots.get(frame?.id);
+    if (plot && !button.disabled) changeView(frame, plot, button.dataset.chartCommand);
+    return;
+  }
   const node = event.target.closest('[data-plot]');
   const plot = plots.get(node?.dataset.plot);
   if (plot?.active >= 0 && plot.onPick) plot.onPick(plot.rows[plot.active]);
@@ -176,7 +229,11 @@ document.addEventListener('click', (event) => {
 export function exportChart(frame, filename) {
   const plot = plots.get(frame?.id);
   if (!plot) return;
-  const keys = plot.series.map((item) => item.key);
-  const rows = plot.rows.map((row, index) => Object.fromEntries([['date', row.date], ...keys.map((key, group) => [key, plot.content[group][index]])]));
+  const plotted = plot.series.map((item) => item.key);
+  const source = plot.view.options.exportFields || [];
+  const keys = [...new Set([...source, ...plotted])];
+  const rows = plot.rows.map((row, index) => ({ date: row.date,
+    ...Object.fromEntries(source.map((key) => [key, row[key]])),
+    ...Object.fromEntries(plotted.map((key, group) => [key, plot.content[group][index]])) }));
   csvDownload(rows, ['date', ...keys], filename);
 }

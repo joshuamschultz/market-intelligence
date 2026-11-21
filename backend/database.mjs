@@ -3,7 +3,10 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const analyticsSources = ['calendar', 'database', 'metrics', 'ranking', 'breadth', 'engine', 'screener', 'research'];
+const analyticsSources = [
+  'calendar', 'database', 'metrics', 'ranking', 'breadth', 'engine', 'screener', 'research',
+  'materialization', 'rank-archive', 'archive-lineage', 'precompute',
+];
 const sourceHash = createHash('sha256');
 for (const filename of analyticsSources) sourceHash.update(readFileSync(new URL(`./${filename}.mjs`, import.meta.url)));
 import { shiftDate } from './calendar.mjs';

@@ -1,6 +1,8 @@
 import { isoDate } from './database.mjs';
 import { deviation, finite, mean, returnWindow } from './metrics.mjs';
 
+const delta = (current, prior) => finite(current) && finite(prior) ? current - prior : null;
+
 const momentumWindows = [
   { kind: 'sessions', length: 252, weight: 0.4 },
   { kind: 'sessions', length: 126, weight: 0.3 },
@@ -170,6 +172,13 @@ export function annotateVelocity(current, weekly) {
     const oldPct = prior.map((old) => old?.rsPercentile).filter(finite);
     item.leadingWeeks = finite(item.rsPercentile) ? oldPct.filter((value) => value >= 90).length + Number(item.rsPercentile >= 90) : null;
     item.leadingWeekCoverage = oldPct.length + Number(finite(item.rsPercentile));
+    for (const period of [4, 8, 12]) {
+      const values = [item.rsPercentile, ...prior.slice(0, period - 1).map((row) => row?.rsPercentile)];
+      const valid = values.length === period && values.every(finite);
+      const weeks = valid ? values.filter((value) => value >= 90).length : null;
+      item[`topDecileWeeks${period}w`] = weeks;
+      item[`topDecilePersistence${period}w`] = valid ? weeks === period : null;
+    }
     for (const limit of [1, 5, 10, 20]) {
       item[`enteredTop${limit}`] = recent?.rsPercentile != null && item.rsPercentile != null
         ? item.rsPercentile >= 100 - limit && recent.rsPercentile < 100 - limit : null;
@@ -177,7 +186,12 @@ export function annotateVelocity(current, weekly) {
     item.rsHighBeforePrice = item.rsNewHigh == null || item.new_high_252d == null ? null : item.rsNewHigh && !item.new_high_252d;
     item.deterioratingOnPriceStrength = item.velocity4w == null || item.return_21d == null ? null : item.velocity4w < 0 && item.return_21d > 0;
     item.momentumImproving = item.return_63d == null || item.return_252d == null ? null : item.return_63d * 4 > item.return_252d;
-    item.priceAndVolumeStrength = item.return_21d == null || item.udv_50d == null ? null : item.return_21d > 0 && item.udv_50d > 1.2;
+    item.udvChange4w = delta(item.udv_50d, prior[3]?.udv_50d);
+    item.upVolumeShareChange4w = delta(item.up_volume_50d, prior[3]?.up_volume_50d);
+    item.volumeDemandImproving = item.upVolumeShareChange4w == null ? null : item.upVolumeShareChange4w > 0;
+    const strongVolume = item.udv_state_50d === 'infinity' || finite(item.udv_50d) && item.udv_50d > 1.2;
+    item.priceAndVolumeStrength = !finite(item.return_21d) || item.volumeDemandImproving == null
+      ? null : item.return_21d > 0 && strongVolume && item.volumeDemandImproving;
     item.lifecycle = item.rsPercentile == null ? null
       : item.rsPercentile >= 90 && item.leadingWeeks >= 5 ? 'Established Leader'
       : item.velocity4w > 10 ? (item.rsPercentile >= 75 ? 'Strengthening' : 'Emerging')
@@ -191,12 +205,51 @@ export function annotateVelocity(current, weekly) {
       group[`rankChange${period}w`] = finite(group.rank) && finite(before?.rank) ? before.rank - group.rank : null;
     }
     const old = groupHistory[3]?.get(group.id);
-    group.breadthChange = finite(group.above50) && finite(old?.above50) ? group.above50 - old.above50 : null;
+    group.medianRSChange4w = delta(group.medianRS, old?.medianRS);
+    group.topDecileChange4w = delta(group.topDecile, old?.topDecile);
+    group.breadthChange = delta(group.above50, old?.above50);
+    group.relativeReturnChange4w = delta(group.relativeReturn, old?.relativeReturn);
+    const emergenceInputs = [group.medianRSChange4w, group.topDecileChange4w, group.breadthChange, group.relativeReturnChange4w];
+    group.emerging = emergenceInputs.every(finite) ? emergenceInputs.every((value) => value > 0) : null;
   }
   const industry = new Map(current.groups.map((group) => [group.id, group]));
   for (const row of current.stocks) {
     const group = industry.get(row.industryId);
     row.industryVelocity = group?.velocity4w ?? null;
     row.industryImproving = group?.velocity4w == null ? null : group.velocity4w > 0;
+    row.industryEmerging = group?.emerging ?? null;
   }
+}
+
+export function topDecileIds(snapshot) {
+  return (snapshot.stocks ?? []).filter((row) => finite(row.rsPercentile) && row.rsPercentile >= 90)
+    .map(({ securityId }) => securityId);
+}
+
+export function leadershipStatistics(snapshot, previousDate, previousIds) {
+  const cohort = new Set(previousIds ?? []);
+  let returns = 0;
+  let totalReturn = 0;
+  let comparableRanks = 0;
+  let retained = 0;
+  for (const row of snapshot.stocks ?? []) {
+    if (!cohort.has(row.securityId)) continue;
+    if (finite(row.return_1d)) {
+      totalReturn += row.return_1d;
+      returns++;
+    }
+    if (finite(row.rsPercentile)) {
+      comparableRanks++;
+      if (row.rsPercentile >= 90) retained++;
+    }
+  }
+  return {
+    previousLeaderDate: previousIds == null ? null : previousDate,
+    leaderReturn: returns ? totalReturn / returns : null,
+    leaderReturnExpected: previousIds == null ? null : cohort.size,
+    leaderReturnObservations: returns,
+    leadershipRankObservations: comparableRanks,
+    leadershipPersistence: comparableRanks ? retained / comparableRanks : null,
+    leadershipTurnover: comparableRanks ? (comparableRanks - retained) / comparableRanks : null,
+  };
 }
