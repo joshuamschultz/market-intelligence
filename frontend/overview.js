@@ -9,6 +9,7 @@ import { rangeSegment } from './chart-ranges.js';
 import { openBreadthDrawer } from './contributors.js';
 import { universeDefinition } from './coverage.js';
 import { renderMarketReading } from './market-reading.js';
+import { createTimingReview } from './market-timing.js';
 import { mountSummation } from './summation.js';
 import { groupHeatmapMetrics, renderGroupHeatmap } from './group-visuals.js';
 import { renderHealthAvailability, renderHealthComponents } from './health-visuals.js';
@@ -160,6 +161,8 @@ export async function render(env) {
   const definitions = new Map((config.breadthMetrics || []).map((metric) => [metric.key, metric]));
   let overview = await api('market/overview', { signal });
   if (!env.isActive()) return;
+  const timing = createTimingReview(env, { date: overview.date, dataVersion: overview.dataVersion ?? env.snapshotContext.dataVersion,
+    basis: overview.basis || env.snapshotContext.basis });
   state.tab = env.params.tab || state.tab || 'overview';
   if (env.params.coverage === 'observed' && state.healthCoverage?.coverageMode !== 'observed') state.healthCoverage = { coverageMode: 'observed' };
   state.range ||= 63;
@@ -216,7 +219,8 @@ export async function render(env) {
           { action: 'breadth', value: 'adSpread', style: direction(breadth.adSpread?.value) })}
         ${summary('Composite health', number(currentHealth?.score), healthScoreNote(currentHealth), { action: 'overview-tab', value: 'health' })}
       </section>` +
-      segment('overview-tab', [['overview', 'Breadth overview'], ['monitor', 'Session breakdown'], ['health', 'Health & regimes']], active, 'tabs') +
+      (active === 'monitor' ? '' : '<div id="overview-timing-summary"></div>') +
+      segment('overview-tab', [['overview', 'Breadth overview'], ['monitor', 'Session review'], ['health', 'Health & regimes']], active, 'tabs') +
       (active === 'overview' ? `<div class="market-grid">
         <section class="panel panel-body">${panelHead('Moving-average breadth', 'Share of comparable stocks above key moving averages.',
           rangeSegment('overview-range', state.range) + iconButton('Export breadth chart CSV', 'export-chart', 'download', 'moving-average-breadth.csv'))}
@@ -241,7 +245,7 @@ export async function render(env) {
         <div id="overview-heatmap" class="section-space">${pending('Loading sector and industry groups…')}</div></section>
       <section class="panel panel-body">${panelHead('Moving-average participation', 'Open a reading to reconcile its contributing securities.')}<div class="metric-grid">${averageKeys.map((key) => metricTile(key, breadth, definitions)).join('')}</div></section>
       <div id="market-summation" class="section-space"></div>`
-      : active === 'monitor' ? monitorLayout() : `<form id="health-coverage-form" class="health-coverage-form" aria-describedby="health-coverage-policy">
+      : active === 'monitor' ? '<div id="overview-timing-panel"></div>' + monitorLayout() : `<form id="health-coverage-form" class="health-coverage-form" aria-describedby="health-coverage-policy">
         ${fieldCoverageSelect(policy)}
         <p class="muted" id="health-coverage-policy">${safe(coveragePolicyLine(policy, coverage, state.healthCoverage))}</p>
         ${healthCoverageRules(state.healthCoverage)}
@@ -252,6 +256,7 @@ export async function render(env) {
         <section class="panel panel-body health-divergence-panel">${panelHead('Breadth divergences', 'Dated benchmark and market participation comparisons')}<div id="divergences">${pending()}</div></section></div>
         <section class="panel panel-body">${panelHead('Market health history', 'Published composite scores using the selected market context.',
           rangeSegment('health-range', state.healthRange) + iconButton('Export market health history CSV', 'export-chart', 'download', 'market-health.csv'))}<div id="health-chart">${pending()}</div></section>`) + notes;
+    timing.mount(main.querySelector('#overview-timing-summary'), main.querySelector('#overview-timing-panel'));
     if (active === 'overview') {
       loadMovers();
       loadChart();
@@ -635,6 +640,9 @@ export async function render(env) {
 
   env.setActions({
     'overview-tab'(value) { state.tab = value; showOverview(); },
+    'timing-instrument': timing.instrument,
+    'timing-range': timing.range,
+    'timing-retry': timing.retry,
     'observe-health'() {
       state.healthCoverage = { coverageMode: 'observed' };
       showOverview({ prepareHealth: true });

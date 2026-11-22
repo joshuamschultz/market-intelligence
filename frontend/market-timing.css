@@ -1,0 +1,163 @@
+.timing-summary,
+.timing-head,
+.timing-chart-head,
+.timing-readings,
+.timing-audit-tools,
+.timing-reference-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .5rem .9rem;
+}
+
+.timing-summary {
+  margin: 0 0 .75rem;
+  padding: .55rem .75rem;
+  border: 1px solid var(--border, #30424a);
+  border-radius: 8px;
+  font-size: .82rem;
+}
+
+.timing-summary-link,
+.timing-load-error button {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.timing-load-error {
+  font-size: .85rem;
+  margin: .5rem 0;
+}
+
+.timing-summary-reading {
+  display: inline-flex;
+  align-items: baseline;
+  gap: .4rem;
+}
+
+.timing-stage {
+  border: 1px solid currentColor;
+  padding-inline: .4rem;
+  border-radius: .4rem;
+  font-weight: 650;
+}
+
+.timing-review {
+  margin-block: .9rem;
+  min-width: 0;
+}
+
+.timing-head,
+.timing-chart-head {
+  justify-content: space-between;
+}
+
+.timing-chart-head {
+  margin-block: .75rem .35rem;
+  padding-block-start: .75rem;
+  border-top: 1px solid var(--border, #30424a);
+}
+
+.timing-head :is(h2, p),
+.timing-chart-head :is(h3, p),
+.timing-method p {
+  margin: 0;
+}
+
+.timing-head p,
+.timing-chart-head :is(h3, p),
+.timing-readings,
+.timing-lens,
+.timing-audit-tools {
+  font-size: .85rem;
+}
+
+.timing-readings {
+  margin-block: .55rem;
+}
+
+.timing-chart {
+  min-width: 0;
+}
+
+.timing-technical {
+  padding-top: .6rem;
+  border-top: 1px solid var(--border, #30424a);
+}
+
+.timing-events {
+  padding-left: 1.3rem;
+  font-size: .85rem;
+  margin-block: .45rem .55rem;
+}
+
+.timing-lens {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+  gap: .65rem 1rem;
+  padding-block: .75rem;
+  margin-top: .6rem;
+  border-top: 1px solid var(--border, #30424a);
+}
+
+.timing-lens > div {
+  display: grid;
+  align-content: start;
+  gap: .25rem;
+}
+
+.timing-panel-details {
+  border-top: 1px solid var(--border, #30424a);
+  padding-block: .55rem;
+}
+
+.timing-panel-details summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.timing-panel-details summary .muted {
+  margin-inline: .35rem;
+  font-size: .8rem;
+  font-weight: 400;
+}
+
+.timing-audit-tools,
+.timing-method {
+  margin-block: .65rem .5rem;
+}
+
+.timing-audit-tools label {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .35rem;
+}
+
+.timing-audit-tools input[type="search"] {
+  max-width: min(100%, 15rem);
+}
+
+.timing-audit :is(td, th) {
+  text-align: left;
+  white-space: nowrap;
+}
+
+.timing-method {
+  display: grid;
+  gap: .55rem;
+  max-width: 77ch;
+  font-size: .85rem;
+}
+
+@media (max-width: 600px) {
+  .timing-chart .chart-svg {
+    min-height: 160px;
+  }
+
+  .timing-chart .chart-navigation {
+    gap: .25rem;
+  }
+}

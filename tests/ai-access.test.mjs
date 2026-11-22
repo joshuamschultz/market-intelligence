@@ -1,0 +1,36 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, statSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import test from 'node:test';
+import { createResearchAccess, isResearchAuthorization } from '../backend/ai-access.mjs';
+
+test('dedicated integration credentials store only a digest, preserve private scopes and can be revoked', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'market research access '));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const filename = join(directory, 'credentials.sqlite');
+  const access = createResearchAccess({ filename, now: () => new Date('2025-03-28T20:00:00Z') });
+  assert.deepEqual(access.list().integrations, []);
+  assert.throws(() => statSync(filename), { code: 'ENOENT' });
+  assert.throws(() => access.create({ name: 'all scopes', scopes: ['admin'] }), /supported research scopes/);
+  const { integration, token } = access.create({ name: 'Claude research', scopes: ['research:notes'] });
+  assert.equal(statSync(filename).mode & 0o777, 0o600);
+  assert.deepEqual(integration.scopes, ['research:read', 'research:notes']);
+  assert.equal(integration.revokedAt, null);
+  assert.deepEqual(access.authenticate(token), integration);
+  assert.equal(access.authenticate(token.replace(/\.[\w-]+$/, '.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')), null);
+  assert.equal(access.authenticate('workspace password'), null);
+  assert.equal(isResearchAuthorization(`Bearer ${token}`), true);
+  assert.equal(isResearchAuthorization('Basic ' + Buffer.from(`operator:${token}`).toString('base64')), true);
+  assert.deepEqual(access.list().integrations, [integration]);
+  const db = new DatabaseSync(filename, { readOnly: true });
+  assert.equal(db.prepare('SELECT length(token_hash) AS bytes FROM integrations').get().bytes, 32);
+  assert.doesNotMatch(JSON.stringify(db.prepare('SELECT * FROM integrations').all()), new RegExp(token));
+  db.close();
+  const second = createResearchAccess({ filename });
+  assert.equal(second.authenticate(token).id, integration.id);
+  assert.ok(second.revoke(integration.id).integration.revokedAt);
+  assert.equal(access.authenticate(token), null);
+  assert.equal(access.list().integrations.length, 1);
+});

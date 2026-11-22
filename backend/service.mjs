@@ -15,6 +15,7 @@ import { BREADTH_METRICS, breadthMetric, binaryMetric } from './breadth.mjs';
 import { chartBookIndustryJob, createChartBook, prepareChartBookIndustries, readChartBookSnapshot, scheduleChartBookIndustries } from './chartbook.mjs';
 import { createResearchNotes } from './research-notes.mjs';
 import { prepareDailyAnalysis } from './daily-analysis.mjs';
+import { marketTimingJournalContext, prepareDailyMarketTiming, readPreparedMarketTiming } from './market-timing.mjs';
 import { createEngine, UNIVERSES, validateUniverse } from './engine.mjs';
 import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, volumeRatio } from './metrics.mjs';
 import {
@@ -1848,6 +1849,7 @@ function journalContext(db, engine, payload) {
     universe: snapshot.universe, model: snapshot.model, benchmark: snapshot.benchmark,
     classificationSystem: snapshot.classificationSystem,
     coverage: snapshot.coverage, breadth: snapshot.breadth, aggregates: snapshot.aggregates,
+    sessionReview: marketTimingJournalContext(db, config),
     health: { score: health.score, state: health.state, regime: health.regime, components: health.components },
     groups: snapshot.groups.slice(0, 25).map(({ memberIds, ...group }) => group),
     leaders: traded.filter((row) => row.rsRank != null).sort((a, b) => a.rsRank - b.rsRank).slice(0, 12)
@@ -2112,12 +2114,14 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
       }, { prepareNow: true });
       return prepareDailyAnalysis(db, engine, config, { workspaceScopes: preparationWorkspaceScopes, rangeContext,
         summationContext, prepareStandardHealth, prepareProxies, progress,
+        prepareTiming: (point) => prepareDailyMarketTiming(db, engine, point),
         finalizeAlerts: (point) => updateAlerts(db, engine, point, { rangeOnly: true, priorPrepared: true }) });
     }
     const result = precomputeProduction(db, engine, config, { ...payload, progress });
     prepareStandardHealth(db, engine, config);
+    const sessionReview = prepareDailyMarketTiming(db, engine, engine.context({ date: config.date, dataVersion: config.dataVersion }));
     scheduleChartBookIndustries(db, engine, materializationContext(config), (jobType, input) => createJob(db, jobType, input));
-    return result;
+    return { ...result, sessionReview };
   }
   if (type === 'rank-materialize') return writeRankArchive(db, engine, engine.context(payload.context || {}), { ...payload, progress });
   if (type === 'materialize') {
@@ -2640,6 +2644,8 @@ export function createService({ db, provider, journalClient, workers = true, pre
         const requestedMetrics = query.metrics ? String(query.metrics).split(',').filter((key) => breadthMetric(key) || key === 'adSpread') : [];
         const keys = [...new Set(requestedMetrics.length ? requestedMetrics : item === 'monitor' ? monitorMetrics : [])].slice(0, 24);
         const config = asContext({ breadthKeys: [item === 'breadth' ? action : null, ...keys].filter(Boolean) });
+        if (item === 'timing' && !action) return response(readPreparedMarketTiming(db, config,
+          { limit: parseCount(query.limit, 1, 1260, 252) }));
         if (item === 'summation') {
           const point = summationContext(db, engine, config);
           const result = readPreparedSummation(db, point, { from: query.from, to: query.to,

@@ -6,6 +6,7 @@ import { partialCoverage } from './overview.js';
 import { loadUniverseCounts, universeCountFacts, universeDefinition } from './coverage.js';
 import { modelEditor } from './screener.js';
 import { mountJournalSettings } from './journal.js';
+import { mountAiConnections } from './ai-connections.js';
 import { mountQualityAudit } from './data-quality.js';
 import { setTickerPreviewContext } from './ticker-preview.js';
 
@@ -571,6 +572,7 @@ async function renderSettings(env) {
   let qualityRequest;
   let jobsReady = false;
   let countsRequested = false;
+  let destroyAiConnections;
   const counts = new Map();
   const tiles = [['Corporate action records','corporateActions'],['Dated float records','float'],['Dated share records','shares'],['Industry classifications','classification']];
   function quality() {
@@ -734,11 +736,16 @@ async function renderSettings(env) {
     if (target && error.name !== 'AbortError') target.innerHTML = `<tr><td colspan="4" class="no-rows">${safe(error.message)}</td></tr>`;
   });
   function draw() {
+    destroyAiConnections?.();
+    destroyAiConnections = undefined;
     main.innerHTML=heading('Settings & Data','Inspect provider coverage, workspace definitions, and warehouse jobs.',action('Import data','import-data','plus',{className:'primary'}))+
-      segment('settings-tab',[['quality','Data quality'],['config','Models & universes'],['jobs','Jobs & maintenance'],['journal','Market Journal']],state.tab,'tabs')+
-      (state.tab==='quality'?quality():state.tab==='config'?configurations():state.tab==='jobs'?jobList():'<div id="journal-settings"></div>');
+      segment('settings-tab',[['quality','Data quality'],['config','Models & universes'],['jobs','Jobs & maintenance'],['journal','Market Journal'],['ai-connections','AI connections']],state.tab,'tabs')+
+      (state.tab==='quality'?quality():state.tab==='config'?configurations():state.tab==='jobs'?jobList():
+        state.tab==='ai-connections'?'<div id="ai-connections-settings"></div>':'<div id="journal-settings"></div>');
     const journal = main.querySelector('#journal-settings');
     if (journal) mountJournalSettings(env,journal);
+    const aiConnections = main.querySelector('#ai-connections-settings');
+    if (aiConnections) destroyAiConnections = mountAiConnections(env, aiConnections);
     const qualityAudit = main.querySelector('#quality-source-audit-mount');
     if (qualityAudit) mountQualityAudit(env,qualityAudit,{asOf:data.asOf,initial:data.qualityOverrides});
     if (state.tab === 'config' && !countsRequested) {
@@ -763,7 +770,14 @@ async function renderSettings(env) {
     });
   }
   env.setActions({
-    'settings-tab'(value) { state.tab=value; draw(); if (value === 'quality') loadQuality(); },
+    'settings-tab'(value) {
+      if (state.tab === value) return;
+      state.tab = value;
+      env.replaceParams?.({ tab: value });
+      draw();
+      main.querySelector('.tabs [data-action="settings-tab"][aria-pressed="true"]')?.focus();
+      if (value === 'quality') loadQuality();
+    },
     'retry-quality': () => loadQuality(),
     'import-data':()=>importEditor(env),
     'provider-probe':()=>launch('data/probe'),

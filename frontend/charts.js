@@ -103,13 +103,22 @@ function drawChart(view) {
     return `<line x1="${center}" x2="${center}" y1="${y(row.high)}" y2="${y(row.low)}" stroke="${color}" vector-effect="non-scaling-stroke"/>
       <rect x="${center - w/2}" y="${Math.min(open, close)}" width="${w}" height="${Math.max(1, Math.abs(close-open))}" fill="${color}"/>`;
   }).join('') : '';
-  const lines = series.map((item, index) => options.candles && index === 0 ? '' : lineSegments(content[index], x, (value) => y(value, item.axis)).map((points) => {
+  const lines = series.map((item, index) => item.pointMarker || options.candles && index === 0 ? '' : lineSegments(content[index], x, (value) => y(value, item.axis)).map((points) => {
     const line = path(points);
     const fill = index === 0 && options.fill && points.length > 1
       ? `<path d="${line} L${points.at(-1)[0]} ${bottom} H${points[0][0]} Z" fill="url(#${id}-gradient)"/>` : '';
     return `${fill}${points.length === 1
       ? `<circle cx="${points[0][0]}" cy="${points[0][1]}" r="3" fill="${item.color}"/>`
       : `<path class="chart-line" d="${line}" fill="none" stroke="${item.color}" stroke-width="${index ? 1.65 : 2.25}" vector-effect="non-scaling-stroke"${item.dash ? ' stroke-dasharray="4 4"' : ''}/>`}`;
+  }).join('')).join('');
+  const pointMarkers = series.map((item, index) => !item.pointMarker ? '' : content[index].map((value, position) => {
+    if (!numeric(value)) return '';
+    const px = x(position);
+    const py = y(value, item.axis);
+    if (rows.length > 126) return `<circle cx="${px}" cy="${py}" r="2.5" fill="${item.color}" aria-hidden="true"/>`;
+    const badgeY = py < top + 15 ? py + 12 : py - 12;
+    return `<g transform="translate(${px} ${badgeY})" aria-hidden="true"><rect x="-6" y="-6" width="12" height="12" rx="3" fill="#152028" stroke="${item.color}"/>
+      <text fill="${item.color}" dominant-baseline="central" text-anchor="middle" font-size="9" font-weight="700">${safe(item.pointMarker)}</text></g>`;
   }).join('')).join('');
   const volumeMax = options.volume ? extent(rows.map(({ volume }) => volume))[1] : 0;
   const volume = numeric(volumeMax) && volumeMax > 0 ? rows.map((row, index) => {
@@ -147,7 +156,7 @@ function drawChart(view) {
     ${scales}
     <svg class="chart-svg" viewBox="0 0 ${width} ${height}" tabindex="0" role="${notes ? 'group' : 'img'}" aria-label="${safe(options.label || series.map(({ label }) => label).join(' and '))}. Use arrow keys to inspect sessions." data-plot="${id}">
       <defs><linearGradient id="${id}-gradient" x2="0" y2="1" gradientUnits="objectBoundingBox"><stop stop-color="${series[0].color}" stop-opacity=".18"/><stop offset="1" stop-color="${series[0].color}" stop-opacity=".015"/></linearGradient></defs>
-      <g fill="#98aab3" font-size="10.5" font-family="monospace">${grid}${axisLabels}</g>${candles}${lines}${volume}
+      <g fill="#98aab3" font-size="10.5" font-family="monospace">${grid}${axisLabels}</g>${candles}${lines}${volume}${pointMarkers}
       <g class="chart-crosshair" hidden></g>${notes}
     </svg>
     <div class="chart-tooltip" hidden></div><div class="legend chart-legend">${legend}${options.volume ? '<span class="legend-item"><i class="legend-mark" style="--series-color:#5d8278"></i>Share volume</span>' : ''}</div>${controls}
@@ -193,7 +202,7 @@ function showPoint(node, plot, index) {
   plot.active = point;
   const crosshair = node.querySelector('.chart-crosshair');
   const x = plot.x(point);
-  const signals = plot.series.map((item, group) => [item, plot.content[group][point]]);
+  const signals = plot.series.map((item, group) => [item, plot.content[group][point]]).filter(([item]) => !item.pointMarker);
   tooltip.innerHTML = `<strong>${safe(dateLabel(plot.rows[point].date))}</strong>` + signals.map(([item, value]) =>
     `<span><i class="legend-mark" style="--series-color:${item.color}"></i> ${safe(item.label)} <strong>${safe(item.format(value))}</strong></span>`).join('');
   const descriptions = plot.describePoint?.(plot.rows[point]) || [];

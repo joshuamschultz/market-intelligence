@@ -9,7 +9,7 @@
 Start with the whole U.S. market. Find the industry groups that lead it. Find the stocks that drive those groups.<br>
 Then review every chart once and keep a dated record of what you saw.
 
-[![Version](https://img.shields.io/badge/version-0.2.7-55d9bd?style=for-the-badge)](package.json)
+[![Version](https://img.shields.io/badge/version-0.3.0-55d9bd?style=for-the-badge)](package.json)
 [![Node.js](https://img.shields.io/badge/node-24.15%2B%20%7C%2026%20LTS-3c873a?style=for-the-badge&logo=node.js&logoColor=white)](#-requirements)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](docs/ARCHITECTURE.md)
 [![Local first](https://img.shields.io/badge/runs-on%20your%20machine-0b1216?style=for-the-badge)](#-privacy-and-security)
@@ -168,7 +168,7 @@ Most tools show you one piece: a chart, a screener, or an index. Market Intellig
 
 | | Page | What you see | Use it to answer |
 | :---: | :--- | :--- | :--- |
-| 🌐 | **Market Overview** | Index context, breadth counts, leadership, market health | *Is the market healthy right now?* |
+| 🌐 | **Market Overview** | Index context, breadth counts, leadership, market health, Session Review | *What does the selected rule profile observe this session?* |
 | 📉 | **Market Monitor** | Momentum and participation readings by session | *Is this move broad or narrow?* |
 | 🔎 | **Stock Screener** | Nested filters, sorts, computed columns | *Which stocks match my rules today?* |
 | 🏆 | **RS Rankings** | Model-based ranks, percentiles, and velocity | *Which stocks are strongest, and which are improving?* |
@@ -323,7 +323,7 @@ Copy `.env.example` to `.env` and set what you need. Keep `.env` private.
 | **Frontend** | Plain JavaScript, HTML, and CSS, no build step |
 | **Exports** | CSV, Parquet via DuckDB CLI |
 | **Tests** | Node built-in test runner, jsdom for UI tests |
-| **AI (optional)** | Anthropic Claude for Journal drafts; MCP server in development |
+| **AI (optional)** | Anthropic Claude for Market Journal drafts; scoped read-only research API and MCP |
 
 ## 📁 Project layout
 
@@ -357,8 +357,8 @@ Copy `.env.example` to `.env` and set what you need. Keep `.env` private.
 
 - 🏠 **Local by default.** The server binds to `127.0.0.1`. The warehouse, captures, logs, and backups stay in `data/`, which Git ignores.
 - 🔑 **Keys stay on the server.** Provider keys are never sent to the browser.
-- 🤖 **AI is opt-in.** Market context goes to Anthropic only when you ask for a Journal draft. Private notes need a separate opt-in.
-- 🧩 **Research API and MCP server** for external AI clients are in development and not in a released build.
+- 🤖 **AI is opt-in.** Market Journal drafts send selected context to Anthropic when requested; private notes require a separate opt-in. External research clients receive only results allowed by their scoped token, and their prompt/tool results are sent to the provider you choose.
+- 🧩 **Research API and MCP** provide scoped, read-only access to prepared data. External clients receive the tool results you request; provider accounts are not connected by default. See [AI connections](docs/AI-CONNECTIONS.md) and [AI research contract](docs/AI-RESEARCH-CONTRACT.md).
 
 ## 🧑‍💻 Development
 
@@ -375,7 +375,7 @@ npm test
 
 ## 📍 Project status
 
-Current release: **0.2.7**. Use `/api/v1/build` or `data/active-release.json` to see the active build.
+Source package version: **0.3.0**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
 
 | Area | Status | Notes |
 | :--- | :---: | :--- |
@@ -384,7 +384,7 @@ Current release: **0.2.7**. Use `/api/v1/build` or `data/active-release.json` to
 | SEC industry groups (68) with velocity | ✅ | Ready |
 | Daily ordered catch-up | 🟡 | Tested on synthetic data; no live provider day observed yet |
 | Cold five-year rebuild speed | 🟡 | 72.6 minutes vs a 10-minute target |
-| Research API and MCP server | 🟡 | In development |
+| Research API and MCP server | 🟡 | Implemented and tested in source; no external client/provider account has been connected |
 | Docker deployment | ⚪ | Config present, not verified |
 
 Open items: [Remaining work](docs/REMAINING-WORK.md) · [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md)
@@ -396,6 +396,9 @@ Open items: [Remaining work](docs/REMAINING-WORK.md) · [Performance acceptance]
 | 🖥️ [Desktop quickstart](docs/LOCAL-QUICKSTART.md) | Install and run the managed macOS service |
 | 🔧 [Operations](docs/OPERATIONS.md) | Import, backup, restore, and recovery |
 | 🏗️ [Architecture](docs/ARCHITECTURE.md) | Data flow and system design |
+| 🧭 [AI connections](docs/AI-CONNECTIONS.md) | Scoped API/MCP access and provider-specific connection limits |
+| 🤖 [AI research contract](docs/AI-RESEARCH-CONTRACT.md) | Tool catalog, provenance, pagination, and statistical interpretation |
+| 📊 [Session Review](docs/SESSION-REVIEW.md) | Rule profile, trend and breadth definitions, data limits |
 | 📈 [ChartBook guide](docs/CHARTBOOK.md) | Chart review, shortcuts, and notes |
 | 📋 [Requirements](docs/REQUIREMENTS.md) | Requirements and implementation status |
 | ⏱️ [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md) | Targets and measured results |
@@ -447,7 +450,7 @@ No. It is a research and review workspace. It links to TradingView for full char
 <summary><b>Does my data leave my computer?</b></summary>
 <br>
 
-No, unless you ask for a Market Journal draft from Claude. Then only the selected market context goes to Anthropic. Notes go only with a separate opt-in.
+The app is local-first, but external AI calls send the prompt and selected tool results to that provider. A scoped research token can read only its authorized prepared data; notes and Market Journal records require their own opt-in scopes. The separate Market Journal generation feature sends selected context to Anthropic when requested; personal notes are included only with a separate opt-in. External provider accounts are not connected by default.
 
 </details>
 

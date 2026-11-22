@@ -155,11 +155,11 @@ function prepareInstruments(db, engine, config, parent, plans, progress) {
 }
 
 export function prepareDailyAnalysis(db, engine, config, {
-  workspaceScopes, rangeContext, summationContext, prepareStandardHealth, prepareProxies, finalizeAlerts, progress,
+  workspaceScopes, rangeContext, summationContext, prepareStandardHealth, prepareProxies, prepareTiming = () => undefined, finalizeAlerts, progress,
 }) {
   const point = { date: config.date, dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION };
   const exact = verifiedAnalysisPublication(db, point);
-  if (exact) return { ...point, ...exact, chartBook: prepareProxies(config) };
+  if (exact) return { ...point, ...exact, chartBook: prepareProxies(config), sessionReview: prepareTiming(config) };
   const parent = dailyAnalysisParent(db, point);
   if (!parent) return { ...point, analysisPreparation: 'verified_baseline_required' };
   const scopes = workspaceScopes(db, engine, { date: point.date, version: point.dataVersion });
@@ -252,12 +252,14 @@ export function prepareDailyAnalysis(db, engine, config, {
   if (sum.rows.length !== 2 || sum.rows.some((row, index) => row.date !== dates[index])) throw new Error('Missing prepared NYSE summation');
   products.nyseSummation = 1;
   const chartBook = prepareProxies(config);
+  const sessionReview = prepareTiming(scopes.basePoint);
   const alerts = finalizeAlerts(point);
   if (alerts.deferred.length) throw new Error('A saved alert is missing required range or dated screen products');
   if (dataVersion(db) !== point.dataVersion) throw new Error('Warehouse revision changed during daily analysis preparation');
   const proof = Object.fromEntries(Object.entries(products).map(([key, verified]) => [key, { expected: expected[key], verified }]));
+  if (sessionReview?.verified) proof.sessionReview = { expected: 1, verified: 1, modelVersion: sessionReview.modelVersion };
   const receiptId = writeDailyAnalysisReceipt(db, point, parent, { recipeHash: rootPlan.recipeHash, contexts: parent.contexts, products: proof });
   progress(1);
   return { ...point, receiptId, parentDate: parent.date, parentDataVersion: parent.dataVersion, dates, products, core,
-    physicalContexts: plan.contexts.length, fixedContexts: fixed.length, instruments: stats, chartBook, alerts };
+    physicalContexts: plan.contexts.length, fixedContexts: fixed.length, instruments: stats, chartBook, sessionReview, alerts };
 }

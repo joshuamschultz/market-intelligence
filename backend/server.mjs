@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bulkSessionStatus, CALCULATION_VERSION, dailyPublication, openDatabase } from './database.mjs';
 import { expectedSessions, latestFinalizableSession, shiftDate } from './calendar.mjs';
@@ -9,6 +10,9 @@ import { journalDueDate } from './journal.mjs';
 import { createService, dailyCaptureAvailability, defaultMarketSyncAfter, hasUnprovedDailyGap, marketSyncAfter,
   orderedDailyPoint, orderedDailyTarget, scheduledJournalReadiness, scheduledPrecomputeKey } from './service.mjs';
 import { runningRelease } from '../scripts/release.mjs';
+import { createResearchAccess, isResearchAuthorization } from './ai-access.mjs';
+import { createResearchHttp, researchRequestBytes } from './ai-mcp.mjs';
+import { createResearchEngine } from './ai-research.mjs';
 
 const publicDir = fileURLToPath(new URL('../frontend/', import.meta.url));
 const backendDir = fileURLToPath(new URL('./', import.meta.url));
@@ -33,14 +37,14 @@ const commonHeaders = {
 };
 const loopbackNames = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
-async function readBody(request) {
-  const maxBytes = 30 * 1024 * 1024;
-  if (Number(request.headers['content-length']) > maxBytes) throw Object.assign(new Error('Request exceeds the 30 MB limit'), { status: 413 });
+async function readBody(request, maxBytes = 30 * 1024 * 1024) {
+  const tooLarge = () => Object.assign(new Error('Request exceeds the body size limit'), { status: 413 });
+  if (Number(request.headers['content-length']) > maxBytes) throw tooLarge();
   const chunks = [];
   let total = 0;
   for await (const chunk of request) {
     total += chunk.length;
-    if (total > maxBytes) throw Object.assign(new Error('Request exceeds the 30 MB limit'), { status: 413 });
+    if (total > maxBytes) throw tooLarge();
     chunks.push(chunk);
   }
   if (!total) return {};
@@ -85,8 +89,9 @@ export async function buildInformation() {
   return metadata;
 }
 
-export function createHandler({ service, token = '', host = '127.0.0.1' }) {
+export function createHandler({ service, token = '', host = '127.0.0.1', research, access, researchRuntime }) {
   const isLocal = loopbackNames.has(host);
+  const researchHttp = research && access ? createResearchHttp({ research, access }) : null;
   return async (req, res) => {
     const send = (status, headers, body) => {
       res.writeHead(status, { ...commonHeaders, ...headers });
@@ -97,13 +102,29 @@ export function createHandler({ service, token = '', host = '127.0.0.1' }) {
       const { pathname } = new URL(req.url, 'http://localhost');
       const hostname = new URL(`http://${req.headers.host || 'localhost'}`).hostname;
       if (isLocal && !loopbackNames.has(hostname)) return json(403, { error: 'Use the local workspace address' });
-      if (!authorized(req, token)) return json(401, { error: 'Workspace authentication required' }, { 'WWW-Authenticate': 'Basic realm="Market Intelligence", charset="UTF-8"' });
+      if (pathname === '/mcp' || pathname.startsWith('/research/v1/')) {
+        if (!researchHttp) return json(404, { error: 'Research route not found' });
+        return await researchHttp.handle({ req, res, pathname, json, readBody });
+      }
+      if (isResearchAuthorization(req.headers.authorization) || !authorized(req, token)) {
+        return json(401, { error: 'Workspace authentication required' }, { 'WWW-Authenticate': 'Basic realm="Market Intelligence", charset="UTF-8"' });
+      }
       if (pathname.startsWith('/api/v1/')) {
         if (!['GET', 'HEAD'].includes(req.method) && req.headers.origin) {
           const remote = new URL(req.headers.origin).host;
           if (remote !== req.headers.host) return json(403, { error: 'Cross-origin mutation is denied' });
         }
         if (pathname === '/api/v1/build' && ['GET', 'HEAD'].includes(req.method)) return json(200, await buildInformation());
+        if (pathname === '/api/v1/research-access' || pathname.startsWith('/api/v1/research-access/')) {
+          if (!access) return json(404, { error: 'Research access is unavailable' });
+          if (pathname === '/api/v1/research-access') {
+            if (['GET', 'HEAD'].includes(req.method)) return json(200, { ...access.list(), runtime: researchRuntime ?? null });
+            if (req.method === 'POST') return json(201, access.create(await readBody(req, researchRequestBytes)));
+          }
+          const id = /^\/api\/v1\/research-access\/([^/]+)$/.exec(pathname)?.[1];
+          if (id && req.method === 'DELETE') return json(200, access.revoke(id));
+          return json(405, { error: 'Research access method is unavailable' });
+        }
         const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : {};
         const outcome = await service.dispatch({ method: req.method === 'HEAD' ? 'GET' : req.method, url: req.url, body });
         const result = pathname === '/api/v1/config' && outcome.status === 200
@@ -252,10 +273,22 @@ export function startServer() {
   const db = openDatabase();
   db.prepare("UPDATE jobs SET status='failed', error='Workspace stopped before job completion' WHERE status='running'").run();
   const service = createService({ db });
-  const server = createServer(createHandler({ service, token, host }));
+  const warehouse = db.location();
+  const researchDb = warehouse ? new DatabaseSync(warehouse, { readOnly: true }) : db;
+  if (researchDb !== db) researchDb.exec('PRAGMA busy_timeout=5000');
+  const access = createResearchAccess({ filename: warehouse ? `${warehouse}.research-access.sqlite` : ':memory:' });
+  const research = createResearchEngine(researchDb);
+  const workspace = release ? resolve(codeRoot, '../../..') : codeRoot;
+  const researchRuntime = { command: process.execPath, scriptPath: resolve(workspace, 'scripts/research-mcp.mjs'), database: warehouse };
+  const server = createServer(createHandler({ service, token, host, research, access, researchRuntime }));
   const timer = schedule(service, db, cutoff,
     process.env.MARKET_SYNC === '1' && Boolean(process.env.EODHD_API_KEY));
-  server.on('close', () => { clearInterval(timer); db.close(); });
+  server.on('close', () => {
+    clearInterval(timer);
+    if (researchDb !== db) researchDb.close();
+    access.close();
+    db.close();
+  });
   server.listen(port, host, () => console.log(`Market Intelligence at http://${host.includes(':') ? `[${host}]` : host}:${port}`));
   return server;
 }
