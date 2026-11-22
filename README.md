@@ -14,6 +14,7 @@ Then review every chart once and keep a dated record of what you saw.
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](docs/ARCHITECTURE.md)
 [![Local first](https://img.shields.io/badge/runs-on%20your%20machine-0b1216?style=for-the-badge)](#-privacy-and-security)
 [![Status](https://img.shields.io/badge/status-active%20development-f0b429?style=for-the-badge)](#-project-status)
+[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-8a63d2?style=for-the-badge)](LICENSE.md)
 
 **[Features](#-features)** &nbsp;·&nbsp; **[Screenshots](#-screenshots)** &nbsp;·&nbsp; **[Quick start](#-quick-start)** &nbsp;·&nbsp; **[How it works](#-how-it-works)** &nbsp;·&nbsp; **[Docs](#-documentation)** &nbsp;·&nbsp; **[FAQ](#-faq)**
 
@@ -44,7 +45,7 @@ Then review every chart once and keep a dated record of what you saw.
 | [Features](#-features) | [Research workflow](#-the-research-workflow) | [Project layout](#-project-layout) | [FAQ](#-faq) |
 | [Screenshots](#-screenshots) | [Keyboard shortcuts](#%EF%B8%8F-keyboard-shortcuts) | [Data sources and limits](#-data-sources-and-limits) | [Disclaimer](#%EF%B8%8F-disclaimer) |
 | [Quick start](#-quick-start) | [Everyday commands](#-everyday-commands) | [Privacy and security](#-privacy-and-security) | |
-| [Configuration](#%EF%B8%8F-configuration) | | [Development](#-development) | |
+| [Configuration](#%EF%B8%8F-configuration) | | [Development](#-development) | [License](#-license) |
 
 </details>
 
@@ -457,6 +458,26 @@ No, unless you ask for a Market Journal draft from Claude. Then only the selecte
 The capture pipeline uses **EODHD** for end-of-day prices, history, and corporate actions. You need your own API key.
 
 </details>
+
+## 📜 License
+
+Market Intelligence is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+
+| You may | You may not |
+| :--- | :--- |
+| ✅ Use it for personal research, study, and hobby trading | ❌ Sell it, or use it inside a paid product or service |
+| ✅ Change it and share your changes for noncommercial use | ❌ Use it for commercial purposes without a separate license |
+| ✅ Use it at charities, schools, public research, and government groups | ❌ Remove the copyright notice |
+
+Anyone who shares a copy must keep the license and this line:
+
+```text
+Required Notice: Copyright (c) 2026 Josh Schultz (https://github.com/joshuamschultz)
+```
+
+**Commercial use.** A commercial license is available from the author. Contact [Josh Schultz on GitHub](https://github.com/joshuamschultz).
+
+**Contributions.** By sending a pull request, you agree that the author may license your contribution under these terms and under separate commercial terms.
 
 ## ⚖️ Disclaimer
 
