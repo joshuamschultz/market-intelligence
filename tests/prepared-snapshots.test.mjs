@@ -3,7 +3,7 @@ import test from 'node:test';
 import { CALCULATION_VERSION, importDataset, openDatabase } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
 import {
-  hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot, writePreparedSnapshot, writePreparedSnapshotBatch,
+  hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot, readPreparedWeeklySnapshots, writePreparedSnapshot, writePreparedSnapshotBatch,
 } from '../backend/prepared-snapshots.mjs';
 import { readStockFrame } from '../backend/snapshot-frame.mjs';
 import { compressStoredBytes, decodeStoredJson, preparedCodec } from '../backend/storage-codec.mjs';
@@ -220,6 +220,62 @@ test('typed frames share base, taxonomy, and velocity layers with ordered exact 
   assert.deepEqual(readPreparedSnapshot(db, engine, original, { velocity: true, securityIds: ['global:AAA'], stockFields: ['rsRank', 'velocity4w'] }).stocks,
     [{ securityId: 'global:AAA', rsRank: 3, velocity4w: -2 }]);
   assert.deepEqual(readPreparedSnapshot(db, engine, original, { securityIds: ['bogus'] }).stocks, []);
+});
+
+test('weekly archive reads decode each physical bucket once and preserve matching dated projections', (t) => {
+  const db = temporaryDb(t);
+  const first = point();
+  const second = point({ variant: 'different ranks' });
+  const legacy = point({ variant: 'legacy snapshot' });
+  const groups = [{ id: 'group:a', rank: 1, above50: null, memberIds: ['global:A', 'global:B'] }];
+  const base = [
+    { securityId: 'global:A', rsRank: 1, rsPercentile: 99.9, rsScore: 12, udv_50d: null, up_volume_50d: 15, ignored: { nested: true } },
+    { securityId: 'global:B', rsRank: null, udv_50d: 0.7, up_volume_50d: 5 },
+  ];
+  const typed = (config, rows) => ({ config, snapshot: snapshot(config, rows.map((row) => row.overrides), { groups }), stockRows: rows });
+  writePreparedSnapshotBatch(db, engine, [
+    typed(first, base.map((row) => ({ base: row, overrides: Object.create(row), baseAfter: 0 }))),
+    typed(second, base.toReversed().map((row) => ({ base: row,
+      overrides: Object.assign(Object.create(row), { rsRank: 3, up_volume_50d: undefined }), baseAfter: 0 }))),
+  ]);
+  writePreparedSnapshot(db, engine, legacy, snapshot(legacy, base.toReversed(), { groups }));
+  const quote = (session, close) => ({ symbol: 'AAA', date: session, knownAt: session,
+    open: close, high: close, low: close, close, volume: 10_000 });
+  const next = '2024-01-08';
+  const { version } = importDataset(db, { provider: 'fixture', prices: [quote(next, 100)] });
+  const pinned = [first, second, legacy].map((config) => ({ ...config, dataVersion: version, latestDate: next, referenceMode: 'latest' }));
+  const stockFields = ['rsRank', 'rsPercentile', 'rsScore', 'udv_50d', 'up_volume_50d'];
+  const groupFields = ['id', 'rank', 'percentile', 'above50', 'medianRS', 'topDecile', 'relativeReturn'];
+  const stats = { frameBuckets: 0, frameProjections: 0, compressedBytes: 0, decodedBytes: 0, headerBlobs: 0, legacySnapshots: 0 };
+  const options = { stockFields, groupFields };
+  const actual = readPreparedWeeklySnapshots(db, engine, pinned, { ...options, stats });
+  assert.deepEqual(actual, pinned.map((config) => ({ stocks: readPreparedSnapshot(db, engine, config, { stockFields }).stocks,
+    groups: [{ id: 'group:a', rank: 1, percentile: undefined, above50: null, medianRS: undefined, topDecile: undefined, relativeReturn: undefined }] })));
+  assert.deepEqual(actual[1].stocks.map(({ securityId }) => securityId), ['global:B', 'global:A']);
+  assert.equal(Object.hasOwn(actual[1].stocks[0], 'up_volume_50d'), false);
+  const physical = db.prepare('SELECT count(*) AS count, sum(length(value)) AS bytes FROM prepared_snapshot_frames').get();
+  assert.equal(stats.frameBuckets, physical.count);
+  assert.equal(stats.frameProjections, physical.count * 2);
+  assert.equal(stats.compressedBytes, physical.bytes);
+  assert.ok(stats.decodedBytes > 0 && stats.headerBlobs > 0);
+  assert.equal(stats.legacySnapshots, 1);
+
+  db.exec('SAVEPOINT remove_bucket');
+  db.exec('DELETE FROM prepared_snapshot_frames');
+  assert.throws(() => readPreparedWeeklySnapshots(db, engine, pinned, options), /stock frame block is missing/);
+  db.exec('ROLLBACK TO remove_bucket; RELEASE remove_bucket');
+  const header = db.prepare('SELECT value FROM prepared_snapshot_blobs').all().map(({ value }) => decodeStoredJson(value))
+    .find((value) => value[0] === 'prepared-header-2');
+  db.exec('SAVEPOINT remove_members');
+  db.prepare('DELETE FROM prepared_snapshot_blobs WHERE blob=?').run(header[2]);
+  assert.throws(() => readPreparedWeeklySnapshots(db, engine, pinned, options), /membership dictionary is missing/);
+  db.exec('ROLLBACK TO remove_members; RELEASE remove_members');
+  db.exec("SAVEPOINT bad_count; UPDATE prepared_snapshot_contexts SET stock_count='bad',delta_mask=0");
+  assert.throws(() => readPreparedWeeklySnapshots(db, engine, pinned, options), /stock count is invalid/);
+  assert.throws(() => readPreparedSnapshot(db, engine, pinned[0]), /stock count is invalid/);
+  db.exec('ROLLBACK TO bad_count; RELEASE bad_count');
+  const corrected = importDataset(db, { provider: 'fixture', prices: [quote(date, 95)] }).version;
+  assert.deepEqual(readPreparedWeeklySnapshots(db, engine, pinned.map((config) => ({ ...config, dataVersion: corrected })), options), [null, null, null]);
 });
 
 test('typed frames insert multiple Monitor fields in order and reuse independent layers', (t) => {

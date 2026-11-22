@@ -1,5 +1,6 @@
 import { expectedSessions, isMarketSession, shiftDate } from './calendar.mjs';
 import { CALCULATION_VERSION, isoDate } from './database.mjs';
+import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 
 const method = 'ratio-adjusted-v1';
 const warmupSessions = 80;
@@ -18,6 +19,13 @@ const schema = `CREATE TABLE IF NOT EXISTS prepared_nyse_summation (
   value TEXT NOT NULL,
   PRIMARY KEY (recipe, data_version, date)
 ) WITHOUT ROWID`;
+
+const appendSchema = `CREATE TABLE IF NOT EXISTS prepared_nyse_summation_appends (
+  recipe TEXT NOT NULL, data_version INTEGER NOT NULL, date TEXT NOT NULL,
+  parent_version INTEGER NOT NULL, parent_date TEXT NOT NULL, segment TEXT NOT NULL,
+  PRIMARY KEY(recipe,data_version)
+) WITHOUT ROWID`;
+const hasAppends = (db) => db.prepare("SELECT 1 FROM sqlite_schema WHERE name='prepared_nyse_summation_appends' AND type='table'").get();
 
 const methodologySources = [
   { label: 'McClellan oscillator calculation', url: 'https://www.mcoscillator.com/learning_center/kb/mcclellan_oscillator/Calculating_the_McClellan_Oscillator/' },
@@ -64,7 +72,7 @@ function averageSignal(segment, date, value, period) {
     [`lastCross${period}`]: segment.lastCross[period] ?? null };
 }
 
-export function calculateSummation(sessions, breadthRows) {
+function advanceSummation(sessions, breadthRows, segment = newSegment()) {
   if (!sessions.length && !breadthRows.length) return [];
   if (!isoDate(sessions[0]) || !isoDate(sessions.at(-1)) || sessions[0] > sessions.at(-1)) {
     throw new RangeError('Supply an ordered range of expected NYSE sessions');
@@ -80,8 +88,7 @@ export function calculateSummation(sessions, breadthRows) {
     byDate.set(row.date, row);
   }
 
-  let segment = newSegment();
-  return sessions.map((date) => {
+  const rows = sessions.map((date) => {
     const counts = coverage(date, byDate.get(date));
     let ratioAdjustedNet = null;
     let oscillator = null;
@@ -113,8 +120,12 @@ export function calculateSummation(sessions, breadthRows) {
       ...averageSignal(segment, date, value, 10), ...averageSignal(segment, date, value, 20),
     };
   });
+  return { rows, segment };
 }
 
+export function calculateSummation(sessions, breadthRows) {
+  return sessions.length || breadthRows.length ? advanceSummation(sessions, breadthRows).rows : [];
+}
 function identity(context) {
   const { universe, basis, dataVersion, earliestDate, referenceMode = 'as-of', observedReferenceDate } = context;
   if (universe?.id !== 'nyse' || !Number.isInteger(universe.version) || universe.version < 1) {
@@ -176,6 +187,69 @@ export function prepareSummation(db, context, sessions, breadthRows) {
   }
 }
 
+export function appendSummation(db, context, parent, breadthRow) {
+  const { recipe, dataVersion, seedStart } = identity(context);
+  const { date } = context;
+  const span = expectedSessions(parent.date, date);
+  const bounds = reusableArchiveVersions(db, { ...context, referenceMode: 'as-of' }, [parent.dataVersion]);
+  if (parent.dataVersion >= dataVersion || span.length !== 2 || span[0] !== parent.date || span[1] !== date ||
+      !usableArchiveRow(bounds, { date: parent.date, data_version: parent.dataVersion }) || breadthRow?.date !== date) {
+    throw new Error('NYSE summation append requires consecutive sessions and an unchanged source prefix');
+  }
+  db.exec(appendSchema);
+  const saved = db.prepare('SELECT date,segment FROM prepared_nyse_summation_appends WHERE recipe=? AND data_version=?');
+  const prior = saved.get(recipe, parent.dataVersion);
+  let segment;
+  if (prior) {
+    if (prior.date !== parent.date) throw new Error('NYSE summation append has a different prior anchor');
+    segment = JSON.parse(prior.segment);
+  } else {
+    const known = db.prepare('SELECT value FROM prepared_nyse_summation WHERE recipe=? AND data_version=? AND date=?');
+    const last = known.get(recipe, parent.dataVersion, parent.date);
+    if (!last) throw new Error('NYSE summation append is missing the verified parent session');
+    const observed = JSON.parse(last.value);
+    if (observed.state === 'gap') segment = newSegment();
+    else {
+      const tail = db.prepare(`SELECT value FROM prepared_nyse_summation WHERE recipe=? AND data_version=? AND date<=?
+        ORDER BY date DESC LIMIT ?`).all(recipe, parent.dataVersion, parent.date, Math.max(warmupSessions, ...averagePeriods))
+        .reverse().map(({ value }) => JSON.parse(value));
+      if (observed.state === 'warmup') {
+        const warmup = tail.slice(-observed.consecutiveObservations);
+        const replay = advanceSummation(warmup.map(({ date }) => date), warmup);
+        segment = replay.segment;
+      } else {
+        segment = { observed: observed.consecutiveObservations, fast: observed.fastEMA, slow: observed.slowEMA,
+          sum: observed.value, values: tail.filter(({ value }) => value != null).slice(-averagePeriods.at(-1)).map(({ value }) => value),
+          side: {}, lastCross: {} };
+        const firstAvailable = expectedSessions(seedStart, parent.date).at(-observed.consecutiveObservations + warmupSessions);
+        for (const period of averagePeriods) {
+          const lastCross = observed[`lastCross${period}`];
+          if (lastCross) segment.lastCross[period] = lastCross;
+          const recent = tail.findLast((row) => row.date >= firstAvailable && ['above', 'below'].includes(row[`position${period}`]));
+          const older = !recent && !lastCross && db.prepare(`SELECT json_extract(value,'$.position${period}') AS position
+            FROM prepared_nyse_summation WHERE recipe=? AND data_version=? AND date BETWEEN ? AND ?
+            AND json_extract(value,'$.position${period}') IN ('above','below') ORDER BY date DESC LIMIT 1`)
+            .get(recipe, parent.dataVersion, firstAvailable, parent.date);
+          segment.side[period] = recent?.[`position${period}`] ?? lastCross?.direction ?? older?.position;
+        }
+      }
+    }
+  }
+  const next = advanceSummation([date], [breadthRow], segment);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const changes = db.prepare('INSERT OR IGNORE INTO prepared_nyse_summation VALUES (?,?,?,?)')
+      .run(recipe, dataVersion, date, JSON.stringify(next.rows[0])).changes;
+    db.prepare('INSERT OR IGNORE INTO prepared_nyse_summation_appends VALUES (?,?,?,?,?,?)')
+      .run(recipe, dataVersion, date, parent.dataVersion, parent.date, JSON.stringify(next.segment));
+    db.exec('COMMIT');
+    return { written: changes, through: date };
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function readPreparedSummation(db, context, { from, to, limit = 252 } = {}) {
   const { recipe, dataVersion, seedStart, metadata } = identity(context);
   const date = context.date ?? null;
@@ -193,8 +267,19 @@ export function readPreparedSummation(db, context, { from, to, limit = 252 } = {
   if (start > end) return result;
   const present = db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='prepared_nyse_summation'").get();
   if (!present) return { ...result, status: 'unprepared' };
-  const stored = db.prepare(`SELECT value FROM prepared_nyse_summation WHERE recipe=? AND data_version=?
-    AND date BETWEEN ? AND ? ORDER BY date DESC LIMIT ?`).all(recipe, dataVersion, start, end, count);
+  const read = db.prepare(`SELECT value FROM prepared_nyse_summation WHERE recipe=? AND data_version=?
+    AND date BETWEEN ? AND ? ORDER BY date DESC LIMIT ?`);
+  const link = hasAppends(db) && db.prepare(`SELECT parent_version,parent_date FROM prepared_nyse_summation_appends WHERE recipe=? AND data_version=?`);
+  const stored = [];
+  let version = dataVersion;
+  let throughDate = end;
+  while (throughDate >= start && stored.length < count) {
+    const parent = link && link.get(recipe, version);
+    stored.push(...read.all(recipe, version, parent?.parent_date >= start ? shiftDate(parent.parent_date, 1) : start, throughDate, count - stored.length));
+    if (!parent || parent.parent_version >= version) break;
+    version = parent.parent_version;
+    if (parent.parent_date < throughDate) throughDate = parent.parent_date;
+  }
   const rows = stored.reverse().map(({ value }) => JSON.parse(value));
   const through = rows.at(-1)?.date ?? null;
   const status = through === end ? 'ready' : through ? 'partial' : 'unprepared';

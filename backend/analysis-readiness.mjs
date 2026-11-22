@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { expectedSessions } from './calendar.mjs';
+import { expectedSessions, isMarketSession, shiftDate } from './calendar.mjs';
 import { isoDate } from './database.mjs';
+import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 
 const manifestFormat = 'market-preparation-publication-1';
 const fiveYearSessions = 1260;
@@ -50,7 +51,8 @@ function matchingWork(db, { date, dataVersion, calculationVersion }) {
       coalesce(json_extract(payload,'$.context.date'),json_extract(payload,'$.date')) AS date,
       coalesce(json_extract(payload,'$.context.dataVersion'),json_extract(payload,'$.dataVersion'),
         json_extract(payload,'$.analysisGeneration.dataVersion')) AS dataVersion,
-      coalesce(json_extract(payload,'$.calculationVersion'),json_extract(payload,'$.analysisGeneration.calculationVersion')) AS calculationVersion
+      coalesce(json_extract(payload,'$.calculationVersion'),json_extract(payload,'$.analysisGeneration.calculationVersion')) AS calculationVersion,
+      json_extract(result,'$.analysisPreparation') AS analysisPreparation
     FROM jobs WHERE type IN (SELECT value FROM json_each(?)) AND json_valid(payload) ORDER BY rowid DESC
   `).iterate(JSON.stringify([...calculationJobs]));
   const work = {};
@@ -72,6 +74,7 @@ function matchingWork(db, { date, dataVersion, calculationVersion }) {
       return work;
     }
     if (current && unsuccessful.has(entry.status)) work.failed ??= info;
+    if (current && entry.status === 'complete' && entry.analysisPreparation) work.blocked ??= entry.analysisPreparation;
     if (external && awaitingPublication) work.awaiting ??= info;
   }
   return work;
@@ -105,19 +108,18 @@ function validManifest(manifest, point, scopeHash) {
   }
 }
 
-function verifyPublication(db, point) {
+function verifyPublication(db, point, { id, scopeHash } = {}) {
   if (!hasTable(db, 'preparation_publications') || !hasTable(db, 'preparation_publication_partitions')) return null;
   const rows = db.prepare(`
     SELECT id, manifest, plan_hash AS planHash, updated_at AS publishedAt
     FROM preparation_publications WHERE state='verified-awaiting-cutover' AND json_valid(manifest)
-      AND json_extract(manifest,'$.dataVersion')=? AND json_extract(manifest,'$.calculationVersion')=?
+      AND json_extract(manifest,'$.dataVersion')=? AND json_extract(manifest,'$.calculationVersion')=? AND (? IS NULL OR id=?)
     ORDER BY updated_at DESC, id
-  `).iterate(point.dataVersion, point.calculationVersion);
+  `).iterate(point.dataVersion, point.calculationVersion, id ?? null, id ?? null);
   const partitions = db.prepare(`
     SELECT table_name AS tableName, sum(count) AS rowCount, sum(state<>'consumed') AS pending
     FROM preparation_publication_partitions WHERE publication=? GROUP BY table_name
   `);
-  let scopeHash;
   for (const row of rows) {
     scopeHash ??= analysisWorkspaceScopeHash(db);
     const manifest = JSON.parse(row.manifest);
@@ -132,14 +134,133 @@ function verifyPublication(db, point) {
   return null;
 }
 
+export const verifiedAnalysisPublication = (db, point) => verifyPublication(db, point);
+
+const dailyReceipts = 'analysis_daily_receipts';
+const receiptFormat = 'analysis-daily-1';
+const completeDailyProducts = (products) => Object.keys(partitionProducts).every((key) =>
+  isPositiveCount(products?.[key]?.expected) && products[key].verified === products[key].expected);
+
+function historicalReferenceChanged(db, parentVersion, dataVersion, date) {
+  const reference = db.prepare(`SELECT 1 FROM reference_revisions AS revision JOIN reference_revisions AS prior
+    ON prior.security_id=revision.security_id AND prior.version=(SELECT max(version) FROM reference_revisions
+      WHERE security_id=revision.security_id AND version<=?)
+    WHERE revision.version>? AND revision.version<=? AND (
+      json_extract(revision.definition,'$.name') IS NOT json_extract(prior.definition,'$.name') OR
+      json_extract(revision.definition,'$.isin') IS NOT json_extract(prior.definition,'$.isin')) LIMIT 1`)
+    .get(parentVersion, parentVersion, dataVersion);
+  return !!reference || !!db.prepare(`SELECT 1 FROM quality_overrides WHERE kind='notice' AND version>? AND version<=?
+    AND effective_from<=? LIMIT 1`).get(parentVersion, dataVersion, date);
+}
+
+function verifiedDailyReceipt(db, point, scopeHash) {
+  if (!hasTable(db, dailyReceipts)) return null;
+  const load = db.prepare(`SELECT id,receipt,created_at FROM ${dailyReceipts} WHERE calculation_version=? AND date=? AND data_version=?
+    AND json_valid(receipt)`);
+  const stored = load.get(point.calculationVersion, point.date, point.dataVersion);
+  if (!stored) return null;
+  const receipt = JSON.parse(stored.receipt);
+  const base = receipt?.base;
+  if (!isHash(receipt?.recipeHash) || !isHash(base?.publicationId) || !isoDate(base.date) || !isPositiveCount(base.dataVersion)) return null;
+  const root = verifyPublication(db, { date: base.date, dataVersion: base.dataVersion, calculationVersion: point.calculationVersion },
+    { id: base.publicationId, scopeHash });
+  if (!root || base.date >= point.date || base.dataVersion >= point.dataVersion) return null;
+  const descendants = expectedSessions(base.date, point.date);
+  if (descendants.length < 2 || descendants.at(-1) !== point.date) return null;
+  let candidate = receipt;
+  let pin = { ...point, id: stored.id };
+  const edges = [];
+  for (let index = descendants.length - 1; index > 0; index--) {
+    const parent = candidate?.parent;
+    if (candidate?.format !== receiptFormat || pin.id !== hash(candidate) || candidate.scopeHash !== scopeHash ||
+        candidate.date !== pin.date || candidate.date !== descendants[index] || candidate.dataVersion !== pin.dataVersion ||
+        candidate.calculationVersion !== point.calculationVersion || candidate.recipeHash !== receipt.recipeHash ||
+        candidate.contexts !== root.contexts || candidate.dateFrom !== root.dateFrom || candidate.sessions !== root.sessions + index ||
+        hash(candidate.base) !== hash(base) || !completeDailyProducts(candidate.products) || !isHash(parent?.id) ||
+        parent.date !== descendants[index - 1] || !isPositiveCount(parent.dataVersion) || parent.dataVersion >= pin.dataVersion) return null;
+    edges.push({ date: parent.date, data_version: parent.dataVersion });
+    if (index === 1) {
+      if (parent.id !== base.publicationId || parent.dataVersion !== base.dataVersion) return null;
+      break;
+    }
+    const older = load.get(point.calculationVersion, parent.date, parent.dataVersion);
+    if (older?.id !== parent.id) return null;
+    candidate = JSON.parse(older.receipt);
+    pin = parent;
+  }
+  const bounds = reusableArchiveVersions(db, { ...point, referenceMode: 'as-of' }, edges.map(({ data_version }) => data_version));
+  if (edges.some((edge) => !usableArchiveRow(bounds, edge))) return null;
+  return { ...root, sessions: receipt.sessions, receiptId: stored.id, publishedAt: stored.created_at, receipt, base };
+}
+
+export function dailyAnalysisParent(db, point) {
+  if (!isoDate(point.date) || !isMarketSession(point.date) || !isPositiveCount(point.dataVersion)) return null;
+  const date = expectedSessions(shiftDate(point.date, -14), point.date).at(-2);
+  if (!date) return null;
+  const scopeHash = analysisWorkspaceScopeHash(db);
+  const versions = [];
+  if (hasTable(db, dailyReceipts)) {
+    versions.push(...db.prepare(`SELECT data_version AS version FROM ${dailyReceipts}
+      WHERE calculation_version=? AND date=? AND data_version<? ORDER BY data_version DESC`)
+      .all(point.calculationVersion, date, point.dataVersion).map(({ version }) => version));
+  }
+  if (hasTable(db, 'preparation_publications')) {
+    versions.push(...db.prepare(`SELECT json_extract(manifest,'$.dataVersion') AS version FROM preparation_publications
+      WHERE state='verified-awaiting-cutover' AND json_valid(manifest) AND json_extract(manifest,'$.calculationVersion')=?
+        AND json_extract(manifest,'$.verification.dateTo')=? AND json_extract(manifest,'$.dataVersion')<?`)
+      .all(point.calculationVersion, date, point.dataVersion).map(({ version }) => version));
+  }
+  const bounds = reusableArchiveVersions(db, { ...point, referenceMode: 'as-of' }, versions);
+  for (const version of [...new Set(versions)].sort((a, b) => b - a)) {
+    if (!usableArchiveRow(bounds, { data_version: version, date }) || historicalReferenceChanged(db, version, point.dataVersion, date)) continue;
+    const pin = { date, dataVersion: version, calculationVersion: point.calculationVersion };
+    const priorWork = matchingWork(db, pin);
+    if (priorWork.active || priorWork.failed) continue;
+    const publication = verifyPublication(db, pin, { scopeHash });
+    if (publication) return { ...pin, ...publication, id: publication.publicationId, scopeHash,
+      base: { publicationId: publication.publicationId, date, dataVersion: version } };
+    const daily = verifiedDailyReceipt(db, pin, scopeHash);
+    if (daily) return { ...pin, ...daily, id: daily.receiptId, scopeHash };
+  }
+  return null;
+}
+
+export function writeDailyAnalysisReceipt(db, point, parent, { recipeHash, contexts, products }) {
+  const currentParent = dailyAnalysisParent(db, point);
+  if (currentParent?.id !== parent.id || contexts !== parent.contexts ||
+      parent.receipt && parent.receipt.recipeHash !== recipeHash || !isHash(recipeHash) ||
+      !completeDailyProducts(products)) {
+    throw new Error('Daily analysis proof no longer matches the verified parent, recipe scope or required products');
+  }
+  const receipt = { format: receiptFormat, ...point, dateFrom: parent.dateFrom, sessions: parent.sessions + 1, contexts,
+    scopeHash: parent.scopeHash, recipeHash, products, base: parent.base,
+    parent: { id: parent.id, date: parent.date, dataVersion: parent.dataVersion } };
+  const id = hash(receipt);
+  db.exec(`CREATE TABLE IF NOT EXISTS ${dailyReceipts} (
+    calculation_version TEXT NOT NULL, date TEXT NOT NULL, data_version INTEGER NOT NULL,
+    id TEXT NOT NULL, receipt TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(calculation_version,date,data_version)
+  ) WITHOUT ROWID`);
+  db.prepare(`INSERT OR IGNORE INTO ${dailyReceipts} VALUES (?,?,?,?,?,?)`)
+    .run(point.calculationVersion, point.date, point.dataVersion, id, JSON.stringify(receipt), new Date().toISOString());
+  if (db.prepare(`SELECT id FROM ${dailyReceipts} WHERE calculation_version=? AND date=? AND data_version=?`)
+    .get(point.calculationVersion, point.date, point.dataVersion).id !== id) throw new Error('Daily analysis receipt conflicts with an existing verified pin');
+  return id;
+}
+
 export function readAnalysisReadiness(db, { date = null, dataVersion, calculationVersion }) {
   const point = { date, dataVersion, calculationVersion };
   if (!isoDate(date) || !isPositiveCount(dataVersion)) return { ...point, state: 'incomplete', reason: 'no_source_data' };
-  const { active: pending, failed, awaiting } = matchingWork(db, point);
+  const { active: pending, failed, awaiting, blocked } = matchingWork(db, point);
   if (pending) return { ...point, state: 'preparing', reason: 'background_calculation', job: pending };
   if (failed) return { ...point, state: 'incomplete', reason: 'calculation_failed', job: failed };
   const publication = verifyPublication(db, point);
   if (publication) return { ...point, state: 'ready', ...publication };
+  const daily = hasTable(db, dailyReceipts) && verifiedDailyReceipt(db, point, analysisWorkspaceScopeHash(db));
+  if (daily) {
+    const { publicationId, receiptId, publishedAt, dateFrom, sessions, contexts } = daily;
+    return { ...point, state: 'ready', publicationId, receiptId, publishedAt, dateFrom, sessions, contexts };
+  }
   return awaiting ? { ...point, state: 'preparing', reason: 'awaiting_publication', job: awaiting }
-    : { ...point, state: 'incomplete', reason: 'no_matching_verified_publication' };
+    : { ...point, state: 'incomplete', reason: blocked ?? 'no_matching_verified_publication' };
 }

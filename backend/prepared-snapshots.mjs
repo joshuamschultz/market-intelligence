@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { referenceArchiveScopes, reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import { CALCULATION_VERSION } from './database.mjs';
 import { stockBaseFields } from './engine.mjs';
-import { encodeStockFrame, readStockFrame } from './snapshot-frame.mjs';
+import { encodeStockFrame, openStockFrame, readStockFrame } from './snapshot-frame.mjs';
 import { compressStoredJson, decodeStoredJson as decode, encodeStoredJson } from './storage-codec.mjs';
 
 const format = 'prepared-stock-2';
@@ -581,44 +581,78 @@ export function writePreparedSnapshotBatch(db, engine, entries, { codec } = {}) 
   }
 }
 
-export function readPreparedSnapshot(db, engine, config, { velocity = false, securityIds, stockFields } = {}) {
+function readSnapshotManifest(db, engine, config, velocity, read) {
   if (!config.date) return null;
   const source = preparedSnapshotDates(db, engine, config, [config.date], { velocity }).get(config.date);
   if (source == null) return null;
   const scoped = dateScope(config);
   const recipe = snapshotRecipe(engine, scoped, velocity);
   const key = areaKey(scoped, source);
-  const manifest = db.prepare(`SELECT layout,stock_count,delta_mask,header FROM prepared_snapshot_contexts WHERE ${contextKey}`)
+  const manifest = (read ?? db.prepare(`SELECT layout,stock_count,delta_mask,header FROM prepared_snapshot_contexts WHERE ${contextKey}`))
     .get(...key, recipe);
-  if (!manifest) return null;
-  const selected = securityIds == null ? null : new Set(typeof securityIds === 'string' ? [securityIds] : securityIds);
-  const fieldsRequested = stockFields == null ? null : new Set(['securityId', ...stockFields]);
-  const readBlob = db.prepare(`SELECT value FROM prepared_snapshot_blobs WHERE ${baseKey} AND blob=?`);
-  const rawHeader = readBlob.get(...key, manifest.header)?.value;
-  if (!rawHeader) throw new Error('Prepared snapshot header block is missing');
-  const savedHeader = decode(rawHeader);
+  if (manifest && (!Number.isSafeInteger(manifest.stock_count) || manifest.stock_count < 0)) {
+    throw new Error('Prepared snapshot stock count is invalid');
+  }
+  return manifest ? { key, recipe, manifest, source } : null;
+}
+
+function readSnapshotHeader(load, headerId, groupFields) {
+  const savedHeader = load(headerId, 'Prepared snapshot header block is missing');
   const dictionaryHeader = Array.isArray(savedHeader) && savedHeader[0] === 'prepared-header-2';
+  const includeMembers = !groupFields || groupFields.includes('memberIds');
   const header = dictionaryHeader || Array.isArray(savedHeader) && savedHeader[0] === 'prepared-header-1' ? Object.fromEntries(
     savedHeader[1].map(([name, value, blob]) => {
       if (!blob) return [name, value];
-      const stored = readBlob.get(...key, blob)?.value;
-      if (!stored) throw new Error('Prepared snapshot header component is missing');
-      const component = decode(stored);
+      const component = load(blob, 'Prepared snapshot header component is missing');
       if (!dictionaryHeader || name !== 'groups') return [name, component];
-      const dictionary = readBlob.get(...key, savedHeader[2])?.value;
-      if (!dictionary) throw new Error('Prepared snapshot group membership dictionary is missing');
-      const memberships = decode(dictionary);
+      const memberships = load(savedHeader[2], 'Prepared snapshot group membership dictionary is missing');
       return [name, component.map(([group, index]) => {
         if (index == null) return group;
         if (!Array.isArray(memberships[index])) throw new Error('Prepared snapshot group membership is missing');
-        return { ...group, memberIds: memberships[index].slice() };
+        return includeMembers ? { ...group, memberIds: memberships[index].slice() } : group;
       })];
     })) : savedHeader;
+  return groupFields ? { ...header, groups: projectSnapshotGroups(header.groups, groupFields) } : header;
+}
+
+function projectSnapshotGroups(groups, fields) {
+  return groups.map((group) => Object.fromEntries(fields.map((name) => [name, group[name]])));
+}
+
+function loadSnapshotLayout(read, key, layoutId) {
+  const stored = read.get(...key, layoutId)?.value;
+  if (!stored) throw new Error('Prepared snapshot layout is missing');
+  return decode(stored);
+}
+
+function appendStockFrameRows(ordered, rows) {
+  for (const [position, row] of rows) {
+    if (position >= ordered.length || ordered[position]) throw new Error('Invalid prepared stock frame ordering');
+    ordered[position] = row;
+  }
+}
+
+function finishStockFrameRows(ordered, selected) {
+  const stocks = ordered.filter(Boolean);
+  if (!selected && stocks.length !== ordered.length) throw new Error('Prepared snapshot row count differs from its manifest');
+  return stocks;
+}
+
+export function readPreparedSnapshot(db, engine, config, { velocity = false, securityIds, stockFields } = {}) {
+  const stored = readSnapshotManifest(db, engine, config, velocity);
+  if (!stored) return null;
+  const { key, recipe, manifest, source } = stored;
+  const selected = securityIds == null ? null : new Set(typeof securityIds === 'string' ? [securityIds] : securityIds);
+  const fieldsRequested = stockFields == null ? null : new Set(['securityId', ...stockFields]);
+  const readBlob = db.prepare(`SELECT value FROM prepared_snapshot_blobs WHERE ${baseKey} AND blob=?`);
+  const header = readSnapshotHeader((id, error) => {
+    const value = readBlob.get(...key, id)?.value;
+    if (!value) throw new Error(error);
+    return decode(value);
+  }, manifest.header);
   const provenance = source !== config.dataVersion ? { sourceDataVersion: source, requestedDataVersion: config.dataVersion } : {};
   if (selected?.size === 0 || manifest.stock_count === 0) return { ...header, stocks: [], ...provenance };
-  const storedLayout = db.prepare(`SELECT value FROM prepared_snapshot_layouts WHERE ${baseKey} AND layout=?`).get(...key, manifest.layout);
-  if (!storedLayout) throw new Error('Prepared snapshot layout is missing');
-  const layout = decode(storedLayout.value);
+  const layout = loadSnapshotLayout(db.prepare(`SELECT value FROM prepared_snapshot_layouts WHERE ${baseKey} AND layout=?`), key, manifest.layout);
   if (layout[0] === frameFormat || layout[0] === legacyFrameFormat) {
     const [, frame, index] = layout;
     const chosenBuckets = selected ? [...new Set([...selected].map(bucketFor))] : Array.from({ length: bucketCount }, (_, bucket) => bucket);
@@ -628,13 +662,9 @@ export function readPreparedSnapshot(db, engine, config, { velocity = false, sec
       if (!(manifest.delta_mask & (1 << bucket))) continue;
       const value = read.get(...key, frame, bucket)?.value;
       if (!value) throw new Error('Prepared stock frame block is missing');
-      for (const [position, row] of readStockFrame(value, index, selected, fieldsRequested)) {
-        if (position >= ordered.length || ordered[position]) throw new Error('Invalid prepared stock frame ordering');
-        ordered[position] = row;
-      }
+      appendStockFrameRows(ordered, readStockFrame(value, index, selected, fieldsRequested));
     }
-    const stocks = ordered.filter(Boolean);
-    if (!selected && stocks.length !== manifest.stock_count) throw new Error('Prepared snapshot row count differs from its manifest');
+    const stocks = finishStockFrameRows(ordered, selected);
     return { ...header, ...provenance, stocks };
   }
   const [patterns, order] = layout;
@@ -697,4 +727,79 @@ export function readPreparedSnapshot(db, engine, config, { velocity = false, sec
     }
   }
   return { ...header, ...provenance, stocks: recovered.filter(Boolean) };
+}
+
+export function readPreparedWeeklySnapshots(db, engine, configs, { stockFields, groupFields, stats }) {
+  const results = configs.map(() => null);
+  if (!configs.length || !hasTable(db)) return results;
+  const read = db.prepare(`SELECT layout,stock_count,delta_mask,header FROM prepared_snapshot_contexts WHERE ${contextKey}`);
+  const readLayout = db.prepare(`SELECT value FROM prepared_snapshot_layouts WHERE ${baseKey} AND layout=?`);
+  const readBlob = db.prepare(`SELECT value FROM prepared_snapshot_blobs WHERE ${baseKey} AND blob=?`);
+  let readFrame;
+  const fields = new Set(['securityId', ...stockFields]);
+  const areas = new Map();
+  for (const [position, config] of configs.entries()) {
+    const stored = readSnapshotManifest(db, engine, config, false, read);
+    if (!stored) continue;
+    const area = JSON.stringify(stored.key);
+    if (!areas.has(area)) areas.set(area, []);
+    areas.get(area).push({ ...stored, position, config });
+  }
+
+  for (const requests of areas.values()) {
+    const { key } = requests[0];
+    const blobs = new Map();
+    const layouts = new Map();
+    const frames = new Map();
+    for (const { manifest, position, config } of requests) {
+      let layout;
+      if (manifest.stock_count) {
+        if (!layouts.has(manifest.layout)) layouts.set(manifest.layout, loadSnapshotLayout(readLayout, key, manifest.layout));
+        layout = layouts.get(manifest.layout);
+      }
+      if (layout && layout[0] !== frameFormat && layout[0] !== legacyFrameFormat) {
+        const stored = readPreparedSnapshot(db, engine, config, { stockFields });
+        if (!stored) throw new Error(`Missing shared weekly snapshot for ${config.date}`);
+        results[position] = { stocks: stored.stocks, groups: projectSnapshotGroups(stored.groups, groupFields) };
+        if (stats) stats.legacySnapshots++;
+        continue;
+      }
+      const header = readSnapshotHeader((id, error) => {
+        if (!blobs.has(id)) {
+          const value = readBlob.get(...key, id)?.value;
+          if (!value) throw new Error(error);
+          blobs.set(id, decode(value));
+          if (stats) stats.headerBlobs++;
+        }
+        return blobs.get(id);
+      }, manifest.header, groupFields);
+      results[position] = { stocks: [], groups: header.groups };
+      if (!layout) continue;
+      const [, frame, recipeIndex] = layout;
+      if (!frames.has(frame)) frames.set(frame, []);
+      frames.get(frame).push({ recipeIndex, manifest, position, ordered: Array(manifest.stock_count) });
+    }
+    blobs.clear();
+    layouts.clear();
+
+    for (const [frame, projections] of frames) {
+      readFrame ??= db.prepare(`SELECT value FROM prepared_snapshot_frames WHERE ${baseKey} AND frame=? AND bucket=?`);
+      for (let bucket = 0; bucket < bucketCount; bucket++) {
+        const matches = projections.filter(({ manifest }) => manifest.delta_mask & (1 << bucket));
+        if (!matches.length) continue;
+        const value = readFrame.get(...key, frame, bucket)?.value;
+        if (!value) throw new Error('Prepared stock frame block is missing');
+        const decoder = openStockFrame(value, fields);
+        if (stats) {
+          stats.frameBuckets++;
+          stats.frameProjections += matches.length;
+          stats.compressedBytes += value.length;
+          stats.decodedBytes += decoder.decodedBytes;
+        }
+        for (const { recipeIndex, ordered } of matches) appendStockFrameRows(ordered, decoder.read(recipeIndex));
+      }
+      for (const { position, ordered } of projections) results[position].stocks = finishStockFrameRows(ordered);
+    }
+  }
+  return results;
 }

@@ -3,12 +3,13 @@ import { performance } from 'node:perf_hooks';
 import { expectedSessions, shiftDate, weekEnd } from './calendar.mjs';
 import { createMaterializedHistoryWriter } from './materialization.mjs';
 import { compactWeeklySnapshot, createPreparedRankWriter, preparationInput, readPreparedRanks, recentPreparationSessions, requirePreparationSpace } from './preparation.mjs';
-import { preparedSnapshotDates, readPreparedSnapshot, writePreparedSnapshotBatch } from './prepared-snapshots.mjs';
+import { preparedSnapshotDates, readPreparedWeeklySnapshots, writePreparedSnapshotBatch } from './prepared-snapshots.mjs';
 import { readRankArchive } from './rank-archive.mjs';
 import { annotateGroupVelocity, annotateVelocity, createStockVelocityLayer, topDecileIds } from './ranking.mjs';
 
 const emptyWeek = { stocks: [], groups: [] };
 const weeklyFields = ['rsRank', 'rsPercentile', 'rsScore', 'udv_50d', 'up_volume_50d'];
+const weeklyGroupFields = ['id', 'rank', 'percentile', 'above50', 'medianRS', 'topDecile', 'relativeReturn'];
 const currentVelocityFields = [...weeklyFields, 'new_high_252d', 'return_21d', 'return_63d', 'return_252d', 'udv_state_50d'];
 
 function calculationKey(engine, config, date) {
@@ -90,14 +91,17 @@ function rankedSnapshot(snapshot, stockRows, weekly, velocityLayer) {
 // The producer and SQLite writer run in one backpressured loop. Only one
 // session's complete context projections are held while its products commit.
 export function prepareBatchedSnapshots(db, engine, configurations, {
-  dates, signal, onProgress, tileSize, codec, dependencyProvider, requireDependencySeeds = false,
+  dates, signal, onProgress, tileSize, codec, dependencyProvider, requireDependencySeeds = false, requireCompactRanks = false,
 } = {}) {
+  const started = performance.now();
   if (!Array.isArray(dates) || dates.some((date, index) => index > 0 && date <= dates[index - 1])) {
     throw new RangeError('Preparation requires ascending unique session dates');
   }
   const totals = { sessions: dates.length, contexts: configurations.length, written: { base: 0, velocity: 0, rank: 0, history: 0 },
     reused: { base: 0, velocity: 0, rank: 0, history: 0 }, producedSessions: 0, producedContexts: 0, commits: 0,
-    calculationMs: 0, projectionMs: 0, storageMs: 0, velocityLayersWritten: 0, velocityLayersReused: 0,
+    planningMs: 0, calculationMs: 0, projectionMs: 0, storageMs: 0, velocityLayersWritten: 0, velocityLayersReused: 0,
+    weeklyArchive: { references: 0, snapshotsLoaded: 0, frameBuckets: 0, frameProjections: 0, compressedBytes: 0,
+      decodedBytes: 0, headerBlobs: 0, legacySnapshots: 0, readMs: 0 },
     seededWeeks: 0, seededLeaderDays: 0 };
   if (!dates.length || !configurations.length) return totals;
   if (db.isTransaction) throw new Error('Batch preparation requires an idle SQLite writer connection');
@@ -105,6 +109,8 @@ export function prepareBatchedSnapshots(db, engine, configurations, {
   const dependencies = dateDependencies(dates);
   const inBatch = new Set(dates);
   const producedDates = new Set();
+  const archiveUses = new Map();
+  const archiveWeeks = new Map();
   function seed(config, kind, date) {
     if (inBatch.has(date)) return undefined;
     const value = dependencyProvider?.({ config, kind, date });
@@ -126,7 +132,7 @@ export function prepareBatchedSnapshots(db, engine, configurations, {
     const weeklyRefs = new Map();
     const missing = new Map();
     let addRank;
-    if (ranks && targetDates.length) {
+    if (ranks && targetDates.length && !requireCompactRanks) {
       const legacy = readRankArchive(db, engine, config, { from: targetDates[0], to: targetDates.at(-1), limit: 7560 }).observed;
       for (const date of legacy) compact.add(date);
     }
@@ -147,6 +153,12 @@ export function prepareBatchedSnapshots(db, engine, configurations, {
     if ([...missing.values()].some((needs) => needs.rank)) addRank = createPreparedRankWriter(db, config, targetDates, { codec });
     const leaderRefs = thin.previousLeaders([...previous]);
     const archivedWeeks = preparedSnapshotDates(db, engine, config, [...weeklyRefs.keys()]);
+    const archiveKeys = new Map();
+    for (const [date, sourceVersion] of archivedWeeks) {
+      const key = JSON.stringify([sourceVersion, preparationSeedKey(engine, config, 'weekly', date)]);
+      archiveKeys.set(date, key);
+      archiveUses.set(key, (archiveUses.get(key) ?? 0) + weeklyRefs.get(date));
+    }
     const weeks = new Map();
     for (const date of previous) if (!leaderRefs.has(date)) {
       const value = seed(config, 'leaders', date);
@@ -162,18 +174,51 @@ export function prepareBatchedSnapshots(db, engine, configurations, {
         totals.seededWeeks++;
       } else producedDates.add(date);
     }
-    return { config, thin, addRank, ranks, missing, leaderRefs, previous, archivedWeeks, weeklyRefs, weeks };
+    return { config, thin, addRank, ranks, missing, leaderRefs, previous, archivedWeeks, archiveKeys, weeklyRefs, weeks };
   });
+
+  function prefetchWeeks(targets) {
+    const requests = new Map();
+    for (const date of targets) {
+      for (const index of work.get(date).assignments.keys()) {
+        const plan = plans[index];
+        if (!plan.missing.get(date)?.velocity) continue;
+        for (const week of dependencies.get(date).weekly) {
+          const key = plan.archiveKeys.get(week);
+          if (!key || plan.weeks.has(week) || work.get(week)?.assignments.has(index)) continue;
+          totals.weeklyArchive.references++;
+          if (!archiveWeeks.has(key) && !requests.has(key)) requests.set(key, { ...plan.config, date: week, requestedDate: week });
+        }
+      }
+    }
+    if (!requests.size) return;
+    const reading = performance.now();
+    const loaded = readPreparedWeeklySnapshots(db, engine, [...requests.values()], {
+      stockFields: weeklyFields, groupFields: weeklyGroupFields, stats: totals.weeklyArchive,
+    });
+    let position = 0;
+    for (const [key, config] of requests) {
+      const week = loaded[position++];
+      if (!week) throw new Error(`Missing shared weekly snapshot for ${config.date}`);
+      archiveWeeks.set(key, week);
+    }
+    totals.weeklyArchive.snapshotsLoaded += requests.size;
+    totals.weeklyArchive.readMs += performance.now() - reading;
+  }
 
   function weeklySnapshot(plan, date) {
     if (!plan.weeklyRefs.has(date)) return emptyWeek;
-    if (!plan.weeks.has(date)) {
-      const stored = plan.archivedWeeks.has(date) && readPreparedSnapshot(db, engine, { ...plan.config, date, requestedDate: date },
-        { stockFields: weeklyFields });
-      if (!stored) throw new Error(`Missing shared weekly snapshot for ${date}`);
-      plan.weeks.set(date, compactWeeklySnapshot(stored));
+    const key = plan.archiveKeys.get(date);
+    const week = plan.weeks.get(date) ?? archiveWeeks.get(key);
+    if (!week) throw new Error(`Missing shared weekly snapshot for ${date}`);
+    if (key) {
+      const remaining = archiveUses.get(key) - 1;
+      if (remaining) archiveUses.set(key, remaining);
+      else {
+        archiveUses.delete(key);
+        archiveWeeks.delete(key);
+      }
     }
-    const week = plan.weeks.get(date);
     const count = plan.weeklyRefs.get(date);
     if (count === 1) {
       plan.weeklyRefs.delete(date);
@@ -199,6 +244,7 @@ export function prepareBatchedSnapshots(db, engine, configurations, {
   }));
   let cursor = 0;
   let previous = performance.now();
+  totals.planningMs = previous - started;
   const shouldBuild = (_config, index, date) => work.get(date)?.producers.has(index) ?? false;
   for (const point of engine.batchSnapshots(plans.map(({ config }) => config), { dates: produced, signal, tileSize, sparseRows: true, shouldBuild })) {
     const projectedAt = performance.now();
@@ -214,6 +260,10 @@ export function prepareBatchedSnapshots(db, engine, configurations, {
     const snapshots = new Map();
     const velocityLayers = new Map();
     const pending = [];
+    // The two-session append can read overlapping stored frames together. Long
+    // backfills still load only the next session's missing dependencies.
+    if (produced.length > 2) prefetchWeeks([date]);
+    else if (cursor === 1) prefetchWeeks(produced);
     for (const [index, owner] of assignments) {
       const result = results.get(owner);
       if (!result) throw new Error('Batch producer omitted an assigned calculation context');

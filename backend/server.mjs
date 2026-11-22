@@ -6,7 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bulkSessionStatus, CALCULATION_VERSION, dailyPublication, openDatabase } from './database.mjs';
 import { expectedSessions, latestFinalizableSession, shiftDate } from './calendar.mjs';
 import { journalDueDate } from './journal.mjs';
-import { createService, dailyCaptureAvailability, defaultMarketSyncAfter, marketSyncAfter, scheduledJournalReadiness, scheduledPrecomputeKey } from './service.mjs';
+import { createService, dailyCaptureAvailability, defaultMarketSyncAfter, hasUnprovedDailyGap, marketSyncAfter,
+  orderedDailyPoint, orderedDailyTarget, scheduledJournalReadiness, scheduledPrecomputeKey } from './service.mjs';
 import { runningRelease } from '../scripts/release.mjs';
 
 const publicDir = fileURLToPath(new URL('../frontend/', import.meta.url));
@@ -135,61 +136,77 @@ export function createDailyTick(service, db, { after = defaultMarketSyncAfter, p
   const completedReference = db.prepare("SELECT 1 FROM jobs WHERE type='provider-reference' AND status='complete' AND json_extract(result, '$.referenceDate')>=? LIMIT 1");
   const scheduledBackups = db.prepare(`SELECT status,updated_at FROM jobs WHERE type='backup'
     AND json_extract(payload,'$.scheduledFor')=? ORDER BY rowid`);
-  let lastAttempt = 0;
-  let lastReferenceAttempt = 0;
-  let lastJournalAttempt = 0;
-  let lastNasdaqAttempt = 0;
-  let lastPrecomputeAttempt = 0;
+  const lastAttempts = new Map();
   const retryInterval = 30 * 60 * 1000;
+  const attemptDue = (stage, scope, stamp) => {
+    const last = lastAttempts.get(stage);
+    return last?.scope !== scope || stamp - last.stamp > retryInterval;
+  };
+  const attempted = (stage, scope, stamp) => lastAttempts.set(stage, { scope, stamp });
   return () => {
     const clock = now();
-    const date = latestFinalizableSession(clock, after);
+    const finalized = latestFinalizableSession(clock, after);
     const stamp = clock.getTime();
     const nasdaqEnabled = config.MARKET_NASDAQ_SYNC === '1';
     const referenceEnabled = providerEnabled && config.MARKET_REFERENCE_SYNC === '1';
     const precomputeEnabled = config.MARKET_PRECOMPUTE === '1';
-    const availability = dailyCaptureAvailability(db, date, clock, after);
-    if (providerEnabled && !active.get('provider-import')) {
-      if (availability.due) {
+    const ordered = precomputeEnabled ? orderedDailyPoint(db) : null;
+    if (ordered?.date > finalized) return;
+    const date = ordered ? orderedDailyTarget(ordered, finalized) : finalized;
+    const alreadyReady = ordered?.date === date && ordered.ready;
+    const receipt = eligible(date);
+    const publication = dailyPublication(db, date, receipt?.version);
+    const availability = dailyCaptureAvailability(db, date, clock, after, { ordered: precomputeEnabled });
+    const sourcesActive = ['provider-import', 'provider-bootstrap', 'provider-reference', 'nasdaq-refresh'].some((type) => active.get(type));
+    // A pin without an adjacent proof cannot be repaired by importing more source facts.
+    const backfillRequired = precomputeEnabled && ordered.date === date && !alreadyReady && hasUnprovedDailyGap(db, ordered);
+    if (!alreadyReady && !backfillRequired && (precomputeEnabled ? !sourcesActive : !active.get('provider-import'))) {
+      if (providerEnabled && availability.due) {
         const captureAttempt = availability.attempts + 1;
         service.enqueue('provider-import', { bulk: true, date, scheduledFor: date, captureAttempt, verifiedOnly: true,
-          skipCaptured: true, force: !!availability.receipt }, `daily-capture:${date}:${captureAttempt}`);
-      } else if (stamp - lastAttempt > retryInterval) {
-        const recovery = expectedSessions(shiftDate(date, -5), date).slice(-3).find((session) => {
-          const receipt = eligible(session);
-          return receipt && !dailyPublication(db, session, receipt.version);
-        });
+          skipCaptured: true, force: !!availability.receipt, ...(precomputeEnabled && { orderedDaily: true }) },
+        `daily-capture:${date}:${captureAttempt}`);
+      } else if ((providerEnabled || precomputeEnabled) && attemptDue('publication', date, stamp)) {
+        const recovery = precomputeEnabled ? receipt && !publication && date
+          : expectedSessions(shiftDate(date, -5), date).slice(-3).find((session) => {
+            const receipt = eligible(session);
+            return receipt && !dailyPublication(db, session, receipt.version);
+          });
         if (recovery) {
-          lastAttempt = stamp;
-          service.enqueue('provider-import', { bulk: true, date: recovery, verifiedOnly: true, skipCaptured: true, localOnly: true },
-            `daily-publication:${recovery}:${eligible(recovery).version}`);
+          attempted('publication', date, stamp);
+          service.enqueue('provider-import', { bulk: true, date: recovery, verifiedOnly: true, skipCaptured: true, localOnly: true,
+            ...(precomputeEnabled && { orderedDaily: true }) }, `daily-publication:${recovery}:${eligible(recovery).version}`);
         }
       }
     }
-    const publication = dailyPublication(db, date, eligible(date)?.version);
-    if (publication && referenceEnabled && !completedReference.get(date) && !active.get('provider-reference')
-        && stamp - lastReferenceAttempt > retryInterval) {
-      lastReferenceAttempt = stamp;
-      service.enqueue('provider-reference', { scheduledFor: date });
+    const referenceRequired = referenceEnabled && !backfillRequired;
+    const nasdaqRequired = nasdaqEnabled && !backfillRequired;
+    if (publication && !alreadyReady && referenceRequired && !completedReference.get(date) && !active.get('provider-reference')
+        && attemptDue('reference', date, stamp)) {
+      attempted('reference', date, stamp);
+      service.enqueue('provider-reference', { scheduledFor: date, ...(precomputeEnabled && { orderedDaily: true }) });
     }
-    if (publication && nasdaqEnabled && !completedNasdaq.get(date, date) && !active.get('nasdaq-refresh')
-        && stamp - lastNasdaqAttempt > retryInterval) {
-      lastNasdaqAttempt = stamp;
-      service.enqueue('nasdaq-refresh', { scheduledFor: date });
+    if (publication && !alreadyReady && nasdaqRequired && !completedNasdaq.get(date, date) && !active.get('nasdaq-refresh')
+        && attemptDue('nasdaq', date, stamp)) {
+      attempted('nasdaq', date, stamp);
+      service.enqueue('nasdaq-refresh', { scheduledFor: date, ...(precomputeEnabled && { orderedDaily: true }) });
     }
-    const readiness = publication ? scheduledJournalReadiness(db, { date, nasdaqEnabled, referenceEnabled, precomputeEnabled }) : null;
+    const readiness = publication || alreadyReady ? scheduledJournalReadiness(db, {
+      date, nasdaqEnabled: nasdaqRequired, referenceEnabled: referenceRequired, precomputeEnabled,
+    }) : null;
+    const preparationKey = readiness?.dataVersion && scheduledPrecomputeKey(date, readiness.dataVersion);
     if (['waiting_for_precompute', 'precompute_failed'].includes(readiness?.state)
         && !['production-precompute', 'workspace-precompute', 'rank-materialize', 'materialize'].some((type) => active.get(type))
-        && stamp - lastPrecomputeAttempt > retryInterval) {
-      lastPrecomputeAttempt = stamp;
+        && attemptDue('precompute', preparationKey, stamp)) {
+      attempted('precompute', preparationKey, stamp);
       service.enqueue('production-precompute', { scheduledFor: date,
         context: { ...service.workspaceConfiguration(), date, dataVersion: readiness.dataVersion },
-      }, scheduledPrecomputeKey(date, readiness.dataVersion));
+      }, preparationKey);
     }
     const scope = readiness?.state === 'ready' ? service.journalConfiguration() : null;
     const journalDate = scope && journalDueDate(db, { publishedDate: date, scope, now: clock });
-    if (journalDate && !active.get('journal-generate') && stamp - lastJournalAttempt > retryInterval) {
-      lastJournalAttempt = stamp;
+    if (journalDate && !active.get('journal-generate') && attemptDue('journal', journalDate, stamp)) {
+      attempted('journal', journalDate, stamp);
       service.enqueue('journal-generate', { asOfDate: journalDate, context: { dataVersion: readiness.dataVersion,
         universe: scope.universe, universeVersion: scope.universeVersion, basis: scope.basis, benchmark: scope.benchmark,
         model: scope.analysisModel, modelVersion: scope.analysisModelVersion, classification: scope.classification,

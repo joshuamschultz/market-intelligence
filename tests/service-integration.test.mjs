@@ -1133,3 +1133,27 @@ test('percentile health calibration uses the model lookback independently of dis
   assert.equal(one.body.history[0].score, two.body.history.at(-1).score);
   assert.equal(one.body.history[0].components[0].calibration.observations, 80);
 });
+
+test('an ordered historical capture reuses bounded retry offsets inside the current-roster window', (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const date = '2024-03-11';
+  const status = (stamp, ordered = true) => dailyCaptureAvailability(db, date, new Date(stamp), undefined, { ordered });
+  const fail = (stamp, captureAttempt) => {
+    const { id } = createJob(db, 'provider-import', { scheduledFor: date, captureAttempt });
+    updateJob(db, id, 'failed', 0, null, 'Mock provider outage');
+    db.prepare('UPDATE jobs SET updated_at=? WHERE id=?').run(stamp, id);
+  };
+  assert.equal(status('2024-03-12T15:30:00Z').due, true);
+  fail('2024-03-12T15:30:00Z', 1);
+  assert.equal(status('2024-03-12T15:39:59Z').state, 'waiting');
+  assert.equal(status('2024-03-12T15:40:00Z').due, true);
+  assert.equal(status('2024-03-12T15:40:00Z', false).state, 'exhausted');
+  fail('2024-03-12T15:40:00Z', 2);
+  assert.equal(status('2024-03-12T15:55:00Z').due, true);
+  fail('2024-03-12T15:55:00Z', 3);
+  assert.equal(status('2024-03-12T16:20:00Z').due, true);
+  fail('2024-03-12T16:20:00Z', 4);
+  assert.equal(status('2024-03-12T17:00:00Z').state, 'exhausted');
+  assert.equal(status('2024-03-19T15:40:00Z').state, 'outside_verification_window');
+});

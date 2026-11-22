@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout } from 'node:timers/promises';
 import { expectedSessions } from '../backend/calendar.mjs';
-import { chartBookIndustryJob } from '../backend/chartbook.mjs';
+import { chartBookIndustryJob, prepareChartBookIndustries } from '../backend/chartbook.mjs';
 import { dataVersion, importDataset, openDatabase, storeWorkspace } from '../backend/database.mjs';
 import { materializeHistory } from '../backend/materialization.mjs';
 import { writePreparedDetail } from '../backend/prepared-details.mjs';
@@ -188,6 +188,30 @@ test('prepared ChartBook returns warmup bars, synchronized SPY, dated and explic
   assert.ok(available.body.industry.rows.some(({ observations, expected }) => observations === 1 && expected === 2));
   await reader.dispatch({ url: '/api/v1/' + route });
   assert.equal(reopened.prepare('SELECT count(*) AS n FROM jobs').get().n, 1);
+});
+
+test('an unchanged ChartBook industry appends from stored quotes and matches full proxy preparation', (t) => {
+  const f = chartBookFixture(t);
+  const parent = { ...f.context, date: f.latest, classification: 'nasdaq' };
+  assert.equal(prepareChartBookIndustries(f.db, f.api.engine, { context: parent }).cold, 1);
+  const date = expectedSessions('2026-11-21', '2026-11-30')[0];
+  const ids = ['company-a', 'company-b', 'etf-spy'];
+  const { version } = importDataset(f.db, { provider: 'fixture', prices: ids.map((securityId, index) => ({
+    securityId, date, knownAt: date, open: 55 + index, high: 55 + index, low: 55 + index, close: 55 + index, volume: 250_000,
+  })) });
+  const context = { ...parent, date, dataVersion: version };
+  const config = f.api.engine.context(context);
+  f.api.engine.snapshot(config, { persist: true });
+  for (const id of ids) writePreparedDetail(f.db, config, f.api.engine.detail(config, id, 301, { velocity: false }));
+  const engine = { ...f.api.engine, studyPrices: () => assert.fail('Unchanged ChartBook reread warehouse prices') };
+  const result = prepareChartBookIndustries(f.db, engine, { context });
+  assert.equal(result.reused, 1);
+  const stored = f.db.prepare('SELECT value FROM chartbook_industry_history WHERE data_version=?');
+  const appended = stored.get(version).value;
+  f.db.exec('DELETE FROM chartbook_industry_inputs');
+  f.db.prepare('DELETE FROM chartbook_industry_history WHERE data_version=?').run(version);
+  assert.equal(prepareChartBookIndustries(f.db, f.api.engine, { context }).cold, 1);
+  assert.deepEqual(stored.get(version).value, appended);
 });
 
 test('pure preparation workspace discovery includes active alert dependencies without queuing', (t) => {

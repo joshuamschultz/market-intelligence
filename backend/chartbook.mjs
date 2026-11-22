@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { BREADTH_METRICS } from './breadth.mjs';
+import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import { CALCULATION_VERSION, getWorkspace, isoDate, listWorkspace, normalizeSymbol, storeWorkspace } from './database.mjs';
 import { expectedSessions } from './calendar.mjs';
 import { readMaterializedHistory } from './materialization.mjs';
-import { readPreparedDetail } from './prepared-details.mjs';
+import { readPreparedChart, readPreparedDetail } from './prepared-details.mjs';
 import { hasPreparedSnapshot, readPreparedSnapshot } from './prepared-snapshots.mjs';
 import { rankBy } from './ranking.mjs';
 
@@ -325,7 +326,7 @@ function industryWorkspaceKey(config) {
   return digest([chartBookIndustryJob, analysisContext(config)]);
 }
 
-export async function prepareChartBookIndustries(db, engine, payload, progress = () => {}) {
+export function prepareChartBookIndustries(db, engine, payload, progress = () => {}) {
   const config = engine.context(payload.context);
   if (config.basis !== 'reconstructed' || config.date !== config.latestDate) {
     return { state: 'unavailable', reason: 'Current-member industry proxies apply only to the latest reconstructed session.' };
@@ -336,48 +337,106 @@ export async function prepareChartBookIndustries(db, engine, payload, progress =
   if (sessions.length < 2) return { state: 'unavailable', date: config.date };
   db.exec(`CREATE TABLE IF NOT EXISTS chartbook_industry_history (
     recipe TEXT PRIMARY KEY, calculation_version TEXT NOT NULL, data_version INTEGER NOT NULL, anchor_date TEXT NOT NULL,
-    industry_id TEXT NOT NULL, value BLOB NOT NULL, prepared_at TEXT NOT NULL) WITHOUT ROWID`);
+    industry_id TEXT NOT NULL, value BLOB NOT NULL, prepared_at TEXT NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS chartbook_industry_inputs (
+      recipe TEXT PRIMARY KEY, value BLOB NOT NULL
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS chartbook_industry_history_anchor ON chartbook_industry_history(calculation_version,anchor_date,data_version)`);
   const read = db.prepare('SELECT 1 FROM chartbook_industry_history WHERE recipe=?');
   const put = db.prepare('INSERT INTO chartbook_industry_history VALUES (?,?,?,?,?,?,?)');
+  const saveInputs = db.prepare('INSERT INTO chartbook_industry_inputs VALUES (?,?)');
+  const readInputs = db.prepare('SELECT value FROM chartbook_industry_inputs WHERE recipe=?');
   const scopes = snapshot.groups.filter((group) => group.level === 'industry' && group.memberIds?.length)
     .map((group) => ({ group, recipe: industryRecipe(config, group) })).filter(({ recipe }) => !read.get(recipe));
   const positions = new Map(sessions.map((date, index) => [date, index]));
-  const pinned = engine.historyBatch?.({ ...config, currentVersion: false }, [config.date]) ?? { ...config, currentVersion: false };
+  const priorDate = sessions.at(-2);
+  const firstObserved = db.prepare(`SELECT date FROM price_revisions WHERE security_id=? AND date>=? AND date<=? AND version<=?
+    ORDER BY date LIMIT 1`);
+  const candidates = db.prepare(`SELECT DISTINCT data_version FROM chartbook_industry_history
+    WHERE calculation_version=? AND anchor_date=? AND data_version<? ORDER BY data_version DESC`)
+    .all(CALCULATION_VERSION, priorDate, config.dataVersion).map(({ data_version }) => data_version);
+  const bounds = reusableArchiveVersions(db, { ...config, referenceMode: 'as-of' }, candidates);
+  const predecessors = candidates.filter((version) => usableArchiveRow(bounds, { date: priorDate, data_version: version }));
+  const splitting = new Set(db.prepare(`SELECT DISTINCT security_id FROM corporate_actions
+    WHERE date=? AND version<=? AND type='split' AND factor>0`).all(config.date, config.dataVersion).map(({ security_id }) => security_id));
+  let pinned;
   let written = 0;
+  let reused = 0;
+  let cold = 0;
   for (const [index, { group, recipe }] of scopes.entries()) {
-    const members = [...new Set(group.memberIds)];
+    const members = [...new Set(group.memberIds)].sort();
     const counts = new Uint32Array(sessions.length);
     const totals = new Float64Array(sessions.length);
-    for (let offset = 0; offset < members.length; offset += 32) {
-      // Canonical saved quote revisions, read only inside this background job.
-      const histories = engine.studyPrices(pinned, members.slice(offset, offset + 32), sessions[0], config.date);
-      for (const bars of histories.values()) {
-        let previous;
-        for (const bar of bars) {
-          const position = positions.get(bar.date);
-          if (usableBar(bar) && usableBar(previous) && positions.get(previous.date) === position - 1) {
-            counts[position]++;
-            totals[position] += bar.close / previous.close - 1;
+    let prior;
+    if (!members.some((id) => splitting.has(id))) {
+      for (const version of predecessors) {
+        const row = readInputs.get(industryRecipe({ ...config, date: priorDate, dataVersion: version }, group));
+        if (row) { prior = new Map(JSON.parse(gunzipSync(row.value))); break; }
+      }
+    }
+    const current = new Map();
+    if (prior) for (const id of members) {
+      const { bars, sourceDataVersion } = readPreparedChart(db, config, id, 2);
+      if (sourceDataVersion !== config.dataVersion || bars.length !== 2 || bars[0].date !== priorDate || bars[1].date !== config.date) break;
+      current.set(id, bars);
+    }
+    const boundaryMoved = prior && prior.keys().next().value < sessions[0];
+    const changedBoundary = boundaryMoved && members.some((id) => {
+      const first = firstObserved.get(id, sessions[0], config.date, config.dataVersion)?.date;
+      if (!first) return false;
+      // Starting a raw history at this quote clears its prior-quote split signal.
+      // A flagged statement can therefore change the first comparable return.
+      const left = readPreparedChart(db, { ...config, date: first }, id, 1);
+      return left.state !== 'ready' || left.bars[0]?.unverifiedSplit;
+    });
+    const reuse = prior && !changedBoundary && current.size === members.length && sessions.slice(0, -1).every((date) => prior.has(date));
+    if (reuse) {
+      reused++;
+      for (const [previous, bar] of current.values()) if (usableBar(previous) && usableBar(bar)) {
+        counts[sessions.length - 1]++;
+        totals[sessions.length - 1] += bar.close / previous.close - 1;
+      }
+    } else {
+      cold++;
+      pinned ??= engine.historyBatch?.({ ...config, currentVersion: false }, [config.date]) ?? { ...config, currentVersion: false };
+      for (let offset = 0; offset < members.length; offset += 32) {
+        const histories = engine.studyPrices(pinned, members.slice(offset, offset + 32), sessions[0], config.date);
+        for (const bars of histories.values()) {
+          let previous;
+          for (const bar of bars) {
+            const position = positions.get(bar.date);
+            if (usableBar(bar) && usableBar(previous) && positions.get(previous.date) === position - 1) {
+              counts[position]++;
+              totals[position] += bar.close / previous.close - 1;
+            }
+            previous = bar;
           }
-          previous = bar;
         }
       }
     }
     const minimum = Math.max(1, Math.ceil(members.length / 2));
-    const readings = new Map(sessions.map((date, position) => [date, {
-      return: counts[position] >= minimum ? totals[position] / counts[position] : null,
-      observations: counts[position], expected: members.length,
-    }]));
+    const readings = new Map(sessions.map((date, position) => [date, reuse && position > 0 && position < sessions.length - 1 ? prior.get(date)
+      : { return: counts[position] >= minimum ? totals[position] / counts[position] : null,
+        observations: counts[position], expected: members.length }]));
     const rows = comparableCurve(sessions, readings);
-    put.run(recipe, CALCULATION_VERSION, config.dataVersion, config.date, group.id, gzipSync(JSON.stringify(rows), { level: 1 }), new Date().toISOString());
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      put.run(recipe, CALCULATION_VERSION, config.dataVersion, config.date, group.id, gzipSync(JSON.stringify(rows), { level: 1 }), new Date().toISOString());
+      saveInputs.run(recipe, gzipSync(JSON.stringify([...readings]), { level: 1 }));
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK');
+      throw error;
+    }
     written++;
     progress((index + 1) / Math.max(1, scopes.length));
   }
-  return { state: 'complete', date: config.date, dataVersion: config.dataVersion, written };
+  return { state: 'complete', date: config.date, dataVersion: config.dataVersion, written, reused, cold };
 }
 
-export function scheduleChartBookIndustries(db, engine, base, enqueueJob) {
+export function scheduleChartBookIndustries(db, engine, base, enqueueJob, { prepareNow = false } = {}) {
   const enqueued = [];
+  const requested = new Set();
   for (const { definition } of listWorkspace(db, bookKind)) {
     if (definition.context?.date || definition.context?.dataVersion) continue;
     let config;
@@ -386,9 +445,11 @@ export function scheduleChartBookIndustries(db, engine, base, enqueueJob) {
     if (config.basis !== 'reconstructed' || !config.date || config.date !== config.latestDate) continue;
     if (!engine.snapshotAvailable(config) && !hasPreparedSnapshot(db, engine, config)) continue;
     const jobKey = industryWorkspaceKey(config);
+    if (requested.has(jobKey)) continue;
+    requested.add(jobKey);
     const current = registeredProxy(db, jobKey);
-    if (current?.pending || current?.status === 'failed' || current?.resultState === 'complete') continue;
-    enqueued.push(enqueueJob(chartBookIndustryJob, { context: analysisContext(config), jobKey }, jobKey));
+    if (!prepareNow && (current?.pending || current?.status === 'failed' || current?.resultState === 'complete')) continue;
+    enqueued.push(enqueueJob(chartBookIndustryJob, { context: analysisContext(config), jobKey }, jobKey, current));
   }
   return enqueued;
 }

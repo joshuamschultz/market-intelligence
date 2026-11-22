@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "Synthetic next-session daily append",
+  "status": "V8 verified; independent V7/V8 persisted-output parity comparison passed",
+  "scope": {
+    "type": "simulated next session, full existing roster and declared analysis matrix",
+    "baselineDataVersion": 18914,
+    "calculationVersion": "2-081799bad3bf",
+    "baselineSession": "2026-11-20",
+    "syntheticAppendSession": "2026-11-23",
+    "liveWarehouseModified": false,
+    "verifiedContexts": 87,
+    "physicalScopes": 89,
+    "fixedContexts": 5,
+    "historySessionsAfterAppend": 1261
+  },
+  "environment": {
+    "hardware": "Apple M5 Max",
+    "cpuCores": 18,
+    "memoryGiB": 128,
+    "node": "v26.12.1",
+    "architecture": "arm64",
+    "workerHeapMiB": 23592,
+    "execution": "In-process scheduled-handler replay with production worker heap limit",
+    "filesystemCache": "Uncontrolled; prior runs may have warmed inputs",
+    "networkDisabled": true,
+    "backgroundWorkersDisabled": true
+  },
+  "results": {
+    "targetMs": 600000,
+    "speedupV8OverV7": 2.94,
+    "v7": {
+      "state": "verified",
+      "workloadElapsedMs": 526652,
+      "overallProcessElapsedMs": 529915,
+      "targetMet": true,
+      "peakRssKiB": 4606592,
+      "stagesMs": {
+        "captureReconcileAndImport": 980,
+        "rawPublication": 24440,
+        "dailyOwnerAndDependencies": 497168,
+        "checkpointAndReopen": 0,
+        "receiptReadback": 15
+      },
+      "corePhaseProjectionMs": 359613.566
+    },
+    "v8": {
+      "state": "verified",
+      "workloadElapsedMs": 179137,
+      "overallProcessElapsedMs": 182408,
+      "targetMet": true,
+      "peakRssKiB": 4665952,
+      "stagesMs": {
+        "captureReconcileAndImport": 1083,
+        "rawPublication": 24639,
+        "dailyOwnerAndDependencies": 149590,
+        "checkpointAndReopen": 1,
+        "receiptReadback": 15
+      },
+      "corePhaseProjectionMs": 14293.747,
+      "weeklyArchive": {
+        "references": 1218,
+        "snapshotsLoaded": 504,
+        "physicalFrameBuckets": 416,
+        "frameProjections": 16128,
+        "compressedBytes": 147894393,
+        "decodedBytes": 694095920,
+        "headerBlobs": 684,
+        "readMs": 11286.644
+      }
+    }
+  },
+  "verifiedOutputs": {
+    "syntheticPricesSubmittedAndReconciled": 5747,
+    "expectedCoreIdentities": 5564,
+    "positiveCoreIdentities": 5469,
+    "detailRows": 10007,
+    "riskRows": 30021,
+    "industryProxyRows": 199,
+    "healthOutputs": 504,
+    "nyseSummationSeries": 1,
+    "outputProducts": {
+      "base": { "expected": 126, "verified": 126 },
+      "velocity": { "expected": 126, "verified": 126 },
+      "ranks": { "expected": 126, "verified": 126 },
+      "breadth": { "expected": 126, "verified": 126 },
+      "monitor": { "expected": 126, "verified": 126 },
+      "detail": { "expected": 10007, "verified": 10007 },
+      "risk": { "expected": 30021, "verified": 30021 },
+      "health": { "expected": 504, "verified": 504 },
+      "nyseSummation": { "expected": 1, "verified": 1 },
+      "industryProxies": { "expected": 199, "verified": 199 }
+    }
+  },
+  "parityVerification": {
+    "state": "passed",
+    "stagesCompared": 29,
+    "readonlyApiSamples": 15,
+    "missingRows": 0,
+    "mathematicalDifferences": 0,
+    "normalizedDifferences": "Run/capture identifiers and generated-at timestamps only; all compared persisted values and API outputs otherwise matched."
+  },
+  "limitations": [
+    "Synthetic prices were used; no external provider, reference-data, or corporate-action downloads were performed.",
+    "Claude generation, backups, and HTTP transport were excluded.",
+    "Filesystem cache state was uncontrolled and prior runs may have warmed inputs.",
+    "The result represents a simulated daily append, not a live trading-day run or a cold full-history rebuild.",
+    "Independent persisted-output parity comparison between V7 and V8 is pending.",
+    "The separate five-year cold rebuild measured 72.6 minutes; full available-history performance has not been measured."
+  ]
+}

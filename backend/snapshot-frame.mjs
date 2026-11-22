@@ -151,7 +151,7 @@ export function encodeStockFrame(plans, { codec } = {}) {
   return compressStoredBytes(Buffer.concat([prefix, ...chunks], prefix.length + bytes), codec);
 }
 
-export function readStockFrame(value, recipeIndex, selected, fields) {
+export function openStockFrame(value, fields) {
   const bytes = decompressStoredBytes(value);
   const format = bytes.toString('ascii', 0, 4);
   if (format !== magic && format !== legacyMagic || bytes.length < 8) throw new Error('Invalid prepared stock frame');
@@ -160,28 +160,8 @@ export function readStockFrame(value, recipeIndex, selected, fields) {
   const start = align(length + 8);
   if (start > bytes.length) throw new Error('Truncated prepared stock frame');
   const [orders, shapes, dictionary, insertionOrders] = JSON.parse(bytes.toString('utf8', 8, length + 8));
-  if (!orders[recipeIndex]) throw new Error('Missing prepared stock frame recipe');
-  const [offset, count] = orders[recipeIndex];
   const views = shapes.map(([names, columns, rows], index) => ({ index, names, columns, rows, idField: names.indexOf('securityId'),
     visible: names.flatMap((name, index) => !fields || fields.has(name) ? [index] : []) }));
-  const parsed = new Map();
-  function decodeToken(code) {
-    if (code < 4) return literals[code];
-    const value = dictionary[code - 4];
-    if (value === undefined) throw new Error('Missing prepared stock frame value');
-    if (!Array.isArray(value)) return value;
-    if (!parsed.has(code)) parsed.set(code, JSON.parse(value[0]));
-    return parsed.get(code);
-  }
-  function field([type, value], row) {
-    if (type === 'number') {
-      const result = bytes.readDoubleLE(start + value + row * 8);
-      return result === missingNumber ? undefined : Number.isNaN(result) ? null : result;
-    }
-    if (type === 'tokens') return decodeToken(bytes.readUInt32LE(start + value + row * 4));
-    if (type === 'token') return decodeToken(value);
-    return type === 'constant' ? value : undefined;
-  }
   function lookup(id) {
     if (!id) return null;
     const shape = views[Math.floor((id - 1) / layersPerShape)];
@@ -204,43 +184,72 @@ export function readStockFrame(value, recipeIndex, selected, fields) {
     combinedOrders.set(key, ordered);
     return ordered;
   }
-  const results = [];
-  for (let index = 0; index < count; index++) {
-    const at = start + offset + index * (legacy ? 16 : 28);
-    const position = bytes.readUInt32LE(at);
-    const base = lookup(bytes.readUInt32LE(at + 4));
-    const own = lookup(bytes.readUInt32LE(at + (legacy ? 12 : 24)));
-    const identity = base ?? own;
-    if (!identity || identity[0].idField < 0) throw new Error('Missing prepared stock frame identity');
-    const id = field(identity[0].columns[identity[0].idField], identity[1]);
-    if (selected && !selected.has(id)) continue;
-    const parent = lookup(bytes.readUInt32LE(at + (legacy ? 8 : 16)));
-    const extra = legacy ? null : lookup(bytes.readUInt32LE(at + 8));
-    const velocity = legacy ? null : lookup(bytes.readUInt32LE(at + 20));
-    const row = {};
-    let omitted = null;
-    function set(name, value) {
-      if (name === '__proto__') Object.defineProperty(row, name, { value, enumerable: true, configurable: true, writable: true });
-      else row[name] = value;
-      if (value === undefined) (omitted ??= []).push(name);
-    }
-    if (extra) {
-      if (!base) throw new Error('Prepared stock additions have no base layer');
-      const orderId = bytes.readUInt32LE(at + 12);
-      for (const [name, layer, column] of mergedOrder(base[0], extra[0], orderId)) set(name, field(column, layer ? extra[1] : base[1]));
-    }
-    for (const layer of [extra ? null : base, parent, velocity, own]) {
-      if (!layer) continue;
-      const [shape, ordinal] = layer;
-      for (const column of shape.visible) {
-        const name = shape.names[column];
-        const value = field(shape.columns[column], ordinal);
-        set(name, value);
+  return {
+    decodedBytes: bytes.length,
+    read(recipeIndex, selected) {
+      if (!orders[recipeIndex]) throw new Error('Missing prepared stock frame recipe');
+      const [offset, count] = orders[recipeIndex];
+      const parsed = new Map();
+      function decodeToken(code) {
+        if (code < 4) return literals[code];
+        const value = dictionary[code - 4];
+        if (value === undefined) throw new Error('Missing prepared stock frame value');
+        if (!Array.isArray(value)) return value;
+        if (!parsed.has(code)) parsed.set(code, JSON.parse(value[0]));
+        return parsed.get(code);
       }
-    }
-    if (omitted) for (const name of omitted) if (row[name] === undefined) delete row[name];
-    if (row.securityId !== id) throw new Error('Prepared stock frame changed a permanent security ID');
-    results.push([position, row]);
-  }
-  return results;
+      function field([type, value], row) {
+        if (type === 'number') {
+          const result = bytes.readDoubleLE(start + value + row * 8);
+          return result === missingNumber ? undefined : Number.isNaN(result) ? null : result;
+        }
+        if (type === 'tokens') return decodeToken(bytes.readUInt32LE(start + value + row * 4));
+        if (type === 'token') return decodeToken(value);
+        return type === 'constant' ? value : undefined;
+      }
+      const results = [];
+      for (let index = 0; index < count; index++) {
+        const at = start + offset + index * (legacy ? 16 : 28);
+        const position = bytes.readUInt32LE(at);
+        const base = lookup(bytes.readUInt32LE(at + 4));
+        const own = lookup(bytes.readUInt32LE(at + (legacy ? 12 : 24)));
+        const identity = base ?? own;
+        if (!identity || identity[0].idField < 0) throw new Error('Missing prepared stock frame identity');
+        const id = field(identity[0].columns[identity[0].idField], identity[1]);
+        if (selected && !selected.has(id)) continue;
+        const parent = lookup(bytes.readUInt32LE(at + (legacy ? 8 : 16)));
+        const extra = legacy ? null : lookup(bytes.readUInt32LE(at + 8));
+        const velocity = legacy ? null : lookup(bytes.readUInt32LE(at + 20));
+        const row = {};
+        let omitted = null;
+        function set(name, value) {
+          if (name === '__proto__') Object.defineProperty(row, name, { value, enumerable: true, configurable: true, writable: true });
+          else row[name] = value;
+          if (value === undefined) (omitted ??= []).push(name);
+        }
+        if (extra) {
+          if (!base) throw new Error('Prepared stock additions have no base layer');
+          const orderId = bytes.readUInt32LE(at + 12);
+          for (const [name, layer, column] of mergedOrder(base[0], extra[0], orderId)) set(name, field(column, layer ? extra[1] : base[1]));
+        }
+        for (const layer of [extra ? null : base, parent, velocity, own]) {
+          if (!layer) continue;
+          const [shape, ordinal] = layer;
+          for (const column of shape.visible) {
+            const name = shape.names[column];
+            const value = field(shape.columns[column], ordinal);
+            set(name, value);
+          }
+        }
+        if (omitted) for (const name of omitted) if (row[name] === undefined) delete row[name];
+        if (row.securityId !== id) throw new Error('Prepared stock frame changed a permanent security ID');
+        results.push([position, row]);
+      }
+      return results;
+    },
+  };
+}
+
+export function readStockFrame(value, recipeIndex, selected, fields) {
+  return openStockFrame(value, fields).read(recipeIndex, selected);
 }

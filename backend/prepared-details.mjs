@@ -3,7 +3,7 @@ import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs
 import { expectedSessions } from './calendar.mjs';
 import { CALCULATION_VERSION, isoDate, normalizeSymbol } from './database.mjs';
 import { UNIVERSES } from './engine.mjs';
-import { mean, quantile } from './metrics.mjs';
+import { change, mean, quantile } from './metrics.mjs';
 import { detailRiskWindows, normalizeRiskBenchmarks, normalizeRiskWindows, readRiskHistory } from './risk-history.mjs';
 import { decodeStoredJson, encodeStoredJson } from './storage-codec.mjs';
 
@@ -11,6 +11,7 @@ const format = 'prepared-details-1';
 const maximumSessions = 7560;
 const wholeCatalog = UNIVERSES.find(({ id }) => id === 'us-all');
 const pinnedScope = Symbol('prepared detail scope');
+const inheritedChart = Symbol('inherited chart');
 export { detailRiskWindows };
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const barFields = [
@@ -195,10 +196,11 @@ function productWriter(db) {
     },
     encode(key, detail, riskByBenchmark, explicitSplitPriceBasis) {
       const existing = writer.has(key);
-      const chart = existing ? [] : chartBlocks(detail.chartBars);
-      const manifest = chart.map(({ first, last, count, hash }) => ({ first, last, count, hash }));
+      const inherited = detail[inheritedChart];
+      const chart = existing ? [] : chartBlocks(inherited?.tail ?? detail.chartBars);
+      const manifest = [...(inherited?.prefix ?? []), ...chart.map(({ first, last, count, hash }) => ({ first, last, count, hash }))];
       return { key, securityId: detail.securityId, chart, riskByBenchmark,
-        header: existing ? null : encodeStoredJson(productHeader(detail, explicitSplitPriceBasis)),
+        header: existing ? null : encodeStoredJson(inherited?.header ?? productHeader(detail, explicitSplitPriceBasis)),
         blocks: existing ? null : encodeStoredJson(manifest) };
     },
     commit(records, checkpoint) {
@@ -237,6 +239,74 @@ function productWriter(db) {
   };
   productWriters.set(db, writer);
   return writer;
+}
+
+export function dailyDetailSources(db, engine, config, parent, securityIds, { lookback = maximumSessions, signal, stats } = {}) {
+  const point = canonicalContext(config);
+  const sessions = expectedSessions(config.earliestDate, config.date);
+  const priorSession = sessions.at(-2);
+  const read = present(db) ? db.prepare(`SELECT header,blocks FROM prepared_detail_products WHERE ${keyWhere}`) : null;
+  const bounds = parent && reusableArchiveVersions(db, point, [parent.dataVersion]);
+  const reusable = point.basis === 'reconstructed' && parent?.date === priorSession &&
+    usableArchiveRow(bounds, { data_version: parent.dataVersion, date: priorSession }) && sessions.length <= maximumSessions;
+  const tailStart = sessions.at(-23) ?? sessions[0];
+
+  return (function* () {
+    const tails = reusable && read ? engine.detailSources({ ...point, earliestDate: tailStart }, { securityIds, lookback: 23, signal }) : null;
+    let next = tails?.next().value;
+    for (const id of securityIds) {
+      signal?.throwIfAborted();
+      const tail = next?.securityId === id ? next : null;
+      if (tail) {
+        if (stats) stats.boundedSourceSessions += Math.min(23, sessions.length);
+        next = tails.next().value;
+      }
+      const prior = tail && read.get(...keyFor(point, id, parent.dataVersion, priorSession));
+      const day = tail?.chartBars.at(-1);
+      const old = prior && decodeStoredJson(prior.header);
+      // A split can rescale every old bar. A new quarantine or suspected split can reset lifetime-high state.
+      const canAppend = old?.format === format && old.calendarThrough === priorSession && old.calendarFrom === sessions[0] &&
+        (!old.latestDate || old.latestDate >= tailStart || day?.missing) && day?.date === config.date &&
+        (!tail.listingDate || tail.listingDate <= priorSession) && !day.unverifiedSplit && !day.priceQuarantined &&
+        !tail.actions.some(({ type, date, factor }) => type === 'split' && date > priorSession && date <= config.date && factor > 0);
+      if (!canAppend) {
+        if (stats) {
+          stats.coldSecurities++;
+          stats.coldSourceSessions += sessions.length;
+        }
+        yield* engine.detailSources(point, { securityIds: [id], lookback: maximumSessions, signal });
+        continue;
+      }
+
+      if (stats) stats.reusedSecurities++;
+      const manifest = decodeStoredJson(prior.blocks);
+      const sameQuarter = quarter(manifest.at(-1).last) === quarter(day.date);
+      const prefix = sameQuarter ? manifest.slice(0, -1) : manifest;
+      const chartTail = sameQuarter ? [...readBars(db, manifest.slice(-1), priorSession, maximumSessions), day] : [day];
+      const chartBars = [...readBars(db, manifest, priorSession, lookback - 1), day];
+      const traded = day.traded && Number.isFinite(day.high);
+      const high = traded ? Math.max(old.loadedHistoryHigh || 0, day.high) : old.loadedHistoryHigh;
+      const allTimeHigh = old.allTimeHigh && traded ? high : null;
+      const metadata = { ...tail, chartBars, allTimeHigh, loadedHistoryHigh: high,
+        loadedHistoryHighFrom: old.loadedHistoryHighFrom ?? (traded ? day.date : null),
+        loadedHistoryHighThrough: traded ? day.date : old.loadedHistoryHighThrough,
+        loadedHistoryHighObservations: old.loadedHistoryHighObservations + Number(traded),
+        loadedHistoryHighExpected: old.loadedHistoryHighFrom ? old.loadedHistoryHighExpected + 1 : Number(traded),
+        loadedHistoryHighBoundary: old.loadedHistoryHighBoundary,
+        distance_all_time_high: change(day.close, allTimeHigh), distance_loaded_history_high: change(day.close, high),
+        earliestDate: old.earliestDate ?? tail.earliestDate, latestDate: day.missing ? old.latestDate : day.date };
+      const highWarning = 'Full history since listing is unavailable.';
+      const warnings = tail.warnings.slice(0, tail.warnings.length - tail.quality.length).filter((warning) => warning !== highWarning);
+      if (!allTimeHigh) warnings.push(highWarning);
+      metadata.warnings = [...warnings, ...tail.quality.map(({ reason }) => reason)];
+      const header = productHeader(metadata, tail.explicitSplitPriceBasis);
+      header.calendarFrom = old.calendarFrom;
+      if (old.unsafeBefore && (!header.unsafeBefore || old.unsafeBefore > header.unsafeBefore)) header.unsafeBefore = old.unsafeBefore;
+      metadata[inheritedChart] = { prefix, tail: chartTail, header };
+      if (stats) stats.retainedChartBlocks += prefix.length;
+      yield metadata;
+    }
+  })();
 }
 
 export function writePreparedDetail(db, config, detail, { riskByBenchmark = {}, explicitSplitPriceBasis = false } = {}) {

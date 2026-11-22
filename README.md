@@ -6,7 +6,7 @@ A local, data-versioned research workspace for U.S. stock leadership, relative s
 
 ## Current status
 
-Immutable R14 / app 0.2.4 is live with warm calculation `2-be44dec1f429`; check `/api/v1/build` and `data/active-release.json` for the active build. The saved five-year `2-081` computation is being checked by bounded parallel verification; it remains unpublished, and the ten-minute target has not been met. See [Remaining work](docs/REMAINING-WORK.md) and [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md) for current readiness and validation status.
+App 0.2.7 is the current release; use `/api/v1/build` and `data/active-release.json` to identify the active immutable build. Calculation `2-081799bad3bf` is published at data version 18,914 through Nov 20, with 1,260/1,260 history and NYSE summation sessions and 68 SEC industry groups with both velocity products ready. A cold rebuild of the five-year archive took 72.6 minutes, missing the ten-minute target; full available-history performance has not been measured. See [Remaining work](docs/REMAINING-WORK.md) and [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md) for current readiness and performance gaps.
 
 ## From market context to a saved review
 
@@ -58,12 +58,13 @@ For the managed macOS service, see [Desktop quickstart](docs/LOCAL-QUICKSTART.md
 | Check build, source, and readiness | `npm run app -- status` | Reports daily-data status separately from full-analysis readiness. |
 | Stop the managed service | `npm run app -- stop` | Stops the server; local data remain on disk. |
 | Update finalized daily data | `npm run update -- --wait` | Waits for that daily job and reports full-analysis status separately; it does not wait for or download the complete history. |
+| Wait for exact-day full analysis | `npm run update -- --wait-analysis` | Waits for the current session and revision's full analysis, not every historical context. |
 
 ## Data and calculation flow
 
 ![Conceptual data flow from provider captures to prepared views](docs/assets/data-pipeline.jpg)
 
-Provider captures are stored with manifests and validated before import. The development workspace warehouse—not included in a Git clone—is v18,914 and contains 14,060,949 daily price rows, 14,073,659 revisions, and 10,094 securities. It retains source revisions; calculations and archives are prepared for exact contexts. Daily updates append newly available sessions and recalculate affected outputs. A split/source correction, changed reference, universe, model, or calculation definition can require recomputing affected history. Do not assume every historical output is permanently calculated once or that a read request will silently build a missing cold context.
+Provider captures are stored with manifests and validated before import. The development workspace warehouse—not included in a Git clone—is v18,914 and contains 14,060,949 daily price rows, 14,073,659 revisions, and 10,094 securities. It retains source revisions; calculations and archives are prepared for exact contexts. Normal daily imports fetch only missing finalized sessions and append calculations from stored outputs. A split/source correction, changed reference, universe, model, or calculation definition requires an explicit verified backfill for affected history. Do not assume every historical output is permanently calculated once or that a read request will silently build a missing cold context.
 
 Current provider access includes EODHD prices, bulk history, split actions, and delisted listings. EODHD fundamentals and ticker-rename endpoints have returned 403. SEC/SIC supplies filing-dated classifications through a current-catalog identity bridge; Nasdaq typed-reference data are a current capture, not a point-in-time taxonomy. These sources do not establish complete historical membership. Float observations are currently absent.
 
@@ -76,7 +77,7 @@ npm run check
 npm test
 ```
 
-The R14 source-index suite passed 342/342, and 10 assembled UI checks passed; the prior R13 protocol suite (50 checks) and Astra's independent 35 focused checks also passed. Production archive verification, all-screen native review, and full five-year performance acceptance remain pending. Use the active release manifest for current build results. Cached page timings do not establish cold-history calculation performance.
+Before the new workspace CLI, the source suite passed 351 tests; the CLI has 15 focused tests, the daily workflow seven, and ordered catch-up 64 focused tests. The catch-up checks cover Mon–Tue sequencing, worker/restart recovery, stale queued work, retries, and bounded explicit backfill; no real provider trading day has yet been observed. V8 completed the same synthetic next-session replay as V7 in 179.137 seconds (2.94× faster). An independent comparison of 29 persisted stages and 15 read-only API samples found no missing rows or mathematical differences; only run/capture identifiers and generated timestamps differed. The run used synthetic prices and uncontrolled filesystem cache, and did not exercise provider downloads or transport; the live warehouse remains unchanged. See the [sanitized benchmark record](docs/benchmarks/2026-11-22-daily-append.json) for scope and limitations. The cold five-year archive rebuild took 72.6 minutes, so the full-history 600-second target remains unmet. The release builder gates promotion on a fresh complete suite and records its results in the release evidence; cached page timings do not establish cold-history calculation performance.
 
 The project uses a Node/browser modular monolith with durable SQLite WAL storage. The `data/` directory contains local databases, raw captures, logs, backups, and derived outputs; it is ignored by Git and should be treated as private workspace state. The browser UI and source warehouse are local, but an explicitly requested Claude generation sends the selected market context to Anthropic. Follow [Operations](docs/OPERATIONS.md) before importing, restoring, or archiving data.
 

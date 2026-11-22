@@ -2,6 +2,8 @@
 
 This guide is for the configured macOS preview on the user's computer. The `market-*` zsh shortcuts manage the local app and daily price capture; they do not erase or replace the SQLite history. They are defined in `~/.setup/.aliases` and call the workspace CLI in this project. If the shortcuts are not loaded in a shell, use the equivalent `npm run app` / `npm run update` commands below.
 
+The current package version is 0.2.7. Use `market-status` or `/api/v1/build` to check which immutable build the managed service is currently running.
+
 ## Open and check the app
 
 Open Terminal and run. In a terminal tab opened before the aliases were installed, first run `source ~/.setup/.aliases`; new terminal tabs load them automatically from zsh startup.
@@ -37,22 +39,22 @@ To check the exact app build, open <http://127.0.0.1:4173/api/v1/build>. Use the
 After the provider has finalized a session (the configured schedule is 16:30 America/New_York), run:
 
 ```sh
-market-update
+market-update --wait-analysis
 market-status
 ```
 
-This asks for the newest finalized session and skips already verified capture instead of downloading the full history again. To catch up a specific recent session, add its date; repeat `--date` for up to five recent sessions:
+This asks for the newest finalized session and waits for analysis for that exact session and revision; it skips already verified capture instead of downloading the full history again. Plain `market-update` queues the daily update and returns without waiting for its analysis. To catch up a specific recent session, add its date; repeat `--date` for up to five recent sessions:
 
 ```sh
 market-update --date YYYY-MM-DD
 market-update --date YYYY-MM-DD --date YYYY-MM-DD
 ```
 
-The equivalent direct command is `npm run update -- --date YYYY-MM-DD`. Add `--wait` to follow the submitted daily capture/import jobs. It waits for those daily jobs only; it does not wait for every historical calculation, breadth archive, or health context to finish. The command reports daily publication separately from full-analysis readiness. Check `market-status` and the UI's readiness status before relying on the new date. When a previous capture is already verified but unpublished, the update flow can recover publication locally rather than downloading the same data again.
+The equivalent direct command is `npm run update -- --date YYYY-MM-DD`. Add `--wait` to follow only daily capture/import jobs. To wait for the exact session and revision's full current-day analysis, use `market-update --wait-analysis` or `npm run update -- --wait-analysis`; this does not rebuild every historical context. The command reports daily publication separately from full-analysis readiness. Check `market-status` and the UI's readiness status before relying on the new date. When a previous capture is already verified but unpublished, the update flow can recover publication locally rather than downloading the same data again.
 
 The update command defaults to the latest finalized exchange session at 16:30 America/New_York (or `MARKET_SYNC_AFTER`). It skips an already published date and does not download the full history again. Updates are deferred while a pinned five-year build is running. Date-specific requests are limited to five recent sessions; current-roster verification is limited to a seven-calendar-day window.
 
-The warehouse retains prior imported rows. A daily update appends new sessions and schedules affected analyses. A source correction, new reference data, or changed model/calculation can invalidate affected history and require recomputation; daily append does not mean historical calculations are never rerun. The current 1,260-session full preparation has exceeded ten minutes and is still a separate, incomplete task.
+The warehouse retains prior imported rows. A normal daily update fetches only missing finalized sessions and appends calculations from stored outputs. A source correction, split change, new reference, or changed universe/model/calculation scope needs an explicit verified backfill of affected history. The five-year 1,260-session archive is published and ready; its cold rebuild took 72.6 minutes, exceeding the ten-minute target. A V8 synthetic next-session replay completed in 179.137 seconds, but used synthetic prices and uncontrolled filesystem cache, excluded external provider/transport, and left the live warehouse unchanged. Ordered multi-day catch-up and recovery paths passed 64 focused tests; a real next-trading-day run remains unobserved.
 
 ## Fresh setup and credentials
 

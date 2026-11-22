@@ -376,7 +376,7 @@ function historyStatus(summary, state, progress) {
 }
 
 export function prepareRangeHistoryBatch(db, engine, config, windows, {
-  cursor = null, progress = () => {}, signal, bucketSize, onSecurity, dates, sourceDb = db,
+  cursor = null, progress = () => {}, signal, bucketSize, onSecurity, dates, sourceDb = db, detailSources, previousRanges,
 } = {}) {
   signal?.throwIfAborted();
   const requested = validateRangeWindows(windows);
@@ -397,6 +397,9 @@ export function prepareRangeHistoryBatch(db, engine, config, windows, {
     throw new RangeError('Range history output dates must be contiguous trading sessions through the pinned date');
   }
   const [first] = output;
+  if (previousRanges && (output.length !== 1 || requested.some((window) => !previousRanges.has(window)))) {
+    throw new RangeError('Range append requires prior coverage for every requested window and one new session');
+  }
   const recipe = recipeFor({ ...config, referenceMode: 'as-of' });
   const id = createHash('sha256').update(JSON.stringify([recipe, config.dataVersion, first, config.date, requested])).digest('hex');
   db.exec(historySchema);
@@ -418,7 +421,9 @@ export function prepareRangeHistoryBatch(db, engine, config, windows, {
     .all(config.dataVersion, config.date, state.cursor ?? '', size);
   const starts = JSON.parse(state.starts);
   const anchored = pinnedRangeContext({ ...config, referenceMode: 'as-of' });
-  const sources = engine.detailSources?.(anchored, { securityIds: ids.map(({ id }) => id), lookback: maxLookback, signal });
+  const securityIds = ids.map(({ id }) => id);
+  const sources = detailSources ? detailSources(securityIds)
+    : engine.detailSources?.(anchored, { securityIds, lookback: maxLookback, signal });
   if (!sources) engine.snapshot(anchored, { cache: true, velocity: false });
   const iterator = sources?.[Symbol.iterator]();
   let next = iterator?.next().value;
@@ -437,11 +442,24 @@ export function prepareRangeHistoryBatch(db, engine, config, windows, {
     const lastSplit = (detail.actions ?? []).findLast((action) => action.type === 'split' && action.factor > 0 && action.date <= config.date)?.date;
     const splitSafeFrom = lastSplit && (detail.explicitSplitPriceBasis ?? explicitPriceBasis.get(securityId, config.dataVersion, lastSplit)) ? lastSplit : '';
     if (splitSafeFrom) excluded++;
-    scanHistory(detail.chartBars, sessions, starts, (date, window, values) => {
+    const collect = (date, window, values) => {
       const output = byWindow.get(window);
       if (!output.has(date)) output.set(date, []);
       output.get(date).push([securityId, ...values]);
-    }, splitSafeFrom);
+    };
+    if (previousRanges && detail.chartBars.length < sessions.length) {
+      const bars = comparableSuffix(detail.chartBars, sessions, config.date);
+      const highs = new Int32Array(bars.length);
+      const lows = new Int32Array(bars.length);
+      for (const [window] of starts) {
+        if (bars.length < window) continue;
+        const values = scanWindow(bars.slice(-(window + 1)), window, highs, lows);
+        const previous = bars.length > window && previousRanges.get(window).get(securityId);
+        for (const index of [2, 3]) if (values[index] == null && Number.isInteger(previous?.[index]) &&
+          previous[index] + 1 < sessions.length - window) values[index] = previous[index] + 1;
+        collect(config.date, window, values);
+      }
+    } else scanHistory(detail.chartBars, sessions, starts, collect, splitSafeFrom);
   }
   signal?.throwIfAborted();
 

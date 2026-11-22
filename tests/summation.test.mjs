@@ -1,12 +1,34 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { expectedSessions } from '../backend/calendar.mjs';
-import { CALCULATION_VERSION, openDatabase } from '../backend/database.mjs';
-import { calculateSummation, prepareSummation, readPreparedSummation } from '../backend/summation.mjs';
+import { CALCULATION_VERSION, importDataset, openDatabase } from '../backend/database.mjs';
+import { appendSummation, calculateSummation, prepareSummation, readPreparedSummation } from '../backend/summation.mjs';
 
 const sessions = expectedSessions('2024-01-02', '2024-12-31');
 const balanced = (date) => ({ date, advancers: 50, decliners: 50, comparable: 100, traded: 100 });
 const closeTo = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `Expected ${actual} to be near ${expected}`);
+
+test('summation appends exactly one row across legacy warmup, crossover and gap states', (t) => {
+  for (const length of [72, 103, 107]) {
+    const db = openDatabase(':memory:');
+    t.after(() => db.close());
+    const dates = sessions.slice(0, length + 2);
+    const breadth = dates.map((date, index) => ({ ...balanced(date), advancers: 48 + index % 7,
+      decliners: 51 - index % 7, ...(index === 106 && { advancers: 0, decliners: 0 }) }));
+    const ingest = (date) => importDataset(db, { provider: 'fixture', prices: [{ symbol: 'AAA', date, knownAt: date,
+      open: 10, high: 10, low: 10, close: 10, volume: 1000 }] }).version;
+    const parent = { universe: { id: 'nyse', version: 1 }, basis: 'reconstructed', referenceMode: 'as-of',
+      dataVersion: ingest(dates[length - 1]), earliestDate: dates[0], date: dates[length - 1] };
+    prepareSummation(db, parent, dates.slice(0, length), breadth.slice(0, length));
+    const current = { ...parent, date: dates[length], dataVersion: ingest(dates[length]) };
+    assert.equal(appendSummation(db, current, parent, breadth[length]).written, 1);
+    assert.equal(appendSummation(db, current, parent, breadth[length]).written, 0);
+    const next = { ...current, date: dates[length + 1], dataVersion: ingest(dates[length + 1]) };
+    assert.equal(appendSummation(db, next, current, breadth[length + 1]).written, 1);
+    assert.deepEqual(readPreparedSummation(db, next).rows, calculateSummation(dates, breadth));
+    assert.equal(db.prepare('SELECT count(*) AS n FROM prepared_nyse_summation WHERE data_version=?').get(next.dataVersion).n, 1);
+  }
+});
 
 test('ratio adjustment, zero EMA initialization, cumulative oscillator, and warmup match known values', () => {
   const dates = sessions.slice(0, 105);

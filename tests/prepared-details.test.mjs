@@ -5,7 +5,7 @@ import { expectedSessions } from '../backend/calendar.mjs';
 import { CALCULATION_VERSION, importDataset, openDatabase } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
 import {
-  createPreparedDetailWriter, hasPreparedDetail, prepareDetailsBatch, readPreparedDetail, riskMetrics, writePreparedDetail,
+  createPreparedDetailWriter, dailyDetailSources, hasPreparedDetail, prepareDetailsBatch, readPreparedDetail, riskMetrics, writePreparedDetail,
 } from '../backend/prepared-details.mjs';
 import { prepareRangeMetrics } from '../backend/range-metrics.mjs';
 import { decompressStoredBytes } from '../backend/storage-codec.mjs';
@@ -37,6 +37,35 @@ function fixture(t, { split = false, explicitBasis = false, count = 182 } = {}) 
   });
   return { db, engine: createEngine(db), dates, splitDate };
 }
+
+test('daily quote tails and cold fallbacks match complete chart products byte for byte', (t) => {
+  const parentDate = '2024-09-30';
+  const date = '2024-10-01';
+  for (const scenario of ['dividend and notice', 'missing quote', 'quarantine', 'split']) {
+    const { db, engine } = fixture(t, { count: calendar.indexOf(parentDate) + 1 });
+    const parent = engine.context({ date: parentDate });
+    prepareDetailsBatch(db, engine, parent, { securityIds: [stockId], riskWindows: [] });
+    const prices = [quote('SPY', date, 59), quote('VTI', date, 61), ...(scenario === 'missing quote' ? [] : [quote('AAA', date, scenario === 'split' ? 46 : 94)])];
+    const corporateActions = scenario === 'split' ? [{ symbol: 'AAA', type: 'split', date, knownAt: date, factor: 2 }]
+      : scenario === 'dividend and notice' ? [{ symbol: 'AAA', type: 'dividend', date, knownAt: date, amount: 0.25 }] : [];
+    const qualityOverrides = ['dividend and notice', 'quarantine'].includes(scenario) ? [{ id: 'tail-q', securityId: stockId,
+      kind: scenario === 'quarantine' ? 'price' : 'notice', from: date, to: date, knownAt: date,
+      active: true, reason: 'fixture override', evidenceUrl: 'https://example.invalid/source' }] : [];
+    importDataset(db, { provider: source, prices, corporateActions, qualityOverrides });
+    const current = engine.context({ date });
+    const stats = { reusedSecurities: 0, coldSecurities: 0, retainedChartBlocks: 0, boundedSourceSessions: 0, coldSourceSessions: 0 };
+    const append = [...dailyDetailSources(db, engine, current, parent, [stockId], { lookback: 54, stats })];
+    const reconstructed = openDatabase(':memory:');
+    t.after(() => reconstructed.close());
+    createPreparedDetailWriter(reconstructed, engine, current, { riskWindows: [], sourceDb: db })
+      .batch([...engine.detailSources(current, { securityIds: [stockId] })]);
+    createPreparedDetailWriter(db, engine, current, { riskWindows: [] }).batch(append);
+    const read = (target) => target.prepare(`SELECT header,blocks FROM prepared_detail_products WHERE anchor_date=? AND security_id=?`).get(date, stockId);
+    assert.deepEqual(read(db), read(reconstructed), scenario);
+    if (['split', 'quarantine'].includes(scenario)) assert.equal(stats.coldSecurities, 1, scenario);
+    else assert.equal(stats.reusedSecurities, 1, scenario);
+  }
+});
 
 test('lookup without a prepared product performs no writes or market calculation', (t) => {
   const { db, engine } = fixture(t, { count: 30 });

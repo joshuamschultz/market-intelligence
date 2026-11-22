@@ -2,11 +2,11 @@ import { createHash } from 'node:crypto';
 import { totalmem } from 'node:os';
 import { Worker } from 'node:worker_threads';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { isAnalysisCalculationJob, readAnalysisReadiness } from './analysis-readiness.mjs';
+import { analysisWorkspaceScopeHash, dailyAnalysisParent, isAnalysisCalculationJob, readAnalysisReadiness, verifiedAnalysisPublication } from './analysis-readiness.mjs';
 import { referenceArchiveScopes, reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import {
   bulkSessionStatus, CALCULATION_VERSION, createJob, dailyPublication, dataVersion, getWorkspace, importDataset, isoDate, jobById, listWorkspace, storeWorkspace,
-  normalizeSymbol, qualityOverrides, recordDailyPublication, today, updateJob, warehouseStatus,
+  marketDay, normalizeSymbol, qualityOverrides, recordDailyPublication, today, updateJob, warehouseStatus,
 } from './database.mjs';
 import { expectedSessions, isMarketSession, latestFinalizableSession, shiftDate, weekEnd } from './calendar.mjs';
 import { backupRetention, createCompressedBackup } from './backup.mjs';
@@ -14,6 +14,7 @@ import { runBatchPreparation } from './batch-preparation.mjs';
 import { BREADTH_METRICS, breadthMetric, binaryMetric } from './breadth.mjs';
 import { chartBookIndustryJob, createChartBook, prepareChartBookIndustries, readChartBookSnapshot, scheduleChartBookIndustries } from './chartbook.mjs';
 import { createResearchNotes } from './research-notes.mjs';
+import { prepareDailyAnalysis } from './daily-analysis.mjs';
 import { createEngine, UNIVERSES, validateUniverse } from './engine.mjs';
 import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, volumeRatio } from './metrics.mjs';
 import {
@@ -54,6 +55,7 @@ export function scheduledPrecomputeKey(date, version) {
 export const defaultMarketSyncAfter = '16:30';
 export const dailyCaptureOffsets = [0, 10, 25, 50];
 const dailyAvailabilityMinutes = 90;
+export const dailyCaptureLookbackDays = 7;
 const easternClock = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 });
@@ -71,32 +73,36 @@ export function rawBulkReceipt(db, date) {
     ORDER BY s.version DESC LIMIT 1`).get(date) || null;
 }
 
-function availabilityClock(date, now, after) {
+function availabilityClock(date, now, after, ordered) {
   const clock = Object.fromEntries(easternClock.formatToParts(now).map(({ type, value }) => [type, value]));
   const today = `${clock.year}-${clock.month}-${clock.day}`;
   const [hours, minutes] = marketSyncAfter(after).split(':').map(Number);
   const elapsed = 60 * Number(clock.hour) + Number(clock.minute) - 60 * hours - minutes;
-  return { today, elapsed, inWindow: today === date && elapsed >= 0 && elapsed <= dailyAvailabilityMinutes };
+  return { today, elapsed, inWindow: today === date && elapsed >= 0 && elapsed <= dailyAvailabilityMinutes,
+    historical: ordered && date < today && date >= shiftDate(today, -dailyCaptureLookbackDays) };
 }
 
-export function dailyCaptureAvailability(db, date, now, after = defaultMarketSyncAfter) {
+export function dailyCaptureAvailability(db, date, now, after = defaultMarketSyncAfter, { ordered = false } = {}) {
   const raw = rawBulkReceipt(db, date);
   const verified = bulkSessionStatus(db, date, { verifiedOnly: true });
   const jobs = db.prepare(`SELECT status,updated_at FROM jobs WHERE type='provider-import'
     AND json_extract(payload,'$.scheduledFor')=? AND json_type(payload,'$.captureAttempt')='integer' ORDER BY rowid`).all(date);
   const previous = jobs.at(-1);
-  const { today, elapsed, inWindow } = availabilityClock(date, now, after);
+  const { today, elapsed, inWindow, historical } = availabilityClock(date, now, after, ordered);
   const attempts = jobs.length;
   const record = { date, after, timezone: 'America/New_York', retryOffsetsMinutes: dailyCaptureOffsets,
     availabilityMinutes: dailyAvailabilityMinutes, attempts, maxAttempts: dailyCaptureOffsets.length, receipt: raw, due: false };
   if (verified) return { ...record, state: 'verified' };
   if (jobs.some(({ status }) => status === 'running' || status === 'queued')) return { ...record, state: 'capturing' };
-  if (inWindow && attempts < dailyCaptureOffsets.length) {
+  if ((inWindow || historical) && attempts < dailyCaptureOffsets.length) {
     const offset = dailyCaptureOffsets[attempts];
     const delay = attempts ? dailyCaptureOffsets[attempts] - dailyCaptureOffsets[attempts - 1] : 0;
     const eligibleAt = previous ? Date.parse(previous.updated_at) + delay * 60_000 : 0;
-    const due = elapsed >= offset && now.getTime() >= eligibleAt;
-    return { ...record, state: due ? 'due' : 'waiting', due };
+    const due = (historical || elapsed >= offset) && now.getTime() >= eligibleAt;
+    return { ...record, state: due ? 'due' : 'waiting', due, ...(historical && { catchUp: true }) };
+  }
+  if (ordered && date < shiftDate(today, -dailyCaptureLookbackDays)) {
+    return { ...record, state: 'outside_verification_window' };
   }
   if (!raw && !attempts && (today > date || today === date && elapsed >= 0)) {
     return { ...record, state: 'due', due: true, catchUp: true };
@@ -104,17 +110,74 @@ export function dailyCaptureAvailability(db, date, now, after = defaultMarketSyn
   return { ...record, state: 'exhausted' };
 }
 
+function nextDailySession(date) {
+  return expectedSessions(shiftDate(date, 1), shiftDate(date, 14))[0];
+}
+
+export function orderedDailyPoint(db) {
+  const date = db.prepare('SELECT date FROM daily_prices ORDER BY date DESC LIMIT 1').get()?.date;
+  const version = dataVersion(db);
+  const point = { date, dataVersion: version, calculationVersion: CALCULATION_VERSION };
+  const ready = date && readAnalysisReadiness(db, point).state === 'ready';
+  const nextDate = date && nextDailySession(date);
+  return { ...point, ready, nextDate };
+}
+
+export function orderedDailyTarget({ date, ready, nextDate }, finalized) {
+  if (!date) return finalized;
+  return ready && nextDate <= finalized ? nextDate : date;
+}
+
+function proofSkipsSession(prior, date) {
+  return !!prior && prior.date < date && nextDailySession(prior.date) !== date;
+}
+
+export function hasUnprovedDailyGap(db, point) {
+  return proofSkipsSession(latestAnalysis(db, point.dataVersion, { requirePrecompute: true, readiness: point }), point.date);
+}
+
+function orderedCaptureConflict(db, payload, now, after) {
+  const { date } = payload;
+  if (payload.calculationVersion != null && payload.calculationVersion !== CALCULATION_VERSION) {
+    return 'The active calculation version changed. Re-run npm run update -- --wait-analysis.';
+  }
+  if (!payload.bulk || !payload.verifiedOnly || payload.from || payload.to || !isoDate(date) ||
+      !isMarketSession(date) || date > latestFinalizableSession(now, after)) {
+    return 'Choose one finalized exchange session for an ordered daily update.';
+  }
+  const point = orderedDailyPoint(db);
+  if (point.date && date < point.date) {
+    return `Current prices already reach ${point.date}. Verify and publish a baseline if the intervening analysis was skipped.`;
+  }
+  if (date === point.date && !point.ready && hasUnprovedDailyGap(db, point)) {
+    return `Prices already reach ${date} without verified analysis for an intervening session. Verify and publish a baseline before retrying.`;
+  }
+  if (point.date && date > point.date && (!point.ready || date !== point.nextDate)) {
+    return !point.ready ? `Finish verified full analysis for ${point.date} before capturing ${date}.`
+      : `Capture and finish verified full analysis for ${point.nextDate} before capturing ${date}.`;
+  }
+  if (!(point.ready && date === point.date) && !bulkSessionStatus(db, date, { verifiedOnly: true }) &&
+      date < shiftDate(marketDay(now), -dailyCaptureLookbackDays)) {
+    return `Session ${date} is outside the provider's seven-calendar-day verification window. Complete a verified backfill before resuming daily updates.`;
+  }
+  return null;
+}
+
 export function scheduledJournalReadiness(db, { date, nasdaqEnabled = process.env.MARKET_NASDAQ_SYNC === '1',
   referenceEnabled = process.env.MARKET_SYNC === '1' && !!process.env.EODHD_API_KEY && process.env.MARKET_REFERENCE_SYNC === '1',
   precomputeEnabled = process.env.MARKET_PRECOMPUTE === '1' } = {}) {
+  const version = dataVersion(db);
   const raw = date ? bulkSessionStatus(db, date, { verifiedOnly: true }) : null;
   const publication = raw && dailyPublication(db, date, raw.version);
-  if (!publication) return { state: 'waiting_for_publication', date: date ?? null };
+  const exactProof = precomputeEnabled && readAnalysisReadiness(db, {
+    date, dataVersion: version, calculationVersion: CALCULATION_VERSION,
+  }).state === 'ready';
+  if (!publication && !exactProof) return { state: 'waiting_for_publication', date: date ?? null };
   const active = db.prepare(`SELECT id,type,status FROM jobs WHERE status IN ('queued','running')
     AND type IN ('provider-import','provider-reference','provider-bootstrap','nasdaq-refresh') ORDER BY created_at DESC LIMIT 1`).get();
   if (active) return { state: 'waiting_for_reference_jobs', date, jobId: active.id, jobType: active.type, jobStatus: active.status };
   if (bootstrapProgress(db, { activeOnly: true })) return { state: 'waiting_for_reference_jobs', date, jobType: 'provider-bootstrap', jobStatus: 'running' };
-  const version = dataVersion(db);
+  if (exactProof) return { state: 'ready', date, dataVersion: version };
   const sourceStages = [
     ['nasdaq-refresh', 'captureDate', 'nasdaq_refresh', nasdaqEnabled],
     ['provider-reference', 'referenceDate', 'reference_refresh', referenceEnabled],
@@ -133,9 +196,10 @@ export function scheduledJournalReadiness(db, { date, nasdaqEnabled = process.en
       ...(attempt ? { jobId: attempt.id, jobStatus: attempt.status } : {}) };
   }
   if (precomputeEnabled) {
-    const attempt = db.prepare(`SELECT id,status FROM jobs WHERE type='production-precompute'
+    const attempt = db.prepare(`SELECT id,status,json_extract(result,'$.analysisPreparation') AS analysisPreparation FROM jobs WHERE type='production-precompute'
       AND json_extract(payload, '$.jobKey')=? ORDER BY status='complete' DESC, created_at DESC LIMIT 1`)
       .get(scheduledPrecomputeKey(date, version));
+    if (attempt?.analysisPreparation) return { state: attempt.analysisPreparation, date, dataVersion: version, jobId: attempt.id };
     if (attempt?.status !== 'complete') return {
       state: attempt?.status === 'failed' ? 'precompute_failed' : 'waiting_for_precompute', date, dataVersion: version,
       ...(attempt ? { jobId: attempt.id, jobStatus: attempt.status } : {}),
@@ -639,10 +703,17 @@ function bootstrapProgress(db, { activeOnly = false } = {}) {
     publishedVersion: plan.published_version };
 }
 
-function classificationStatus(db) {
+function requireWritableRawFacts(db) {
+  const owned = db.prepare(`SELECT 1 FROM jobs WHERE type='optimized-five-year' AND (
+    status IN ('waiting_for_space','building') AND unixepoch(updated_at)>=unixepoch('now')-120
+    OR status='awaiting_publication' AND json_extract(payload,'$.dataVersion')=?) LIMIT 1`).get(dataVersion(db));
+  if (owned) throw asError('Raw market facts are read-only while verified five-year analysis is being prepared or published.', 409);
+}
+
+function classificationStatus(db, version = dataVersion(db)) {
   const coverage = db.prepare(`SELECT system, source, count(*) AS observations, count(DISTINCT security_id) AS securities,
     min(effective_from) AS firstDate, max(effective_from) AS lastDate
-    FROM classifications WHERE industry IS NOT NULL GROUP BY system, source ORDER BY system, source`).all();
+    FROM classifications WHERE industry IS NOT NULL AND version<=? GROUP BY system, source ORDER BY system, source`).all(version);
   const systems = [...new Set(['provider', ...coverage.map(({ system }) => system)])];
   const defaultClassification = systems.includes('nasdaq') ? 'nasdaq'
     : coverage.some(({ system }) => system === 'provider') ? 'provider'
@@ -655,11 +726,42 @@ function availableBenchmarks(db) {
     WHERE type IN ('etf','index') AND first_seen IS NOT NULL ORDER BY symbol`).all().map(({ symbol }) => symbol);
 }
 
-function workspaceDefaults(db) {
-  const benchmarks = availableBenchmarks(db);
+function workspaceDefaults(db, pin = null) {
+  const benchmarks = pin ? db.prepare(`SELECT DISTINCT symbol FROM identifiers JOIN securities ON id=security_id
+    WHERE type IN ('etf','index') AND first_seen<=? AND EXISTS (SELECT 1 FROM price_revisions
+      WHERE security_id=securities.id AND version<=? AND date<=? LIMIT 1) ORDER BY symbol`)
+    .all(pin.date, pin.version, pin.date).map(({ symbol }) => symbol) : availableBenchmarks(db);
   return { basis: 'reconstructed', universe: 'us-core', universeVersion: 1, model: 'composite', modelVersion: 1,
     benchmark: ['SPY', 'VTI'].find((symbol) => benchmarks.includes(symbol)) || benchmarks[0] || 'SPY',
-    classification: classificationStatus(db).defaultClassification, reference: 'latest' };
+    classification: classificationStatus(db, pin?.version).defaultClassification, reference: 'latest' };
+}
+
+function createServiceEngine(db) {
+  const engine = createEngine(db);
+  const context = engine.context;
+  const captures = new Map();
+  const latestRun = db.prepare(`SELECT started_at,finished_at,
+      CASE WHEN json_valid(detail) THEN json_extract(detail,'$.catalogDate') END AS catalog_date
+    FROM ingestion_runs WHERE status='complete' AND version<=? ORDER BY version DESC LIMIT 1`);
+
+  engine.context = (input = {}) => {
+    const config = context(input);
+    if (config.referenceMode !== 'latest' || !config.latestDate || input.observedReferenceDate != null) return config;
+    const version = config.dataVersion;
+    if (!captures.has(version)) {
+      const run = latestRun.get(version);
+      const timestamp = [run?.finished_at, run?.started_at].find((value) => Number.isFinite(Date.parse(value)));
+      captures.set(version, timestamp ? marketDay(timestamp) : run?.catalog_date);
+      if (captures.size > 32) captures.delete(captures.keys().next().value);
+    }
+    const wallDay = config.observedReferenceDate;
+    const capture = captures.get(version);
+    const capturedDate = isoDate(capture) && capture <= wallDay ? capture : null;
+    const session = config.latestDate <= wallDay ? config.latestDate : null;
+    const observed = capturedDate && (!session || capturedDate >= session) ? capturedDate : session;
+    return observed ? { ...config, observedReferenceDate: observed } : config;
+  };
+  return engine;
 }
 
 export function summationContext(db, engine, config) {
@@ -788,8 +890,8 @@ function riskHistoryPending(db, config, lookback) {
   return job && { preparationState: job.status, ...(['queued', 'running'].includes(job.status) ? pendingJob(job) : { error: job.error }) };
 }
 
-export function preparationWorkspaceScopes(db, engine, { date, version = dataVersion(db) } = {}) {
-  const base = { ...workspaceDefaults(db), date, dataVersion: version };
+export function preparationWorkspaceScopes(db, engine, { date, version = dataVersion(db), pinnedDefaults = false } = {}) {
+  const base = { ...workspaceDefaults(db, pinnedDefaults ? { date, version } : null), date, dataVersion: version };
   const basePoint = engine.context(base);
   const savedScreens = listWorkspace(db, 'screen').map(({ definition }) => ({ definition,
     context: { ...savedScreenContext(definition), ...screenDataNeeds(definition), rangeWindows: rangeWindowsForScreen(definition) } }));
@@ -885,7 +987,6 @@ function replaceObsoletePreparation(db, engine) {
   const obsolete = jobs.map(({ payload, ...job }) => ({ ...job, spec: JSON.parse(payload) }))
     .filter(({ type, spec }) => obsoletePreparation(type, spec));
   if (!obsolete.length) return;
-  if (obsolete.some(({ spec }) => spec.followLatest)) schedulePreparation(db, engine);
   const replacement = [];
   for (const { type, spec } of obsolete) {
     if (spec.followLatest || type === 'production-precompute') continue;
@@ -983,7 +1084,7 @@ function preparationSummary(db, version) {
       history: Object.fromEntries(rangeRows.filter(({ type }) => type === rangeHistoryType).map(({ status, total }) => [status, total])) } };
 }
 
-function localStatus(db) {
+function localStatus(db, requirePrecompute = process.env.MARKET_PRECOMPUTE === '1') {
   const status = warehouseStatus(db);
   const now = new Date();
   const after = marketSyncAfter(process.env.MARKET_SYNC_AFTER);
@@ -991,18 +1092,25 @@ function localStatus(db) {
   const backup = db.prepare(`SELECT id,updated_at,result FROM jobs WHERE type='backup' AND status='complete'
     AND json_extract(result,'$.quickCheck')='ok' ORDER BY updated_at DESC LIMIT 1`).get();
   const verified = backup && JSON.parse(backup.result);
-  const analysis = latestAnalysis(db, status.dataVersion);
+  const analysisReadiness = readAnalysisReadiness(db, { date: status.latestDate, dataVersion: status.dataVersion, calculationVersion: CALCULATION_VERSION });
+  const analysis = latestAnalysis(db, status.dataVersion, { requirePrecompute, readiness: analysisReadiness });
+  if (requirePrecompute && analysisReadiness.reason === 'no_matching_verified_publication' && proofSkipsSession(analysis, status.latestDate)) {
+    analysisReadiness.reason = 'verified_baseline_required';
+  }
+  const scheduledDate = requirePrecompute && status.latestDate && status.latestDate <= session ?
+    orderedDailyTarget({ date: status.latestDate, ready: analysisReadiness.state === 'ready',
+      nextDate: nextDailySession(status.latestDate) }, session) : session;
   const preparation = preparationSummary(db, status.dataVersion);
   const current = preparation.phases.current;
   const currentReadiness = analysis?.date === status.latestDate && analysis?.dataVersion === status.dataVersion ? 'ready'
-    : current.running || current.queued ? 'pending' : analysis ? 'prior-revision' : 'unavailable';
+    : analysis ? 'prior-revision' : analysisReadiness.state === 'preparing' || current.running || current.queued ? 'pending' : 'unavailable';
   return { ...status, bootstrap: bootstrapProgress(db), latestAnalysis: analysis,
-    analysisReadiness: readAnalysisReadiness(db, { date: status.latestDate, dataVersion: status.dataVersion, calculationVersion: CALCULATION_VERSION }),
+    analysisReadiness,
     currentReadiness: { state: currentReadiness, date: analysis?.date ?? null, dataVersion: analysis?.dataVersion ?? null },
     lastVerifiedBackup: backup ? { jobId: backup.id, completedAt: verified.completedAt ?? backup.updated_at,
       dataVersion: verified.dataVersion, latestDate: verified.latestDate, bytes: verified.bytes, sha256: verified.sha256 } : null,
     preparation, captureSchedule: { enabled: process.env.MARKET_SYNC === '1' && !!process.env.EODHD_API_KEY,
-      ...dailyCaptureAvailability(db, session, now, after) } };
+      ...dailyCaptureAvailability(db, scheduledDate, now, after, { ordered: requirePrecompute }) } };
 }
 
 function securitySearch(db, config, search, limit) {
@@ -1058,13 +1166,44 @@ function requireStockIdentity(db, config, id) {
   return exists(identity, 'Security');
 }
 
-function latestAnalysis(db, version) {
+function analysisFromProof({ date, dataVersion, calculationVersion, publishedAt, receiptId }) {
+  return { date, dataVersion, calculationVersion, publishedAt, stage: receiptId ? 'daily-analysis-receipt' : 'verified-publication' };
+}
+
+function latestAnalysis(db, version, { requirePrecompute = process.env.MARKET_PRECOMPUTE === '1', readiness, date = null } = {}) {
+  if (readiness?.state === 'ready' && (!date || date === readiness.date)) return analysisFromProof(readiness);
+  const tables = new Set(db.prepare(`SELECT name FROM main.sqlite_schema WHERE type='table'
+    AND name IN ('preparation_publications','analysis_daily_receipts')`).all().map(({ name }) => name));
+  const queries = [];
+  if (tables.has('preparation_publications')) queries.push(`
+    SELECT json_extract(manifest,'$.verification.dateTo') AS date, json_extract(manifest,'$.dataVersion') AS dataVersion,
+      json_extract(manifest,'$.verification.workspaceScopeHash') AS scopeHash
+    FROM preparation_publications WHERE state='verified-awaiting-cutover' AND json_valid(manifest)
+      AND json_extract(manifest,'$.calculationVersion')=$calculation AND json_extract(manifest,'$.dataVersion')<=$version`);
+  if (tables.has('analysis_daily_receipts')) queries.push(`
+    SELECT date, data_version AS dataVersion, json_extract(receipt,'$.scopeHash') AS scopeHash
+    FROM analysis_daily_receipts WHERE calculation_version=$calculation AND data_version<=$version AND json_valid(receipt)`);
+  if (queries.length) {
+    const scope = analysisWorkspaceScopeHash(db);
+    const candidates = db.prepare(`SELECT DISTINCT date,dataVersion FROM (${queries.join(' UNION ALL ')}) WHERE scopeHash=$scope
+      AND ($date IS NULL OR date=$date)
+      ORDER BY date DESC,dataVersion DESC`).iterate({ calculation: CALCULATION_VERSION, version, scope, date });
+    for (const point of candidates) {
+      if (readiness && point.date === readiness.date && point.dataVersion === readiness.dataVersion) continue;
+      const proof = readAnalysisReadiness(db, { ...point, calculationVersion: CALCULATION_VERSION });
+      if (proof.state === 'ready') return analysisFromProof(proof);
+    }
+  }
+  if (date || requirePrecompute || tables.size) return null;
+
   const published = db.prepare(`SELECT date, data_version AS dataVersion, published_at AS publishedAt
     FROM daily_publications WHERE calculation_version=? AND data_version<=?
     ORDER BY date DESC, data_version DESC LIMIT 1`).get(CALCULATION_VERSION, version);
   const prepared = db.prepare(`
     SELECT json_extract(result,'$.date') AS date, json_extract(result,'$.dataVersion') AS dataVersion, updated_at AS publishedAt
     FROM jobs WHERE type='production-precompute' AND status='complete'
+      AND json_extract(result,'$.analysisPreparation') IS NULL
+      AND json_type(result,'$.receiptId') IS NULL AND json_type(result,'$.publicationId') IS NULL
       AND json_extract(result,'$.calculationVersion')=?
       AND json_extract(result,'$.dataVersion')<=?
       AND json_extract(payload,'$.jobKey')=(? || json_extract(result,'$.date') || ':' || json_extract(result,'$.dataVersion'))
@@ -1072,11 +1211,10 @@ function latestAnalysis(db, version) {
         AND p.calculation_version=? AND p.data_version<=json_extract(jobs.result,'$.dataVersion'))
     ORDER BY date DESC, dataVersion DESC LIMIT 1
   `).get(CALCULATION_VERSION, version, `production-precompute:${CALCULATION_VERSION}:`, CALCULATION_VERSION);
-  const requirePrecompute = process.env.MARKET_PRECOMPUTE === '1';
-  const ready = prepared && (requirePrecompute || !published || prepared.date > published.date
+  const ready = prepared && (!published || prepared.date > published.date
     || prepared.date === published.date && prepared.dataVersion >= published.dataVersion)
     ? { ...prepared, stage: 'production-precompute' }
-    : !requirePrecompute && published ? { ...published, stage: 'daily-publication' } : null;
+    : published ? { ...published, stage: 'daily-publication' } : null;
   return ready && { ...ready, calculationVersion: CALCULATION_VERSION };
 }
 
@@ -1135,7 +1273,7 @@ function preparedStockDetail(db, config, security, snapshot, archive) {
       ...quality.map(({ reason }) => reason)].filter(Boolean) };
 }
 
-function updateAlerts(db, engine, params = {}, { rangeOnly = false } = {}) {
+function updateAlerts(db, engine, params = {}, { rangeOnly = false, priorPrepared = false } = {}) {
   let fired = 0;
   let evaluated = 0;
   const deferred = [];
@@ -1165,8 +1303,10 @@ function updateAlerts(db, engine, params = {}, { rangeOnly = false } = {}) {
       deferred.push({ ruleId: rule.id, reason: 'Rolling range metrics are not prepared', windows });
       continue;
     }
-    const current = engine.snapshot(config, { velocity: stockRule });
-    const before = engine.snapshot(beforeConfig, { velocity: stockRule });
+    const load = (point) => (priorPrepared && readPreparedSnapshot(db, engine, point, { velocity: stockRule })) ||
+      engine.snapshot(point, { velocity: stockRule });
+    const current = load(config);
+    const before = load(beforeConfig);
     const base = { ruleId: rule.id, name: rule.name, rule: def, date: config.date,
       observedAt: at, sourceTimestamp: db.prepare("SELECT finished_at FROM ingestion_runs WHERE version=? AND status='complete' LIMIT 1").get(config.dataVersion)?.finished_at || null,
       universe: current.universe.id, universeVersion: current.universe.version,
@@ -1195,8 +1335,9 @@ function updateAlerts(db, engine, params = {}, { rangeOnly = false } = {}) {
       const beforeRowsWithRange = ranges.length ? applyPreparedRangeMetrics(before, ranges[1]) : before;
       let latest, previous;
       try {
-        latest = historicalScreen(db, engine, config, options, currentRowsWithRange).rows;
-        previous = historicalScreen(db, engine, beforeConfig, options, beforeRowsWithRange).rows;
+        const history = priorPrepared ? (point, flags) => readPreparedSnapshot(db, engine, point, flags) : undefined;
+        latest = historicalScreen(db, engine, config, options, currentRowsWithRange, history).rows;
+        previous = historicalScreen(db, engine, beforeConfig, options, beforeRowsWithRange, history).rows;
       } catch (error) {
         if (!error.preparation) throw error;
         deferred.push({ ruleId: rule.id, reason: error.message, ...error.preparation.materialization });
@@ -1307,8 +1448,12 @@ function readPreparedHealth(db, engine, config, model, coverage, from, limit) {
       dataVersion: data_version, requestedDataVersion: config.dataVersion }));
 }
 
-function prepareHealth(db, engine, config, { model, coverage, from, limit = 315, allowCompute = false }) {
+function prepareHealth(db, engine, config, { model, coverage, from, limit = 315, allowCompute = false, carryRegime = false, verifyOnly = false }) {
   if (!config.earliestDate) return { prepared: 0, date: config.date };
+  const requested = expectedSessions(from && from > config.earliestDate ? from : config.earliestDate, config.date).slice(-limit);
+  const reused = healthArchiveRows(db, engine, 'prepared_health', config, model, coverage, requested);
+  if (verifyOnly || requested.length && reused.length === requested.length) return { prepared: reused.length, reused: reused.length,
+    date: config.date, dataVersion: config.dataVersion, latestPrepared: reused.at(-1)?.date ?? null };
   const warmup = healthBaseline(model);
   const seed = from ? shiftDate(from, -2 * warmup - 16) : null;
   const count = Math.min(7560, limit + warmup);
@@ -1325,16 +1470,32 @@ function prepareHealth(db, engine, config, { model, coverage, from, limit = 315,
     if (consecutive >= Math.min(warmup + 1, index + 1)) supported.add(date);
   }
   const targetDates = sessions.filter((date) => (!from || date >= from) && supported.has(date)).slice(-limit);
-  const reused = healthArchiveRows(db, engine, 'prepared_health', config, model, coverage, targetDates);
-  const available = new Set(reused.map(({ date }) => date));
+  const targets = new Set(targetDates);
+  const available = new Set(reused.filter(({ date }) => targets.has(date)).map(({ date }) => date));
   const latestPrepared = targetDates.at(-1) ?? null;
   if (available.size === targetDates.length) {
     return { prepared: available.size, reused: available.size, date: config.date, dataVersion: config.dataVersion,
       latestPrepared, missingDates: archived.missingDates };
   }
-  const targets = new Set(targetDates);
   const rows = marketHealthHistory(source, { model, sessions, ...coverage })
     .filter(({ date }) => targets.has(date) && !available.has(date));
+  if (carryRegime && rows.length) {
+    const missing = new Map(rows.map((row) => [row.date, row]));
+    const history = new Map(reused.map(({ date, payload }) => [date, decodeStoredJson(payload)]));
+    const previousDate = previousSession(targetDates[0], 1);
+    const [previous] = healthArchiveRows(db, engine, 'prepared_health', config, model, coverage, [previousDate]);
+    if (!previous) throw new Error(`Missing prepared health regime seed for ${previousDate}`);
+    history.set(previousDate, decodeStoredJson(previous.payload));
+    let prior = history.get(previousDate);
+    for (const date of targetDates) {
+      const row = missing.get(date);
+      if (row && row.regime.id !== 'unavailable' && row.regime.id === prior?.regime.id) {
+        row.regime.since = prior.regime.since;
+        row.regime.sessions = prior.regime.sessions + 1;
+      }
+      prior = row ?? history.get(date);
+    }
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS prepared_health (
     recipe TEXT NOT NULL, data_version INTEGER NOT NULL, calculation_version TEXT NOT NULL, date TEXT NOT NULL, payload BLOB NOT NULL,
     PRIMARY KEY (recipe,data_version,calculation_version,date)
@@ -1354,7 +1515,7 @@ function prepareHealth(db, engine, config, { model, coverage, from, limit = 315,
     db.exec('ROLLBACK');
     throw error;
   }
-  return { prepared: rows.length + reused.length, reused: reused.length, date: config.date, dataVersion: config.dataVersion, latestPrepared,
+  return { prepared: rows.length + available.size, reused: available.size, date: config.date, dataVersion: config.dataVersion, latestPrepared,
     missingDates: archived.missingDates };
 }
 
@@ -1713,7 +1874,7 @@ function journalCsv(entries) {
 }
 
 export async function performJob(db, type, payload, { provider = EodhdProvider(), progress = () => {}, journalClient, now = () => new Date() } = {}) {
-  const engine = createEngine(db);
+  const engine = createServiceEngine(db);
   if (type === chartBookIndustryJob) return prepareChartBookIndustries(db, engine, payload, progress);
   if (type === 'leadership-transitions') {
     const config = engine.context(payload.context || {});
@@ -1754,6 +1915,14 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
     return { ...study, excludedRetrospective: study.selectionCounts.retrospectiveExcluded };
   }
   if (type === 'provider-probe') return provider.capabilities(payload);
+  const orderedDaily = payload.orderedDaily || payload.scheduledFor && process.env.MARKET_PRECOMPUTE === '1';
+  if (orderedDaily && ['provider-reference', 'nasdaq-refresh'].includes(type)) {
+    requireWritableRawFacts(db);
+    const point = orderedDailyPoint(db);
+    if (point.date !== payload.scheduledFor || point.ready || hasUnprovedDailyGap(db, point)) {
+      throw new Error('This reference job no longer owns an eligible analysis session');
+    }
+  }
   if (type === 'nasdaq-refresh') {
     const { refreshNasdaq } = await import('../scripts/refresh-nasdaq.mjs');
     progress(0.1);
@@ -1772,11 +1941,20 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
       ORDER BY started_at DESC LIMIT 1`).get(dataset, date)?.records,
   });
   if (type === 'provider-import') {
+    const clock = now();
+    const after = marketSyncAfter(process.env.MARKET_SYNC_AFTER);
+    if (orderedDaily) {
+      requireWritableRawFacts(db);
+      const conflict = orderedCaptureConflict(db, payload, clock, after);
+      if (conflict) throw new Error(conflict);
+      const point = orderedDailyPoint(db);
+      if (point.ready && point.date === payload.date) return { imported: 0, dates: [], published: [], alreadyPublished: [],
+        alreadyAnalyzed: [payload.date], stillPending: [], downloadSkipped: true };
+    }
     if (Number.isInteger(payload.captureAttempt)) {
-      const clock = now();
-      const after = marketSyncAfter(process.env.MARKET_SYNC_AFTER);
-      const obsolete = payload.scheduledFor !== latestFinalizableSession(clock, after);
-      const expired = payload.captureAttempt > 1 && !availabilityClock(payload.scheduledFor, clock, after).inWindow;
+      const obsolete = !orderedDaily && payload.scheduledFor !== latestFinalizableSession(clock, after);
+      const availability = availabilityClock(payload.scheduledFor, clock, after, orderedDaily);
+      const expired = payload.captureAttempt > 1 && !availability.inWindow && !availability.historical;
       if (obsolete || expired) return { imported: 0, dates: [], published: [], alreadyPublished: [], stillPending: [payload.scheduledFor],
         downloadSkipped: true, sourceAvailability: obsolete ? 'superseded' : 'exhausted',
         warnings: [obsolete ? 'A newer finalized session became available before this automatic request started.'
@@ -1925,6 +2103,17 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
   }
   if (type === 'production-precompute') {
     const config = engine.context({ ...workspaceDefaults(db), ...payload.context });
+    if (payload.scheduledFor && config.date === payload.scheduledFor && payload.analysisGeneration?.calculationVersion === CALCULATION_VERSION) {
+      const prepareProxies = (point) => scheduleChartBookIndustries(db, engine, materializationContext(point), (jobType, input, key, prior) => {
+        const result = prepareChartBookIndustries(db, engine, input);
+        if (result.state !== 'complete' && result.state !== 'unavailable') throw new Error('ChartBook industry preparation did not complete');
+        if (prior?.status === 'queued') updateJob(db, prior.jobId, 'complete', 100, result);
+        return result;
+      }, { prepareNow: true });
+      return prepareDailyAnalysis(db, engine, config, { workspaceScopes: preparationWorkspaceScopes, rangeContext,
+        summationContext, prepareStandardHealth, prepareProxies, progress,
+        finalizeAlerts: (point) => updateAlerts(db, engine, point, { rangeOnly: true, priorPrepared: true }) });
+    }
     const result = precomputeProduction(db, engine, config, { ...payload, progress });
     prepareStandardHealth(db, engine, config);
     scheduleChartBookIndustries(db, engine, materializationContext(config), (jobType, input) => createJob(db, jobType, input));
@@ -1974,13 +2163,12 @@ export async function runQueuedJob(db, job, { provider, journalClient } = {}) {
     } else {
       updateJob(db, job.id, 'complete', 100, result);
       if (job.type === preparationType && job.payload.phase === 'current') {
-        try { scheduleChartBookIndustries(db, createEngine(db), workspaceDefaults(db), (type, input) => createJob(db, type, input)); }
+        try { scheduleChartBookIndustries(db, createServiceEngine(db), workspaceDefaults(db), (type, input) => createJob(db, type, input)); }
         catch (error) { console.error('Unable to plan ChartBook industry preparation:', error.message); }
       }
       if (process.env.MARKET_PRECOMPUTE === '1' && (job.type === 'provider-bootstrap' && result.state === 'complete'
-        || job.type === 'provider-import' && !job.payload.verifiedOnly && result.imported > 0
-        || job.type === 'production-precompute' && job.payload.scheduledFor && result.dataVersion === dataVersion(db))) {
-        try { schedulePreparation(db, createEngine(db)); }
+        || job.type === 'provider-import' && !job.payload.verifiedOnly && result.imported > 0)) {
+        try { schedulePreparation(db, createServiceEngine(db)); }
         catch (error) { console.error('Unable to plan post-import preparation:', error.message); }
       }
     }
@@ -1993,7 +2181,7 @@ export async function runQueuedJob(db, job, { provider, journalClient } = {}) {
 }
 
 export function createService({ db, provider, journalClient, workers = true, preparedOnly = process.env.MARKET_PRECOMPUTE === '1' } = {}) {
-  const engine = createEngine(db);
+  const engine = createServiceEngine(db);
   const workerPath = new URL('./job-worker.mjs', import.meta.url);
   let pumpScheduled = false;
   let activeJob = null;
@@ -2078,7 +2266,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
     }
     try {
       let failure;
-      const resourceLimits = job.payload.contexts ? {
+    const resourceLimits = job.payload.contexts || job.type === 'production-precompute' && job.payload.scheduledFor ? {
         maxOldGenerationSizeMb: Math.min(24576, Math.max(4096, Math.floor(totalmem() / 2 ** 20 * 0.18))),
       } : undefined;
       const worker = new Worker(workerPath, { workerData: { filename: db.location(), job }, execArgv: [], resourceLimits });
@@ -2124,6 +2312,23 @@ export function createService({ db, provider, journalClient, workers = true, pre
     if (!requested && !retry && !result.waitingForCapture) scheduledPreparation = identity;
     if (result.queued) schedulePump();
     return result;
+  }
+
+  function prepareScheduled({ date, version, requested, retry } = {}) {
+    if (requested || retry) return prepareStandard({ date, version, requested, retry });
+    // The scheduler supplies a version after the scheduled production owner completes.
+    if (version != null || !requiresArchive(db) || process.env.MARKET_SYNC === '1' && process.env.EODHD_API_KEY) return { jobs: [], queued: 0 };
+    const config = engine.context({ ...workspaceDefaults(db), date });
+    if (!config.date) return { jobs: [], queued: 0 };
+    const point = { date: config.date, dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION };
+    if (verifiedAnalysisPublication(db, point) || readAnalysisReadiness(db, point).state === 'ready') return { jobs: [], queued: 0 };
+    if (!dailyAnalysisParent(db, point)) return { jobs: [], queued: 0, analysisPreparation: 'verified_baseline_required' };
+    const key = scheduledPrecomputeKey(config.date, config.dataVersion);
+    if (db.prepare(`SELECT 1 FROM jobs WHERE type='production-precompute' AND json_extract(payload,'$.jobKey')=? LIMIT 1`).get(key)) {
+      return { jobs: [], queued: 0 };
+    }
+    const job = enqueue('production-precompute', { scheduledFor: config.date, context: preparationInput(config) }, key);
+    return { jobs: [job], queued: 1 };
   }
 
   const historyFor = (config, options) => thinHistory(db, engine, config, options, enqueue, preparedOnly);
@@ -2253,7 +2458,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
           if ((engine.snapshotAvailable(current) || hasPreparedSnapshot(db, engine, current)) &&
             preparationStatus(db, engine, current, 'recent').preparationState === 'complete') return current;
         }
-        const ready = latestAnalysis(db, dataVersion(db));
+        const ready = latestAnalysis(db, dataVersion(db), { requirePrecompute: preparedOnly });
         return asContext(ready ? { ...extra, date: ready.date, dataVersion: ready.dataVersion } : extra);
       };
       const rowPage = () => [parseCount(query.page, 1, 100_000, 1), parseCount(query.perPage, 1, 250, 50)];
@@ -2332,7 +2537,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
         }
       }
       if (area === 'data') {
-        if (method === 'GET' && item === 'status') return response(localStatus(db));
+        if (method === 'GET' && item === 'status') return response(localStatus(db, preparedOnly));
         if (item === 'preparation' && method === 'GET') return response(preparationSummary(db, asContext().dataVersion));
         if (item === 'preparation' && method === 'POST') {
           const context = body.context && Object.keys(body.context).length ? body.context : null;
@@ -2352,6 +2557,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
           if (method === 'POST') {
             const rows = Array.isArray(body.overrides) ? body.overrides : [body];
             if (!rows.length || rows.length > 50 || rows.some((row) => !row?.securityId)) throw asError('Supply 1–50 overrides with permanent security IDs');
+            requireWritableRawFacts(db);
             const receipt = importDataset(db, { provider: 'reviewed-operator', dataset: 'quality-overrides', qualityOverrides: rows });
             if (preparedOnly && !receipt.duplicate) prepareStandard();
             return response(receipt, 201);
@@ -2363,12 +2569,28 @@ export function createService({ db, provider, journalClient, workers = true, pre
           return response(quality(db, engine, point, snapshot));
         }
         if (method === 'POST' && item === 'import') {
+          requireWritableRawFacts(db);
           const receipt = importDataset(db, body);
           if (preparedOnly && !receipt.duplicate) prepareStandard();
           return response(receipt, 201);
         }
+        if (method === 'GET' && item === 'analysis-proof') {
+          if (!isoDate(query.date) || !isMarketSession(query.date)) throw asError('Choose a finalized exchange session');
+          return response({ proof: latestAnalysis(db, dataVersion(db), { date: query.date, requirePrecompute: true }) });
+        }
         if (method === 'POST' && item === 'refresh') {
           providerOptions(body);
+          if (body.orderedDaily) {
+            requireWritableRawFacts(db);
+            const conflict = orderedCaptureConflict(db, body, new Date(), marketSyncAfter(process.env.MARKET_SYNC_AFTER));
+            if (conflict) throw asError(conflict, 409);
+            const existing = db.prepare(`SELECT id FROM jobs WHERE type='provider-import' AND status IN ('queued','running')
+              AND json_extract(payload,'$.date')=? AND json_type(payload,'$.from') IS NULL
+              AND json_type(payload,'$.to') IS NULL AND json_extract(payload,'$.bulk')=1
+              AND json_extract(payload,'$.verifiedOnly')=1 ORDER BY rowid LIMIT 1`).get(body.date);
+            if (existing) return response(jobById(db, existing.id), 202);
+            return response(enqueue('provider-import', body, `ordered-daily:${body.date}`), 202);
+          }
           return response(enqueue('provider-import', body), 202);
         }
         if (method === 'POST' && item === 'reference') return response(enqueue('provider-reference', body), 202);
@@ -2400,7 +2622,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
           automaticPreparation: preparedOnly,
           benchmarks: [...new Set([...BENCHMARKS, ...observedBenchmarks])], availableBenchmarks: observedBenchmarks,
           ...classificationStatus(db),
-          status: localStatus(db), exportFormats: await parquetAvailable() ? exportFormats : ['csv'],
+          status: localStatus(db, preparedOnly), exportFormats: await parquetAvailable() ? exportFormats : ['csv'],
         });
       }
       if (area === 'market' && item === 'health' && action === 'prepare' && method === 'POST') {
@@ -2815,8 +3037,11 @@ export function createService({ db, provider, journalClient, workers = true, pre
     }
   }
 
-  return { dispatch, enqueue, engine, workspaceConfiguration: () => workspaceDefaults(db),
-    prepareStandard: (options) => requiresArchive(db) ? prepareStandard(options) : { jobs: [], queued: 0 },
+  return { dispatch, enqueue, engine, workspaceConfiguration() {
+    const defaults = workspaceDefaults(db);
+    return { ...defaults, observedReferenceDate: engine.context(defaults).observedReferenceDate };
+  },
+    prepareStandard: prepareScheduled,
     journalConfiguration() {
       const { model, modelVersion, reference, ...context } = workspaceDefaults(db);
       return { ...context, analysisModel: model, analysisModelVersion: modelVersion, referenceMode: reference };
