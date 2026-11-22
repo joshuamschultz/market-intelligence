@@ -1,9 +1,8 @@
 import { createHash } from 'node:crypto';
 import { statfsSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { gzipSync, gunzipSync } from 'node:zlib';
+import { isDeepStrictEqual } from 'node:util';
 import { referenceArchiveScopes, reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
-import { backupSpaceRequired } from './backup.mjs';
 import { expectedSessions, shiftDate, weekEnd } from './calendar.mjs';
 import { CALCULATION_VERSION, createJob, jobById, listWorkspace, normalizeSymbol } from './database.mjs';
 import { UNIVERSES } from './engine.mjs';
@@ -12,6 +11,7 @@ import { precomputeWorkspace } from './precompute.mjs';
 import { preparedSnapshotDates, readPreparedSnapshot, writePreparedSnapshot } from './prepared-snapshots.mjs';
 import { readRankArchive } from './rank-archive.mjs';
 import { annotateVelocity, BUILTIN_MODELS } from './ranking.mjs';
+import { decodeStoredJson, encodeStoredJson } from './storage-codec.mjs';
 
 export const preparationType = 'prepare-context';
 export const recentPreparationSessions = 315;
@@ -71,10 +71,11 @@ export function readPreparedRanks(db, config, dates, { securityId, symbol } = {}
       for (const bucket of buckets) {
         const block = read.get(recipe, version, date, bucket);
         if (!block) continue;
-        const match = JSON.parse(gunzipSync(block.value)).find(([id, ticker]) => securityId ? securityId === id : ticker === bySymbol);
+        const match = decodeStoredJson(block.value).find(([id, ticker]) => securityId ? securityId === id : ticker === bySymbol);
         if (!match) continue;
-        const [, , rank, percentile, score] = match;
-        rows.push({ date, rank, percentile, score, ...(version === config.dataVersion ? {}
+        const [, , rank, percentile, score, demand, demandState] = match;
+        rows.push({ date, rank, percentile, score, ...(match.length > 5 && { udv_50d: demand, udv_state_50d: demandState }),
+          ...(version === config.dataVersion ? {}
           : { sourceDataVersion: version, requestedDataVersion: config.dataVersion }) });
       }
     }
@@ -82,33 +83,80 @@ export function readPreparedRanks(db, config, dates, { securityId, symbol } = {}
   return { observed, rows };
 }
 
-function compactWriter(db, config, dates) {
+export function verifyPreparedRankCoverage(db, config, dates, witnesses, cache = new Map()) {
+  const verified = { dates: 0, blocks: 0, tradedIds: 0 };
+  if (!dates.length) return verified;
+  const read = db.prepare(`SELECT bucket,value FROM prepared_rank_blocks
+    WHERE recipe=? AND data_version=? AND date=? ORDER BY bucket`);
+  const signature = (buckets) => createHash('sha256').update(JSON.stringify(buckets)).digest('hex');
+  for (const scope of referenceArchiveScopes(config, dates)) {
+    const { recipe, selected } = compactScope(db, scope.config, scope.dates);
+    for (const date of scope.dates) {
+      const version = selected.get(date);
+      const expected = witnesses.get(date);
+      if (version == null || !Array.isArray(expected)) throw new Error(`Missing rank date or traded-stock witness for ${date}`);
+      const key = `${recipe}:${version}:${date}`;
+      if (!cache.has(key)) {
+        const buckets = [];
+        let count = 0;
+        for (const { bucket, value } of read.iterate(recipe, version, date)) {
+          const rows = decodeStoredJson(value);
+          if (!Array.isArray(rows) || !rows.length) throw new Error(`Empty or invalid rank block for ${date}`);
+          const ids = rows.map((row) => {
+            const id = row?.[0];
+            if (!Array.isArray(row) || typeof id !== 'string' || !id || bucketFor(id) !== bucket) {
+              throw new Error(`Rank ID is outside its bucket for ${date}`);
+            }
+            return id;
+          });
+          if (new Set(ids).size !== ids.length) throw new Error(`Duplicate traded ID in rank block for ${date}`);
+          count += ids.length;
+          buckets.push([bucket, ids.length, createHash('sha256').update(JSON.stringify(ids)).digest('hex')]);
+        }
+        cache.set(key, { signature: signature(buckets), blocks: buckets.length, tradedIds: count });
+      }
+      const actual = cache.get(key);
+      if (actual.signature !== signature(expected)) throw new Error(`Rank blocks disagree with the saved traded-stock roster for ${date}`);
+      verified.dates++;
+      verified.blocks += actual.blocks;
+      verified.tradedIds += actual.tradedIds;
+    }
+  }
+  return verified;
+}
+
+export function createPreparedRankWriter(db, config, dates, { codec } = {}) {
   db.exec(compactSchema);
   const addDate = db.prepare('INSERT OR IGNORE INTO prepared_rank_dates VALUES (?,?,?)');
   const addBlock = db.prepare('INSERT INTO prepared_rank_blocks VALUES (?,?,?,?,?)');
   const recipes = new Map();
   for (const scope of referenceArchiveScopes(config, dates)) {
-    const { recipe } = compactScope(db, scope.config, scope.dates);
+    const recipe = rankRecipe(scope.config);
     for (const date of scope.dates) recipes.set(date, recipe);
   }
   return (snapshot) => {
     const { date } = snapshot;
     const recipe = recipes.get(date);
     if (!recipe) return;
-    const blocks = Array.from({ length: bucketCount }, () => []);
-    for (const row of snapshot.stocks) {
-      if (!row.traded) continue;
-      blocks[bucketFor(row.securityId)].push([row.securityId, row.symbol, row.rsRank ?? null, row.rsPercentile ?? null, row.rsScore ?? null]);
-    }
-    const encoded = blocks.flatMap((rows, index) => rows.length ? [[index, gzipSync(JSON.stringify(rows), { level: 3 })]] : []);
-    db.exec('BEGIN IMMEDIATE');
+    const nested = db.isTransaction;
+    if (!nested) db.exec('BEGIN IMMEDIATE');
     try {
-      if (addDate.run(recipe, config.dataVersion, date).changes) {
-        for (const [bucket, value] of encoded) addBlock.run(recipe, config.dataVersion, date, bucket, value);
+      const written = !!addDate.run(recipe, config.dataVersion, date).changes;
+      if (written) {
+        const blocks = Array.from({ length: bucketCount }, () => []);
+        for (const row of snapshot.stocks) {
+          if (!row.traded) continue;
+          blocks[bucketFor(row.securityId)].push([row.securityId, row.symbol, row.rsRank ?? null, row.rsPercentile ?? null,
+            row.rsScore ?? null, row.udv_50d ?? null, row.udv_state_50d ?? null]);
+        }
+        for (const [bucket, rows] of blocks.entries()) {
+          if (rows.length) addBlock.run(recipe, config.dataVersion, date, bucket, encodeStoredJson(rows, codec));
+        }
       }
-      db.exec('COMMIT');
+      if (!nested) db.exec('COMMIT');
+      return written;
     } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK');
+      if (!nested && db.isTransaction) db.exec('ROLLBACK');
       throw error;
     }
   };
@@ -191,6 +239,33 @@ export function preparationSpecs(db, engine, input, { custom = [], requested, hi
   }));
 }
 
+export function batchPreparationSpecs(engine, specs) {
+  const grouped = new Map();
+  for (const spec of specs) {
+    const { phase, context, historySessions, followLatest } = spec;
+    const currentPrimary = phase === 'current' && ['us-core', 'us-all'].includes(context.universe) && context.model === 'composite' &&
+      context.basis === 'reconstructed' && context.reference === 'latest';
+    const key = JSON.stringify([phase, context.date, context.dataVersion, context.basis, historySessions, followLatest, currentPrimary]);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(spec);
+  }
+  const batches = [...grouped.values()].map((members) => {
+    const first = members[0];
+    const variants = new Map();
+    for (const spec of members) {
+      const base = engine.context(spec.context);
+      variants.set(spec.primary, { context: spec.context, rank: true });
+      if (spec.monitor && !variants.has(spec.recipes[1])) {
+        variants.set(spec.recipes[1], { context: preparationInput(monitored(engine, base)), rank: false });
+      }
+    }
+    const recipes = [...variants.keys()];
+    return { ...first, monitor: false, contexts: [...variants.values()], members: members.map(({ jobKey, context, label }) => ({ jobKey, context, label })),
+      recipes, jobKey: `${preparationType}:batch:${digest(recipes.toSorted())}:${first.phase}` };
+  });
+  return batches;
+}
+
 export function enqueuePreparation(db, specs, { retry = false, supersedeBefore } = {}) {
   if (!specs.length) return { jobs: [], queued: 0 };
   const existing = db.prepare(`SELECT id,status,error,payload FROM jobs WHERE type=? AND json_extract(payload,'$.jobKey')=?
@@ -211,7 +286,15 @@ export function enqueuePreparation(db, specs, { retry = false, supersedeBefore }
       const retryable = ['failed', 'superseded'].includes(prior?.status);
       if (prior && (!retryable || !retry && !interrupted)) jobs.push(jobById(db, prior.id));
       else {
-        jobs.push(createJob(db, type, interrupted ? JSON.parse(prior.payload) : spec));
+        const blockedBySpace = prior?.status === 'failed' && prior.error?.startsWith('Not enough free disk space to prepare this calculation while preserving ');
+        let payload = spec;
+        if (interrupted || blockedBySpace) {
+          const checkpoint = JSON.parse(prior.payload);
+          const { cursor, completedSessions, written, reused, elapsedMs, totals, baseComplete, ...plan } = checkpoint;
+          // The recipe key is also used for requests with different history lengths or variant orders.
+          if (isDeepStrictEqual(plan, JSON.parse(JSON.stringify(spec)))) payload = checkpoint;
+        }
+        jobs.push(createJob(db, type, payload));
         queued++;
       }
     }
@@ -251,29 +334,23 @@ export function preparationStatus(db, engine, config, phases) {
     progress: row.progress, completedSessions: detail.completedSessions ?? 0, totalSessions: detail.totalSessions ?? null, error: row.error || null };
 }
 
-export function requirePreparationSpace(db, dates = 1, { backupEnabled = process.env.MARKET_BACKUP === '1' } = {}) {
-  if (!db.location()) return;
-  const { bavail, bsize } = statfsSync(dirname(db.location()), { bigint: true });
+export function requirePreparationSpace(db, dates = 1, { statfs = statfsSync } = {}) {
+  const location = db.location();
+  if (!location) return;
+  const { bavail, bsize } = statfs(dirname(location), { bigint: true });
+  const available = bavail * bsize;
   const priced = BigInt(db.prepare('SELECT count(first_seen) AS count FROM securities').get().count);
   const growth = BigInt(dates) * priced * 160n;
   const warehouseReserve = 2n * 1024n ** 3n;
-  let reserve = warehouseReserve + growth;
-  if (backupEnabled) {
-    const raw = BigInt(db.prepare('PRAGMA page_count').get().page_count) * BigInt(db.prepare('PRAGMA page_size').get().page_size);
-    const prior = db.prepare(`SELECT result FROM jobs WHERE type='backup' AND status='complete'
-      AND json_extract(result,'$.quickCheck')='ok' ORDER BY updated_at DESC LIMIT 1`).get();
-    const { bytes, rawBytes } = prior ? JSON.parse(prior.result) : {};
-    // Preserve a full copy, compressed output plus a 25% size margin, and the backup's working reserve.
-    const compressedRatio = bytes > 0 && rawBytes > 0 ? Math.min(1.01, Math.max(0.35, 1.25 * bytes / rawBytes)) : 1.01;
-    const backup = backupSpaceRequired(raw + growth) + BigInt(Math.ceil(Number(raw + growth) * compressedRatio));
-    reserve = backup + warehouseReserve + growth;
-  }
-  if (bavail * bsize < reserve) {
-    throw new Error(`Not enough free disk space to prepare this calculation while preserving ${backupEnabled ? 'verified backup staging and ' : ''}warehouse headroom (need ${reserve} bytes)`);
+  // Allow for the batch's new pages and a matching set in the WAL during checkpointing.
+  // The backup job checks staging and compression space when it runs.
+  const required = warehouseReserve + 2n * growth;
+  if (available < required) {
+    throw new Error(`Not enough free disk space to prepare this calculation while preserving warehouse and WAL headroom (need ${required} bytes, available ${available} bytes)`);
   }
 }
 
-function compactWeeklySnapshot(snapshot) {
+export function compactWeeklySnapshot(snapshot) {
   return {
     stocks: snapshot.stocks.map(({ securityId, rsRank, rsPercentile, rsScore, udv_50d, up_volume_50d }) =>
       ({ securityId, rsRank, rsPercentile, rsScore, udv_50d, up_volume_50d })),
@@ -287,7 +364,7 @@ function warmBatch(db, engine, config, dates, rank) {
   const legacy = rank ? readRankArchive(db, engine, config, window).observed : new Set(dates);
   const compact = rank ? readPreparedRanks(db, config, dates).observed : new Set(dates);
   const missingRanks = new Set(dates.filter((date) => !legacy.has(date) && !compact.has(date)));
-  const addRank = missingRanks.size ? compactWriter(db, config, dates) : null;
+  const addRank = missingRanks.size ? createPreparedRankWriter(db, config, dates) : null;
   const dated = new Map();
   const missingRows = new Set();
   const missingVelocity = new Set();

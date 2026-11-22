@@ -5,14 +5,20 @@ import {
 } from './ui.js';
 import { partialCoverage } from './overview.js';
 import { openBreadthDrawer } from './contributors.js';
+import { chartRanges } from './chart-ranges.js';
+import { openMomentumHistory } from './momentum-history.js';
 
-const rowLimits = [20, 63, 126, 252];
 const ratioKeys = ['up_down_4pct_5d','up_down_4pct_10d'];
 const readingKeys = (pairs) => pairs.flatMap(({threshold,sessions})=>['up','down'].map((side)=>keyOf(side,threshold,sessions)));
 const exact = (row, key) => `${count(row[`${key}_numerator`])} / ${count(row[`${key}_denominator`])}`;
 const pctPoint = (value) => numeric(value) ? `${signed(value)} pp` : '—';
 const movingPeriods = [5, 10, 20];
 const changePeriods = [1, 5, 21];
+const ordinal = (value) => `${value}${value === 2 ? 'nd' : 'th'}`;
+export function momentumExtremeClass(percentile, tail = 5) {
+  if (!numeric(percentile) || percentile < 0 || percentile > 100) return '';
+  return percentile >= 100-tail ? ' extreme-high' : percentile <= tail ? ' extreme-low' : '';
+}
 
 function bar(row, side, pair, state, scale) {
   const key = keyOf(side,pair.threshold,pair.sessions);
@@ -25,11 +31,12 @@ function bar(row, side, pair, state, scale) {
   const averages = movingPeriods.map((n) => percent(row[`${key}_sma${n}`]));
   const changes = changePeriods.map((n) => pctPoint(row[`${key}_change${n}`]));
   const details = `5/10/20D means ${averages.join(' / ')} · 1/5/21D change ${changes.join(' / ')}`;
-  const extreme = calibrated ? historical >= 90 ? ' extreme-high' : historical <= 10 ? ' extreme-low' : '' : '';
+  const tail = state.extremeTail ?? 5;
+  const extreme = momentumExtremeClass(calibrated ? historical : null, tail);
   const width = available ? Math.min(100,Math.max(0,value / scale * 100)) : 0;
   return `<button type="button" class="breadth-bar ${side}${state.extremes ? extreme : ''}${available ? '' : ' missing'}${state.statistics ? ' with-statistics' : ''}"
     data-action="monitor-detail" data-value="${safe(key)}" data-date="${safe(row.date)}" style="--bar-size:${width}%"
-    title="${safe(`${dateLabel(row.date)} · ${label} · ${percent(value)} · ${exact(row,key)} qualifying/comparable · ${legend} · ${details}`)}"
+    title="${safe(`${dateLabel(row.date)} · ${label} · ${percent(value)} · ${exact(row,key)} qualifying/comparable · ${legend} · Extremes: top/bottom ${tail}% · ${details}`)}"
     aria-label="${safe(`${dateLabel(row.date)} ${label}: ${percent(value)}, ${exact(row,key)} qualifying over comparable. Open contributors.`)}">
     <span class="bar-fill"></span><span class="bar-value">${percent(value, value === 0 ? 0 : 1)}</span>
     ${state.counts ? `<small class="bar-count">${exact(row,key)}</small>` : ''}
@@ -49,22 +56,28 @@ function sideRatio(row,key) {
 function timeline(data,pairs,state,{ ratios = true } = {}) {
   const rows = data.rows || [];
   if (!rows.length) return empty('No sessions in this range','Choose another as-of date or analysis context.','pulse');
+  if (ratios) pairs=['daily','quarter','swing','surge','intermediate'].map(id=>pairs.find(pair=>pair.id===id)).filter(Boolean);
   const scales = pairs.map(({ threshold, sessions }) => {
     if (state.scale === 'common') return 100;
     const [up, down] = ['up', 'down'].map((side) => keyOf(side, threshold, sessions));
     const maximum = Math.max(0, ...rows.flatMap((row) => [row[up] || 0, row[down] || 0]));
     return [5, 10, 20, 50, 100].find((value) => value >= maximum) || 100;
   });
-  return `<div class="monitor-scroll" role="region" aria-label="${ratios ? 'Standard market breadth timeline' : 'Custom market breadth timeline'}" tabindex="0"><table class="monitor-table${ratios ? '' : ' single-comparison'}">
-    <thead><tr><th scope="col" class="monitor-date">Session<span>Traded</span></th>
-      ${pairs.map(({label,sessions,threshold}, index)=>`<th scope="col"><strong>${safe(label)}</strong><small>${count(sessions)} ${sessions === 1 ? 'session' : 'sessions'} · 0–${scales[index]}%</small><div class="bar-column-head"><span>Down ≥ ${threshold}%</span><span>Up ≥ ${threshold}%</span></div></th>`).join('')}
-      ${ratios ? '<th scope="col"><strong>U/D participation</strong><small>±4% daily readings</small><div class="bar-column-head"><span>5D ratio</span><span>10D ratio</span></div></th>' : ''}
+  const dateHeader=`<th scope="col" class="monitor-date"${ratios?' rowspan="2"':''}>Session<span>Traded</span></th>`;
+  const ratioHeader='<th scope="col" class="monitor-ratios"><strong>U/D participation</strong><small>±4% daily readings</small><div class="bar-column-head"><span>5D ratio</span><span>10D ratio</span></div></th>';
+  const incomplete=data.materialization?.pending || data.materialization?.missingDates?.length;
+  return `<div class="monitor-scroll" role="region" aria-label="${ratios ? 'Standard market breadth timeline' : 'Custom market breadth timeline'}" tabindex="0"><p class="muted monitor-current-note" data-monitor-available-range>Showing ${count(rows.length)} stored sessions of up to ${count(state.limit)} requested · ${safe(dateLabel(rows[0].date))} – ${safe(dateLabel(rows.at(-1).date))}.${incomplete?' Additional history is awaiting preparation.':''}</p><table class="monitor-table${ratios ? ' grouped-presets' : ' single-comparison'}">
+    <thead>${ratios?`<tr class="monitor-tier-row">${dateHeader}<th scope="colgroup" colspan="3">Primary breadth indicators</th><th scope="colgroup" colspan="3" class="secondary-start">Secondary breadth indicators</th></tr>`:''}<tr>${ratios?'':dateHeader}
+      ${pairs.map((pair, index)=>{
+        const {label,sessions,threshold}=pair;
+        const originalIndex=ratios?breadthMovePresets.findIndex(item=>item.id===pair.id):index;
+        return `<th scope="col"${ratios&&index===2?' class="secondary-start"':''}><button type="button" class="text-link" data-action="monitor-pair-history" data-value="${originalIndex}" data-custom="${!ratios}" aria-label="${safe(`${label}: open upside and downside historical chart`)}"><strong>${safe(label)}</strong></button><small>${count(sessions)} ${sessions === 1 ? 'session' : 'sessions'} · 0–${scales[index]}%</small><div class="bar-column-head"><span>Up ≥ ${threshold}%</span><span>Down ≥ ${threshold}%</span></div></th>${ratios&&index===0?ratioHeader:''}`;
+      }).join('')}
     </tr></thead><tbody>${rows.toReversed().map((row)=>{
       return `<tr${row.coverage === 'complete' ? '' : ' class="partial-row"'}>
         <th class="monitor-date" scope="row"><button type="button" class="date-button" data-action="replay-monitor" data-value="${safe(row.date)}" title="Replay ${safe(dateLabel(row.date))}">
           ${safe(dateLabel(row.date,true))}<small>${count(row.traded)} traded</small></button></th>
-        ${pairs.map((pair,index)=>`<td><div class="opposed-bars">${bar(row,'down',pair,state,scales[index])}${bar(row,'up',pair,state,scales[index])}</div></td>`).join('')}
-        ${ratios ? `<td><div class="opposed-bars ratio-pair">${ratioKeys.map((key)=>sideRatio(row,key)).join('')}</div></td>` : ''}</tr>`;
+        ${pairs.map((pair,index)=>`<td${ratios&&index===2?' class="secondary-start"':''}><div class="opposed-bars">${bar(row,'up',pair,state,scales[index])}${bar(row,'down',pair,state,scales[index])}</div></td>${ratios&&index===0?`<td class="monitor-ratios"><div class="opposed-bars ratio-pair">${ratioKeys.map((key)=>sideRatio(row,key)).join('')}</div></td>`:''}`).join('')}</tr>`;
     }).join('')}</tbody></table></div>`;
 }
 
@@ -75,6 +88,7 @@ export async function render(env) {
   state.threshold ??= 13;
   state.counts ??= false;
   state.extremes ??= true;
+  state.extremeTail ??= 5;
   state.statistics ??= false;
   state.scale ||= 'auto';
   let loadRun=0;
@@ -88,11 +102,12 @@ export async function render(env) {
     const toggle = (key, label, checked, help) => `<div class="field-caption"><label class="checkbox-label"><input type="checkbox" data-change="monitor-${key}"
       aria-describedby="monitor-${key}-help"${checked ? ' checked' : ''}> ${label}</label>${helpTooltip(`monitor-${key}-help`,label,help)}</div>`;
     return `<div class="monitor-toolbar">
-      ${helpField('monitor-limit','Visible sessions',(attrs)=>`<select ${attrs} data-change="monitor-limit">${rowLimits.map((key)=>option(key,`${key} sessions`,state.limit)).join('')}</select>`,breadthMoveHelp.visible)}
-      ${helpField('monitor-scale','Bar scale',(attrs)=>`<select ${attrs} data-change="monitor-scale">${option('auto','Auto per group',state.scale)}${option('common','Common 0–100%',state.scale)}</select>`,breadthMoveHelp.scale)}
+      ${helpField('monitor-limit','Visible sessions',(attrs)=>`<select ${attrs} data-change="monitor-limit">${chartRanges.map(([sessions, label])=>option(sessions,`${label} · ${sessions} sessions`,state.limit)).join('')}</select>`,breadthMoveHelp.visible)}
+      ${helpField('monitor-scale','Bar scale',(attrs)=>`<select ${attrs} data-change="monitor-scale">${option('auto','Focus range per group',state.scale)}${option('common','Full scale · 0–100%',state.scale)}</select>`,breadthMoveHelp.scale)}
       <span class="context-spacer"></span>
       ${toggle('counts','Show counts',state.counts,breadthMoveHelp.counts)}
       ${toggle('extremes','Mark extremes',state.extremes,breadthMoveHelp.extremes)}
+      ${helpField('monitor-extreme-tail','Extreme cutoff',(attrs)=>`<select ${attrs} data-change="monitor-extreme-tail">${[5,2,10].map(tail=>option(tail,`Top / bottom ${tail}%`,state.extremeTail)).join('')}</select>`,'The cutoff applies independently to the upside and downside participation series. Top/bottom 5% marks historical percentiles at least 95 or at most 5; 2% marks at least 98 or at most 2. It changes highlighting, not the price-move thresholds or underlying values.')}
       ${toggle('statistics','Show averages and changes',state.statistics,breadthMoveHelp.statistics)}
     </div>`;
   }
@@ -115,10 +130,10 @@ export async function render(env) {
           helpTooltip('monitor-fixed-help','fixed preset definitions',breadthMoveHelp.fixed))}${filters()}</div>
         <div id="monitor-timeline">${pending('Loading breadth timeline…')}</div>
         <footer class="monitor-footer">
-          <div class="legend"><span class="legend-item"><i class="legend-mark" style="--series-color:#ff8c94"></i> Downside</span>
-          <span class="legend-item"><i class="legend-mark" style="--series-color:#58e2c3"></i> Upside</span>
-          <span class="legend-item"><i class="extreme-key high"></i> At or above 90th percentile</span>
-          <span class="legend-item"><i class="extreme-key low"></i> At or below 10th percentile</span></div>
+          <div class="legend"><span class="legend-item"><i class="legend-mark" style="--series-color:#58e2c3"></i> Upside</span>
+          <span class="legend-item"><i class="legend-mark" style="--series-color:#ff8c94"></i> Downside</span>
+          <span class="legend-item"><i class="extreme-key high"></i> <span data-extreme-upper>At or above ${ordinal(100-state.extremeTail)} percentile</span></span>
+          <span class="legend-item"><i class="extreme-key low"></i> <span data-extreme-lower>At or below ${ordinal(state.extremeTail)} percentile</span></span></div>
           <p class="muted">Extremes compare with the prior 252 sessions and require 60 comparable readings. Choose a bar to inspect its count, denominator, and exclusions.</p>
           ${customControls()}
         </footer>
@@ -262,6 +277,13 @@ export async function render(env) {
     'change:monitor-scale'(value){state.scale=value;showRows();paintCustom();},
     'change:monitor-counts'(value,input){state.counts=input.checked;showRows();paintCustom();},
     'change:monitor-extremes'(value,input){state.extremes=input.checked;showRows();paintCustom();},
+    'change:monitor-extreme-tail'(value){
+      if (![2,5,10].includes(Number(value))) return;
+      state.extremeTail=Number(value);
+      main.querySelector('[data-extreme-upper]').textContent=`At or above ${ordinal(100-state.extremeTail)} percentile`;
+      main.querySelector('[data-extreme-lower]').textContent=`At or below ${ordinal(state.extremeTail)} percentile`;
+      showRows();paintCustom();
+    },
     'change:monitor-statistics'(value,input){state.statistics=input.checked;showRows();paintCustom();},
     'monitor-detail'(key,button) {
       const date=button.dataset.date;
@@ -272,6 +294,13 @@ export async function render(env) {
       return openBreadthDrawer(env,{key,date,title,reading});
     },
     'monitor-ratio':(key,button)=>ratioDetail(key,button.dataset.date),
+    'monitor-pair-history':(index,button)=>{
+      const custom=button.dataset.custom==='true';
+      const pair=custom?customPair():breadthMovePresets[Number(index)];
+      if (!pair) return;
+      drillRun++;
+      return openMomentumHistory(env,{pair,data:custom?customData:current});
+    },
     'replay-monitor':(date)=>env.go('overview',{date,dataVersion:env.snapshotContext.dataVersion}),
   });
   shell();

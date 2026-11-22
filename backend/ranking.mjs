@@ -128,16 +128,17 @@ export function modelInputs(series, bounds, definition) {
   return { components, risk };
 }
 
-export function scoreRanking(rows, definition, benchmarkInputs) {
+export function scoreRanking(rows, definition, benchmarkInputs, risks = null) {
   const candidates = rows.filter((row) => row.traded && row.rsComponents.every(finite));
-  const columns = definition.windows.map((_, index) => candidates.map((row) => row.rsComponents[index]));
+  const columns = definition.method === 'zscore' ? definition.windows.map((_, index) => candidates.map((row) => row.rsComponents[index])) : null;
   const percentiles = definition.method === 'percentile'
-    ? columns.map((_, index) => rankBy(candidates, (row) => row.rsComponents[index])) : null;
-  const stats = definition.method === 'zscore' ? columns.map((column) => [mean(column), deviation(column)]) : null;
+    ? definition.windows.map((_, index) => rankBy(candidates, (row) => row.rsComponents[index])) : null;
+  const stats = columns?.map((column) => [mean(column), deviation(column)]) ?? null;
   for (const row of candidates) {
+    const risk = risks?.get(row) ?? row.rsRisk;
     const values = row.rsComponents.map((value, index) => {
       if (definition.method === 'benchmark') return finite(benchmarkInputs.components[index]) ? value - benchmarkInputs.components[index] : null;
-      if (definition.method === 'risk') return row.rsRisk[index] > 0 ? value / row.rsRisk[index] : null;
+      if (definition.method === 'risk') return risk[index] > 0 ? value / risk[index] : null;
       if (percentiles) return percentiles[index].get(row.securityId).percentile / 100;
       if (stats) return stats[index][1] > 0 ? (value - stats[index][0]) / stats[index][1] : 0;
       return value;
@@ -153,51 +154,99 @@ export function scoreRanking(rows, definition, benchmarkInputs) {
   }
 }
 
-export function annotateVelocity(current, weekly) {
-  const past = weekly.map((snapshot) => new Map(snapshot.stocks.map((row) => [row.securityId, row])));
-  for (const item of current.stocks) {
-    const recent = past[0]?.get(item.securityId);
-    item.rsStatus = item.rsRank == null ? 'INSUFFICIENT' : !recent || recent.rsRank == null ? 'NEW' : 'RANKED';
-    const prior = past.map((snapshot) => snapshot.get(item.securityId));
-    for (const period of [1, 4, 12]) {
-      const old = prior[period - 1];
-      item[`rankChange${period}w`] = old?.rsRank != null && item.rsRank != null ? old.rsRank - item.rsRank : null;
-      item[`velocity${period}w`] = old?.rsPercentile != null && item.rsPercentile != null ? item.rsPercentile - old.rsPercentile : null;
+const weeklyLookups = new WeakMap();
+function lookupWeek(snapshot, memoize) {
+  const prior = memoize ? weeklyLookups.get(snapshot) : null;
+  if (prior) return prior;
+  const stocks = new Map(snapshot.stocks.map((row) => [row.securityId, row]));
+  const groups = new Map(snapshot.groups.map((group) => [group.id, group]));
+  const view = { stocks, groups };
+  if (memoize) weeklyLookups.set(snapshot, view);
+  return view;
+}
+
+function writeStockVelocity(target, item, past) {
+  let recent, second, fourth, twelfth;
+  let highest = -Infinity;
+  const ranked = finite(item.rsPercentile);
+  let comparableWeeks = Number(ranked);
+  let leaderWeeks = Number(ranked && item.rsPercentile >= 90);
+  const persistence = [null, null, null];
+  for (let index = 0; index < past.length; index++) {
+    const prior = past[index].get(item.securityId);
+    if (index === 0) recent = prior;
+    else if (index === 1) second = prior;
+    else if (index === 3) fourth = prior;
+    else if (index === 11) twelfth = prior;
+    if (finite(prior?.rsScore)) highest = Math.max(highest, prior.rsScore);
+    if (finite(prior?.rsPercentile)) {
+      comparableWeeks++;
+      if (prior.rsPercentile >= 90) leaderWeeks++;
     }
-    item.rsScoreChange = finite(recent?.rsScore) && finite(item.rsScore) ? item.rsScore - recent.rsScore : null;
-    item.rsAcceleration = finite(item.velocity1w) && finite(prior[1]?.rsPercentile)
-      ? item.velocity1w - (recent.rsPercentile - prior[1].rsPercentile) : null;
-    const priorScores = prior.map((old) => old?.rsScore).filter(finite);
-    item.rsNewHigh = priorScores.length && finite(item.rsScore) ? item.rsScore > Math.max(...priorScores) : null;
-    const oldPct = prior.map((old) => old?.rsPercentile).filter(finite);
-    item.leadingWeeks = finite(item.rsPercentile) ? oldPct.filter((value) => value >= 90).length + Number(item.rsPercentile >= 90) : null;
-    item.leadingWeekCoverage = oldPct.length + Number(finite(item.rsPercentile));
-    for (const period of [4, 8, 12]) {
-      const values = [item.rsPercentile, ...prior.slice(0, period - 1).map((row) => row?.rsPercentile)];
-      const valid = values.length === period && values.every(finite);
-      const weeks = valid ? values.filter((value) => value >= 90).length : null;
-      item[`topDecileWeeks${period}w`] = weeks;
-      item[`topDecilePersistence${period}w`] = valid ? weeks === period : null;
+    if ((index === 2 || index === 6 || index === 10) && comparableWeeks === index + 2) {
+      persistence[(index - 2) / 4] = leaderWeeks;
     }
-    for (const limit of [1, 5, 10, 20]) {
-      item[`enteredTop${limit}`] = recent?.rsPercentile != null && item.rsPercentile != null
-        ? item.rsPercentile >= 100 - limit && recent.rsPercentile < 100 - limit : null;
-    }
-    item.rsHighBeforePrice = item.rsNewHigh == null || item.new_high_252d == null ? null : item.rsNewHigh && !item.new_high_252d;
-    item.deterioratingOnPriceStrength = item.velocity4w == null || item.return_21d == null ? null : item.velocity4w < 0 && item.return_21d > 0;
-    item.momentumImproving = item.return_63d == null || item.return_252d == null ? null : item.return_63d * 4 > item.return_252d;
-    item.udvChange4w = delta(item.udv_50d, prior[3]?.udv_50d);
-    item.upVolumeShareChange4w = delta(item.up_volume_50d, prior[3]?.up_volume_50d);
-    item.volumeDemandImproving = item.upVolumeShareChange4w == null ? null : item.upVolumeShareChange4w > 0;
-    const strongVolume = item.udv_state_50d === 'infinity' || finite(item.udv_50d) && item.udv_50d > 1.2;
-    item.priceAndVolumeStrength = !finite(item.return_21d) || item.volumeDemandImproving == null
-      ? null : item.return_21d > 0 && strongVolume && item.volumeDemandImproving;
-    item.lifecycle = item.rsPercentile == null ? null
-      : item.rsPercentile >= 90 && item.leadingWeeks >= 5 ? 'Established Leader'
-      : item.velocity4w > 10 ? (item.rsPercentile >= 75 ? 'Strengthening' : 'Emerging')
-      : item.velocity4w < -10 ? 'Deteriorating' : 'Lagging';
   }
-  const groupHistory = weekly.map((snapshot) => new Map(snapshot.groups.map((group) => [group.id, group])));
+  target.rsStatus = item.rsRank == null ? 'INSUFFICIENT' : !recent || recent.rsRank == null ? 'NEW' : 'RANKED';
+  target.rankChange1w = recent?.rsRank != null && item.rsRank != null ? recent.rsRank - item.rsRank : null;
+  target.velocity1w = recent?.rsPercentile != null && item.rsPercentile != null ? item.rsPercentile - recent.rsPercentile : null;
+  target.rankChange4w = fourth?.rsRank != null && item.rsRank != null ? fourth.rsRank - item.rsRank : null;
+  target.velocity4w = fourth?.rsPercentile != null && item.rsPercentile != null ? item.rsPercentile - fourth.rsPercentile : null;
+  target.rankChange12w = twelfth?.rsRank != null && item.rsRank != null ? twelfth.rsRank - item.rsRank : null;
+  target.velocity12w = twelfth?.rsPercentile != null && item.rsPercentile != null ? item.rsPercentile - twelfth.rsPercentile : null;
+  target.rsScoreChange = finite(recent?.rsScore) && finite(item.rsScore) ? item.rsScore - recent.rsScore : null;
+  target.rsAcceleration = finite(target.velocity1w) && finite(second?.rsPercentile)
+    ? target.velocity1w - (recent.rsPercentile - second.rsPercentile) : null;
+  target.rsNewHigh = highest !== -Infinity && finite(item.rsScore) ? item.rsScore > highest : null;
+  target.leadingWeeks = ranked ? leaderWeeks : null;
+  target.leadingWeekCoverage = comparableWeeks;
+  for (const [index, weeks] of persistence.entries()) {
+    const period = 4 * (index + 1);
+    target[`topDecileWeeks${period}w`] = weeks;
+    target[`topDecilePersistence${period}w`] = weeks != null ? weeks === period : null;
+  }
+  for (const limit of [1, 5, 10, 20]) {
+    target[`enteredTop${limit}`] = recent?.rsPercentile != null && item.rsPercentile != null
+      ? item.rsPercentile >= 100 - limit && recent.rsPercentile < 100 - limit : null;
+  }
+  target.rsHighBeforePrice = target.rsNewHigh == null || item.new_high_252d == null ? null : target.rsNewHigh && !item.new_high_252d;
+  target.deterioratingOnPriceStrength = target.velocity4w == null || item.return_21d == null ? null : target.velocity4w < 0 && item.return_21d > 0;
+  target.momentumImproving = item.return_63d == null || item.return_252d == null ? null : item.return_63d * 4 > item.return_252d;
+  target.udvChange4w = delta(item.udv_50d, fourth?.udv_50d);
+  target.upVolumeShareChange4w = delta(item.up_volume_50d, fourth?.up_volume_50d);
+  target.volumeDemandImproving = target.upVolumeShareChange4w == null ? null : target.upVolumeShareChange4w > 0;
+  const strongVolume = item.udv_state_50d === 'infinity' || finite(item.udv_50d) && item.udv_50d > 1.2;
+  target.priceAndVolumeStrength = !finite(item.return_21d) || target.volumeDemandImproving == null
+    ? null : item.return_21d > 0 && strongVolume && target.volumeDemandImproving;
+  target.lifecycle = item.rsPercentile == null ? null
+    : item.rsPercentile >= 90 && target.leadingWeeks >= 5 ? 'Established Leader'
+    : target.velocity4w > 10 ? (item.rsPercentile >= 75 ? 'Strengthening' : 'Emerging')
+    : target.velocity4w < -10 ? 'Deteriorating' : 'Lagging';
+}
+
+export function createStockVelocityLayer(stocks, weekly, { memoizeWeeks = false } = {}) {
+  const past = weekly.map((snapshot) => lookupWeek(snapshot, memoizeWeeks).stocks);
+  const layers = new Map();
+  for (const stock of stocks) {
+    const fields = {};
+    writeStockVelocity(fields, stock, past);
+    layers.set(stock.securityId, fields);
+  }
+  return layers;
+}
+
+export function annotateVelocity(current, weekly, { memoizeWeeks = false } = {}) {
+  const lookups = weekly.map((snapshot) => lookupWeek(snapshot, memoizeWeeks));
+  const past = lookups.map(({ stocks }) => stocks);
+  for (const item of current.stocks) writeStockVelocity(item, item, past);
+  writeGroupVelocity(current, lookups.map(({ groups }) => groups));
+}
+
+export function annotateGroupVelocity(current, weekly, { memoizeWeeks = false } = {}) {
+  writeGroupVelocity(current, weekly.map((snapshot) => lookupWeek(snapshot, memoizeWeeks).groups));
+}
+
+function writeGroupVelocity(current, groupHistory) {
   for (const group of current.groups) {
     for (const period of [4, 12]) {
       const before = groupHistory[period - 1]?.get(group.id);

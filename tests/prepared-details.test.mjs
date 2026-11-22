@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { gzipSync } from 'node:zlib';
 import { expectedSessions } from '../backend/calendar.mjs';
 import { CALCULATION_VERSION, importDataset, openDatabase } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
@@ -7,6 +8,7 @@ import {
   createPreparedDetailWriter, hasPreparedDetail, prepareDetailsBatch, readPreparedDetail, riskMetrics, writePreparedDetail,
 } from '../backend/prepared-details.mjs';
 import { prepareRangeMetrics } from '../backend/range-metrics.mjs';
+import { decompressStoredBytes } from '../backend/storage-codec.mjs';
 
 const calendar = expectedSessions('2024-01-02', '2024-10-15');
 const stockId = 'fixture:AAA';
@@ -154,6 +156,12 @@ test('range callbacks publish exact products and resumable catalog batches skip 
   const calls = [];
   const tracking = { ...engine, snapshot(...args) { calls.push('snapshot'); return engine.snapshot(...args); },
     studyPrices(...args) { calls.push('benchmark'); return engine.studyPrices(...args); },
+    *detailSources(...args) {
+      for (const detail of engine.detailSources(...args)) {
+        calls.push(detail.securityId);
+        yield detail;
+      }
+    },
     detail(...args) { calls.push(args[1]); return engine.detail(...args); } };
   const first = prepareDetailsBatch(db, tracking, config, { bucketSize: 1, riskWindows: [21] });
   assert.equal(first.done, false);
@@ -165,6 +173,22 @@ test('range callbacks publish exact products and resumable catalog batches skip 
   assert.equal(third.processedSecurities, 3);
   assert.equal(prepareDetailsBatch(db, tracking, config, { bucketSize: 1, riskWindows: [21], cursor: second.cursor }).done, true);
   assert.deepEqual(calls.filter((item) => item.startsWith('fixture:')), ['fixture:IDX']);
+  assert.equal(calls.includes('snapshot'), false);
+});
+
+test('a failed detail bucket rolls back saved products and its durable roster cursor together', (t) => {
+  const { db, engine } = fixture(t, { count: 30 });
+  const config = engine.context();
+  createPreparedDetailWriter(db, engine, config, { riskWindows: [] });
+  db.exec(`CREATE TRIGGER interrupt_detail BEFORE INSERT ON prepared_detail_products
+    WHEN NEW.security_id='fixture:SPY' BEGIN SELECT RAISE(ABORT, 'blocked detail bucket'); END`);
+  const options = { securityIds: [stockId, 'fixture:SPY'], riskWindows: [] };
+  assert.throws(() => prepareDetailsBatch(db, engine, config, options), /blocked detail bucket/);
+  assert.equal(hasPreparedDetail(db, config, stockId), false);
+  assert.equal(db.prepare('SELECT processed FROM prepared_detail_batches').get().processed, 0);
+  db.exec('DROP TRIGGER interrupt_detail');
+  const result = prepareDetailsBatch(db, engine, config, options);
+  assert.deepEqual([result.done, result.written, result.processedSecurities], [true, 2, 2]);
 });
 
 test('an ordinary append deduplicates unchanged chart quarters and admits only the safe lineage prefix', (t) => {
@@ -184,6 +208,22 @@ test('an ordinary append deduplicates unchanged chart quarters and admits only t
   const changed = engine.context();
   assert.equal(readPreparedDetail(db, { ...changed, date: dates[156] }, stockId, { lookback: 21 }).state, 'not-prepared');
   assert.equal(readPreparedDetail(db, { ...changed, date: dates[154] }, stockId, { lookback: 21 }).state, 'ready');
+});
+
+test('prepared detail readers accept existing gzip chart manifests, blocks and risk values', (t) => {
+  const { db, engine } = fixture(t, { count: 30 });
+  const config = engine.context();
+  prepareDetailsBatch(db, engine, config, { securityIds: [stockId], riskWindows: [21] });
+  const read = () => readPreparedDetail(db, config, stockId, { lookback: 21 });
+  const expected = read();
+  const gzip = (value) => gzipSync(decompressStoredBytes(value), { level: 6 });
+  const { header, blocks } = db.prepare('SELECT header,blocks FROM prepared_detail_products').get();
+  db.prepare('UPDATE prepared_detail_products SET header=?,blocks=?').run(gzip(header), gzip(blocks));
+  const chart = db.prepare('UPDATE prepared_detail_blocks SET value=? WHERE hash=?');
+  for (const { hash, value } of db.prepare('SELECT hash,value FROM prepared_detail_blocks').all()) chart.run(gzip(value), hash);
+  const risk = db.prepare('UPDATE prepared_detail_risk SET value=? WHERE benchmark=?');
+  for (const { benchmark, value } of db.prepare('SELECT benchmark,value FROM prepared_detail_risk').all()) risk.run(gzip(value), benchmark);
+  assert.deepEqual(read(), expected);
 });
 
 test('ambiguous future split flags fail closed and projected metadata keeps only dated aliases and actions', (t) => {

@@ -1,0 +1,26 @@
+{
+  "generator": "Nano Banana Pro",
+  "provider": "Gemini API Interactions",
+  "model": "gemini-3-pro-image",
+  "generatedDate": "2026-11-21",
+  "generatedTimezone": "America/Chicago",
+  "apiRevisionDate": "2026-05-20",
+  "outputFormat": "Native JPEG bytes; no conversion",
+  "assets": [
+    {
+      "file": "readme-header.jpg",
+      "dimensions": "3168x1344",
+      "prompt": "Use case: ads-marketing. Asset type: wide GitHub README banner, 21:9 landscape. Create a refined institutional market-research brand image for a real dark-theme application called Market Intelligence. Restrained technical editorial design; near-black charcoal (#0b1216), mint/teal (#55d9bd), cool white, very sparse rose downside accents. A fine subtle field of line-chart trajectories, tiny candlesticks and sector tile geometry occupies the right half and recedes into the dark background. Sophisticated flat/soft-depth visualization texture, no glossy 3D, no neon, no stock photography, no bulls, no logos from other companies. Left half has large impeccably typeset white overlay title exactly 'MARKET INTELLIGENCE' and smaller text exactly 'Relative strength · Industry leadership · Market breadth'. Generous margins and negative space, clear at GitHub content width, powerful calm premium research terminal identity. Do not include simulated UI controls, performance promises, investment returns, watermarks, data numbers or other text. Text is the primary hierarchy and must be spelled exactly. Opaque background."
+    },
+    {
+      "file": "research-workflow.jpg",
+      "dimensions": "2752x1536",
+      "prompt": "Use case: infographic-diagram. Asset type: GitHub README conceptual workflow graphic, wide landscape. Design an exceptionally clear premium technical infographic for Market Intelligence in near-black charcoal #0b1216, pale white typography, mint teal #55d9bd and muted slate. Exactly five equally weighted columns with simple tasteful geometric iconography, thin connected arrows and generous spacing. Top title exactly 'THE DAILY RESEARCH LOOP'. Left-to-right primary labels exactly 'Market', 'Industries', 'Stocks', 'ChartBook', 'Watchlists + Journal'. Smaller labels below respectively exactly 'Assess participation', 'Find strengthening groups', 'Filter and rank', 'Review every setup once', 'Capture decisions'. Market icon is paired green/red breadth strokes; industries icon a subtle heatmap grid; stocks icon a ranking grid; ChartBook icon candles and a keyboard key; final icon a bookmark and note. One elegant low-contrast return arrow along bottom indicates ongoing review, label exactly 'Repeat with the next verified session'. This is a conceptual workflow illustration, NOT an app screenshot. Keep text large and exact, no extra text, no numerical market data, no decorative clutter, no watermark, no finance brand logos. Clean flat infographic with subtle depth only, opaque background. All typography must be crisp single-layer typesetting: no doubled letters, no ghost text, no overlapping copies. Pay special attention to the exact subtitle Assess participation. Keep generous separation between every label and icon."
+    },
+    {
+      "file": "data-pipeline.jpg",
+      "dimensions": "2752x1536",
+      "prompt": "Use case: infographic-diagram. Asset type: GitHub README architecture graphic, landscape 16:9. Create a technically accurate premium dark infographic for a local market research platform. Palette near-black charcoal #0b1216, mint #55d9bd, cool white, muted slate, amber only for corrections. Title exactly 'CAPTURE ONCE. PREPARE. RESEARCH.' A simple flow left-to-right with exactly five large nodes connected by fine mint arrows: 'New daily data' -> 'Local warehouse' -> 'Affected calculations' -> 'Verify + publish' -> 'Fast research views'. Beneath node 1 in small clear text exactly 'Missing finalized sessions'; beneath node 2 exactly 'Prices · Actions · References'; beneath node 3 exactly 'Metrics · Ranks · Breadth'; beneath node 4 exactly 'Versioned results'; beneath node 5 exactly 'Saved results only'. Beneath the main flow show a thin amber feedback arrow from 'Corrections or model changes' into 'Affected calculations'; one note exactly 'Reprocess impacted history when inputs change'. A restrained small lower band says exactly 'Private warehouse · Explicit opt-in for AI journal context'. Depict the warehouse as a crisp database outline, calculations as a few parallel columns, publication as a check circle, research as line/heatmap primitives. This is a conceptual architecture diagram, not an assertion the full initial build has finished. Do not show runtime/latency numbers or a promise to never recalculate history. No extra text, no dashboard mockup, no watermark. Very clear labels and spacious composition, opaque background."
+    }
+  ]
+}

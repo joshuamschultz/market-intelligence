@@ -9,7 +9,9 @@
         {
           "heading": "What the overview shows",
           "paragraphs": [
-            "The overview brings together benchmark context, advancing and declining participation, breadth history, leading securities, daily movers, and the selected market-health model. Each panel answers a different question: whether the benchmark moved, how many comparable stocks participated, and which securities or groups led. A benchmark gain alone does not imply broad participation.",
+            "The overview brings together benchmark context, advancing and declining participation, breadth history, leading securities, daily movers, and the selected market-health model. Market Reading cards report their underlying observations independently of the composite health score; a missing or withheld score does not erase those facts. Daily movers compare with the prior close and show the corresponding industry when available. A benchmark gain alone does not imply broad participation.",
+            "The movers panel has three views: Daily movers are strictly above +10% or below −10% versus the prior close; exactly +10% and −10% are excluded. The other views show 20-trading-session highs/lows and 52-week highs/lows (252 sessions). A preview shows up to five tickers and the true qualifying count; Full list keeps the selected date and data version. Ticker and available industry names link to their detail views.",
+            "Daily participation values are percentages of comparable stocks meeting each move threshold; counts are available in the tooltip or contributor drawer. The comparison matrix and sector/industry heatmaps mix measures with different units: returns and participation are percentages, RS is a percentile/rank measure, and counts are securities. Read the metric label and unit before comparing colors. In the RS-versus-velocity map, velocity is the change in RS percentile points; missing velocity is displayed at the neutral position, not treated as a measured zero change.",
             "Breadth percentages use the comparable traded securities for that metric and session. Prices that are missing, invalid, quarantined, unchanged where a move is required, or too short for a lookback can be excluded. Use the numerator, denominator, and coverage status in the interface to understand what a percentage describes. The data-quality page explains missing or excluded inputs."
           ]
         },
@@ -31,7 +33,7 @@
         {
           "heading": "Health and interpretation",
           "paragraphs": [
-            "Health components combine selected participation and leadership measures using the active model's weights. An observed/descriptive reading summarizes available observations; it is not a probability or forecast. A strict coverage gate can withhold the score when the configured share of required inputs is missing. A missing score is a data-quality signal, not a market state."
+            "Health graphics show each raw reading in its original units: percentages for participation and volume share, percentage points for the new-high minus new-low spread. The active model's weights and normalized 0–100 component score appear only when available. Component details retain input counts and coverage. Missing readings or scores stay unavailable; the interface does not fill a partial composite or invent history. An observed/descriptive reading is not a probability or forecast, and a strict coverage gate can withhold scores when configured support is insufficient."
           ]
         }
       ],
@@ -53,16 +55,18 @@
         {
           "heading": "Read and investigate a bar",
           "steps": [
-            "Choose the visible session range and whether to show counts, historical extremes, or averages and changes.",
+            "Choose the visible session range and whether to show counts, historical extremes, or averages and changes. Focus range scales bars within each metric group; full scale uses 0–100%.",
+            "Select a fixed metric title to open paired upside and downside history. Choose 1M, 3M, 6M, 1Y, or 5Y and focus or full-scale charting. The chart reads saved session measurements only; if dates are missing, prepare that context and check readiness before relying on the history.",
+            "Read a bar's historical percentile against its prior 252 comparable sessions; at least 60 prior readings are required. A percentile is unavailable when calibration is insufficient.",
             "Use the session date to replay the market context for that day.",
-            "Select an upside or downside bar to open its exact constituent list. The same drawer can show the selected metric's historical trend and that date's qualifying, comparable, and excluded stocks.",
+            "Select an upside or downside bar, or a session in the paired chart, to inspect that date's exact qualifying contributors, numerator, denominator, and exclusions.",
             "Export the standard or custom timeline when you need a local analysis copy."
           ]
         },
         {
           "heading": "Historical extremes",
           "paragraphs": [
-            "Extreme markers compare each reading with its prepared historical distribution for the same metric. They mark readings at or above the 90th percentile or at or below the 10th percentile when calibration is available. If the historical comparison is not prepared or coverage is insufficient, the interface says calibration is unavailable rather than inventing a percentile."
+            "Extreme markers compare each reading with its prepared prior-252-session distribution for the same metric; at least 60 comparable prior readings are required. The default highlights the top and bottom 5% (at or above the 95th percentile or at or below the 5th). You can choose rarer 2% extremes (98th/2nd) or the optional 10% setting (90th/10th). This changes highlighting only, not the saved reading or calibration. If history or coverage is insufficient, calibration is unavailable rather than estimated."
           ]
         }
       ],
@@ -350,7 +354,8 @@
         {
           "heading": "What is on the ticker page",
           "paragraphs": [
-            "Ticker detail combines a six-month view of 126 trading sessions of OHLCV candles, price/volume measures, returns, relative-strength history, selected benchmark comparisons, and available source/provenance fields. The plotted chart can be exported as CSV. Use the TradingView link to open the matching security chart in a separate research tool.",
+            "Ticker detail is organized into Last session, Price & trend, Volume & participation, Liquidity & fundamentals, and All metrics. Changing sections filters the already loaded view and does not request a new calculation. Period tables align moving-average and volume measures by session window so comparisons stay on the same row.",
+            "The price chart shows split-adjusted OHLCV history and can export the plotted data as CSV. Use the TradingView link to open the matching security chart in a separate research tool. Float turnover requires dated public-float observations; when float or another source field is unavailable, the value remains blank rather than being estimated.",
             "Metrics are scoped to the selected date, model, benchmark, price basis, universe, and data/calculation revision. The ticker's loaded-history high is limited to the history actually present for that security; it is not necessarily its all-time high. Corporate actions and unresolved source-quality intervals can change which measures are usable."
           ]
         },
@@ -414,6 +419,66 @@
       "related": ["overview", "monitor", "history", "settings", "glossary"]
     },
     {
+      "id": "chartbook",
+      "title": "ChartBook",
+      "summary": "Combine saved lists into a deduplicated chart review with dated notes and bookmarks.",
+      "sections": [
+        {
+          "heading": "Build and review a book",
+          "steps": [
+            "Create a book, then select built-in lists, saved screens, manual watchlists, or manual tickers/security IDs. ChartBook deduplicates by permanent security ID and shows a badge for every source that includes each stock.",
+            "Review the selected session, data revision, source badges, and source status. Choose a default manual watchlist if you want B or Bookmark to save the current stock there.",
+            "Move between stocks with Next/Previous or the keyboard. Save a note for the current stock and date; notes and watchlist bookmarks persist."
+          ]
+        },
+        {
+          "heading": "Chart ranges and overlays",
+          "definitions": [
+            { "term": "ChartBook default range", "text": "Six months (126 trading sessions). Available ranges are 1M/21 sessions, 3M/63, 6M/126, 1Y/252, and 5Y/1,260. The chart reports actual priced sessions and date bounds; a 5Y selection can display less than five years when saved price history is shorter." },
+            { "term": "±4% move strip", "text": "A marker shows an individual stock's close-to-close move when its absolute daily return is at least 4%. It is not a market breadth percentage." },
+            { "term": "SPY and Industry overlays", "text": "Comparison curves are rebased to the stock close at a shared or first usable anchor so they can be shown on the stock-price scale. They are not raw benchmark or industry prices. Missing or quarantined sessions remain gaps." }
+          ],
+          "paragraphs": [
+            "Toggle 20-session and 50-session moving averages, SPY, Industry, and the ±4% move strip. Point inspection shows the session date, available OHLCV, stock close/return, and rebased comparison values. The status below the chart identifies the comparison method and unavailable inputs.",
+            "Dated industry membership is used when available. A current-member equal-weight industry proxy can be prepared for the latest reconstructed session and applied retrospectively; it does not represent historical constituents. Historical industry curves can be unavailable when dated group membership is missing."
+          ]
+        },
+        {
+          "heading": "Keyboard and safe typing",
+          "definitions": [
+            { "term": "ChartBook shortcuts", "text": "Space: next stock; Shift+Space or Left Arrow: previous; B: bookmark; V: longer range; M: 3M; N: note; Escape: dismiss the chart point display. Focus the chart and use Up/Down to inspect sessions or Home/End to jump to the first/last plotted point." }
+          ],
+          "paragraphs": [
+            "Review shortcuts are disabled while a dialog is open or focus is in an input, text area, select, or editable text. Typing a note therefore does not navigate or bookmark stocks."
+          ]
+        }
+      ],
+      "related": ["stocklists", "screens", "watchlists", "stock", "coverage"]
+    },
+    {
+      "id": "stocklists",
+      "title": "Stock Lists",
+      "summary": "Browse period-return leaders and model-driven stock lists separately from saved screen rules.",
+      "sections": [
+        {
+          "heading": "Choose the list you need",
+          "paragraphs": [
+            "Period-return lists rank their own comparable population for the selected period and allow an adjustable top-percent cutoff. Model lists such as Top RS, Fast Improvers, and Emerging Leaders use the selected RS model and answer a different ranking question. Counts and ranks depend on the chosen date, universe, model, and available history.",
+            "Stock Lists can open a saved screen, but the screen definition remains in Saved Screens, the canonical place to build and revise reusable filters, sorting, and columns. Configure RS models in Settings. A Stock List is not itself a custom model formula."
+          ]
+        },
+        {
+          "heading": "A repeatable workflow",
+          "steps": [
+            "Choose a period-return list or an RS model list and inspect its comparable population.",
+            "Adjust the top-percent cutoff for a return list when needed; use filters and columns to inspect candidates.",
+            "Save durable filter rules under Saved Screens, configure ranking models in Settings, and carry selected stocks into a watchlist or ChartBook for review."
+          ]
+        }
+      ],
+      "related": ["rankings", "screener", "screens", "watchlists", "chartbook", "settings"]
+    },
+    {
       "id": "glossary",
       "title": "Definitions and calculations",
       "summary": "Shared terms used across market breadth, relative strength, history, and health.",
@@ -424,6 +489,7 @@
             { "term": "Comparable population", "text": "Securities eligible for a specific metric in a selected universe, date, and context after required price/history checks." },
             { "term": "Breadth percentage", "text": "Qualifying securities divided by comparable securities for that metric and session.", "formula": "100 × numerator / denominator" },
             { "term": "Relative strength percentile", "text": "A security's position relative to comparable securities. Higher percentile means stronger relative rank; it is not a future-return probability." },
+            { "term": "RS velocity", "text": "Change in relative-strength percentile over the selected number of weeks, measured in percentile points. Missing velocity means the comparison is unavailable; a neutral map position is a display fallback, not an observed zero change." },
             { "term": "EOD", "text": "End-of-day data for a completed market session. Latest-mode screens and reports follow completed and prepared publications, not an unfinished intraday quote." },
             { "term": "Observed health", "text": "A descriptive score based on available component observations and shown with support/coverage information." },
             { "term": "Strict health", "text": "A score made available only when configured component coverage and sample minimums are satisfied; otherwise the score is withheld." },

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { gunzipSync } from 'node:zlib';
 import { CALCULATION_VERSION, importDataset, openDatabase } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
 import {
-  hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot, writePreparedSnapshot,
+  hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot, writePreparedSnapshot, writePreparedSnapshotBatch,
 } from '../backend/prepared-snapshots.mjs';
+import { readStockFrame } from '../backend/snapshot-frame.mjs';
+import { compressStoredBytes, decodeStoredJson, preparedCodec } from '../backend/storage-codec.mjs';
 
 const date = '2024-01-05';
 const jsonCopy = (value) => JSON.parse(JSON.stringify(value));
@@ -142,11 +143,135 @@ test('selected-ID reads decompress only the relevant buckets and fail closed on 
   const seeded = snapshot(config, [{ securityId: 'base:A', close: 100 }, { securityId: 'base:B', close: 120 }]);
   writePreparedSnapshot(db, engine, config, seeded);
   const body = db.prepare('SELECT bucket,value FROM prepared_stock_base').all().find(({ value }) =>
-    JSON.parse(gunzipSync(value))[2].some(([id]) => id === 'base:B'));
+    decodeStoredJson(value)[2].some(([id]) => id === 'base:B'));
   assert.ok(body);
   db.prepare('DELETE FROM prepared_stock_base WHERE bucket=?').run(body.bucket);
   assert.deepEqual(readPreparedSnapshot(db, engine, config, { securityIds: ['base:A'] }).stocks, [seeded.stocks[0]]);
   assert.throws(() => readPreparedSnapshot(db, engine, config), /stock block is missing/);
+});
+
+test('mixed legacy blocks and batched projections retain field order, colliding overlays, and arbitrary JSON', (t) => {
+  const db = temporaryDb(t);
+  const first = point();
+  const second = point({ variant: 'composite overlay' });
+  const third = point({ variant: 'alternate pricing' });
+  const base = { close: 100, market_cap: null, tags: [{ field: 7 }], incomplete: NaN };
+  const firstStock = { securityId: 'fixture:A', close: 101, market_cap: 999, custom: null };
+  writePreparedSnapshot(db, engine, first, snapshot(first, [firstStock]), { codec: 'gzip' });
+  const overlay = Object.assign(Object.create(base), { securityId: 'fixture:A', symbol: 'AAA', market_cap: 188, custom: [8, null] });
+  const alternate = Object.assign(Object.create(base), { securityId: 'fixture:A', symbol: 'BBB', market_cap: 200, custom: [9] });
+  const definitions = [{ config: second, snapshot: snapshot(second, [overlay]), stockRows: [{ base, baseAfter: 2 }] },
+    { config: third, snapshot: snapshot(third, [alternate]), stockRows: [{ base, baseAfter: 2 }] }];
+  const counts = writePreparedSnapshotBatch(db, engine, definitions, { codec: preparedCodec });
+  assert.equal(counts.filter(({ written }) => written).length, 2);
+  assert.deepEqual(readPreparedSnapshot(db, engine, first).stocks, [firstStock]);
+  for (const { config, snapshot: context } of definitions) {
+    const stock = context.stocks[0];
+    const expected = jsonCopy({ securityId: stock.securityId, symbol: stock.symbol, ...base, market_cap: stock.market_cap, custom: stock.custom });
+    const result = readPreparedSnapshot(db, engine, config).stocks[0];
+    assert.deepEqual(result, expected);
+    assert.deepEqual(Object.keys(result), Object.keys(expected));
+  }
+  assert.ok(db.prepare('SELECT value FROM prepared_snapshot_blobs').all().some(({ value }) => value[0] === 0x1f && value[1] === 0x8b));
+  if (preparedCodec === 'zstd') assert.ok(db.prepare('SELECT value FROM prepared_snapshot_blobs').all().some(({ value }) => value[0] === 0x28));
+  assert.equal(db.prepare('SELECT count(DISTINCT blob) AS n FROM prepared_snapshot_deltas').get().n, 1);
+});
+
+test('shared snapshot header groups retain their exact JSON after another context adds fields', (t) => {
+  const db = temporaryDb(t);
+  const first = point();
+  const other = point({ variant: 'later fields' });
+  const groups = Array.from({ length: 35 }, (_, index) => ({ id: `group:${index}`, members: [`security:${index}`], score: null }));
+  const firstResult = snapshot(first, [{ securityId: 'security:4', close: 10 }], { groups, optional: undefined, nullish: null });
+  const otherResult = snapshot(other, [{ securityId: 'security:4', close: 11, demand: 5 }], { groups, optional: 2 });
+  writePreparedSnapshotBatch(db, engine, [{ config: first, snapshot: firstResult }, { config: other, snapshot: otherResult }]);
+  assert.deepEqual(readPreparedSnapshot(db, engine, first), jsonCopy(firstResult));
+  assert.deepEqual(readPreparedSnapshot(db, engine, other), jsonCopy(otherResult));
+  const headerComponents = db.prepare('SELECT value FROM prepared_snapshot_blobs').all().map(({ value }) => decodeStoredJson(value));
+  assert.equal(headerComponents.filter((component) => Array.isArray(component) && component[0]?.id === 'group:0').length, 1);
+});
+
+test('typed frames share base, taxonomy, and velocity layers with ordered exact values and selected columns', (t) => {
+  const db = temporaryDb(t);
+  const original = point();
+  const variant = point({ variant: 'other facts' });
+  const base = { securityId: 'global:AAA', close: 30.17, sector: null, cap: 6.7e17, absent: undefined,
+    odd: NaN, observed: true, tick: -0, metadata: { nested: ['x', null, false] } };
+  const own = Object.assign(Object.create(base), { sector: 'Industrials', rsRank: 3, close: 34.7 });
+  const other = Object.assign(Object.create(base), { sector: null, rsRank: 1, close: undefined, extra: new Date(date) });
+  const thinView = Object.create(own);
+  const enriched = Object.assign(Object.create(thinView), { velocity4w: -2, customMissing: undefined });
+  const plain = snapshot(original, [thinView]);
+  const velocity = snapshot(original, [enriched]);
+  const alternative = snapshot(variant, [other]);
+  writePreparedSnapshotBatch(db, engine, [
+    { config: original, snapshot: plain, stockRows: [{ base, overrides: own, baseAfter: 0 }] },
+    { config: original, snapshot: velocity, velocity: true, stockRows: [{ base, parent: own, overrides: enriched, baseAfter: 0 }] },
+    { config: variant, snapshot: alternative, stockRows: [{ base, overrides: other, baseAfter: 0 }] },
+  ]);
+  assert.equal(db.prepare('SELECT count(*) AS count FROM prepared_snapshot_frames').get().count, 1);
+  assert.equal(db.prepare('SELECT count(*) AS count FROM prepared_stock_base').get().count, 0);
+  for (const [point, args, expected] of [[original, {}, { ...base, ...own }], [original, { velocity: true }, { ...base, ...own, ...enriched }],
+    [variant, {}, { ...base, ...other }]]) {
+    const actual = readPreparedSnapshot(db, engine, point, args).stocks[0];
+    assert.deepEqual(actual, jsonCopy(expected));
+    assert.deepEqual(Object.keys(actual), Object.keys(jsonCopy(expected)));
+  }
+  assert.deepEqual(readPreparedSnapshot(db, engine, original, { velocity: true, securityIds: ['global:AAA'], stockFields: ['rsRank', 'velocity4w'] }).stocks,
+    [{ securityId: 'global:AAA', rsRank: 3, velocity4w: -2 }]);
+  assert.deepEqual(readPreparedSnapshot(db, engine, original, { securityIds: ['bogus'] }).stocks, []);
+});
+
+test('typed frames insert multiple Monitor fields in order and reuse independent layers', (t) => {
+  const db = temporaryDb(t);
+  const standard = point();
+  const monitor = point({ variant: 'ordered monitor' });
+  const base = { securityId: 'global:AAA', return_21d: 0.2, return_50d: 0.3, return_63d: 0.4, sector: null };
+  const additions = { order: [['return_21d', 'return_34d'], ['return_34d', 'return_40d']], values: { return_34d: 0.21, return_40d: null } };
+  const own = Object.assign(Object.create(base), { sector: 'A', rsRank: 5 });
+  const velocity = { rankChange4w: 2, lifecycle: 'Established Leader' };
+  const industry = Object.assign(Object.create(own), { industryVelocity: null });
+  const monitorStock = Object.assign(Object.create(industry), additions.values);
+  writePreparedSnapshotBatch(db, engine, [
+    { config: standard, snapshot: snapshot(standard, [own]), stockRows: [{ base, overrides: own, baseAfter: 0 }] },
+    { config: monitor, snapshot: snapshot(monitor, [monitorStock]), velocity: true,
+      stockRows: [{ base, additions, parent: own, velocity, overrides: industry, baseAfter: 0 }] },
+  ]);
+  const result = readPreparedSnapshot(db, engine, monitor, { velocity: true });
+  assert.equal(JSON.stringify(result.stocks[0]), JSON.stringify({ securityId: 'global:AAA', return_21d: 0.2,
+    return_34d: 0.21, return_40d: null, return_50d: 0.3, return_63d: 0.4, sector: 'A', rsRank: 5,
+    rankChange4w: 2, lifecycle: 'Established Leader', industryVelocity: null }));
+  assert.deepEqual(readPreparedSnapshot(db, engine, monitor, { velocity: true, stockFields: ['return_34d', 'lifecycle'] }).stocks,
+    [{ securityId: 'global:AAA', return_34d: 0.21, lifecycle: 'Established Leader' }]);
+});
+
+test('previous MSF1 binary frames reopen without field or type changes', () => {
+  const payload = Buffer.from(JSON.stringify([[[0, 1]], [[['securityId', 'close'], [['token', 4], ['constant', 7]], 1]], ['legacy:AAA']]));
+  const prefix = Math.ceil((payload.length + 8) / 8) * 8;
+  const value = Buffer.alloc(prefix + 16);
+  value.write('MSF1');
+  value.writeUInt32LE(payload.length, 4);
+  payload.copy(value, 8);
+  value.writeUInt32LE(1, prefix + 4);
+  assert.deepEqual(readStockFrame(compressStoredBytes(value, 'gzip'), 0), [[0, { securityId: 'legacy:AAA', close: 7 }]]);
+});
+
+test('group membership dictionaries share exact ordered arrays and keep original keys', (t) => {
+  const db = temporaryDb(t);
+  const core = point();
+  const alternate = point({ variant: 'alternate group metrics' });
+  const first = ['security:C', 'security:A', 'security:B'];
+  const second = ['security:B', 'security:A', 'security:C'];
+  const groups = [{ group: 'First', memberIds: first, ratio: null }, { group: 'Second', memberIds: second, ratio: 1 }];
+  const later = [{ group: 'First', memberIds: first.slice(), ratio: 3 }, { group: 'Second', memberIds: second.slice(), ratio: null }];
+  const one = snapshot(core, [], { groups });
+  const two = snapshot(alternate, [], { groups: later });
+  writePreparedSnapshotBatch(db, engine, [{ config: core, snapshot: one }, { config: alternate, snapshot: two }]);
+  assert.equal(JSON.stringify(readPreparedSnapshot(db, engine, core).groups), JSON.stringify(groups));
+  assert.equal(JSON.stringify(readPreparedSnapshot(db, engine, alternate).groups), JSON.stringify(later));
+  const blobs = db.prepare('SELECT value FROM prepared_snapshot_blobs').all().map(({ value }) => decodeStoredJson(value));
+  assert.equal(blobs.filter((value) => JSON.stringify(value) === JSON.stringify([first, second])).length, 1);
+  assert.equal(blobs.filter((value) => value[0] === 'prepared-header-2').length, 2);
 });
 
 test('lineage reuses unaffected exact contexts and withholds modified sessions', (t) => {

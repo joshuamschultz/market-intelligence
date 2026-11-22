@@ -3,6 +3,7 @@ import {
   panelHead, pagination, pathPart, pending, percent, publishingHistory, safe, savedScreenRoute, segment, summary, table, tradingViewLink,
 } from './ui.js';
 import { partialCoverage } from './overview.js';
+import { loadUniverseCounts, universeCountFacts, universeDefinition } from './coverage.js';
 import { modelEditor } from './screener.js';
 import { mountJournalSettings } from './journal.js';
 import { mountQualityAudit } from './data-quality.js';
@@ -123,6 +124,7 @@ async function renderScreens(env) {
     },
   });
   env.main.innerHTML = heading('Saved Screens','Reopen, duplicate, and export your research filters and table layouts.',
+    `<a class="button" href="${safe(env.routeUrl('stocklists'))}">${icon('rankings')} Stock Lists</a>` +
     `<a class="button primary" href="${safe(env.routeUrl('screener'))}">${icon('plus')} Build screen</a>`) +
     (screens.length ? `<div class="library-grid">${screens.map((screen)=>card(screen.name,`Version ${screen.version || 1}`,
       `<div class="inline-stack">${chip(`${countRules(screen.definition?.filter)} rules`)}${chip(`${count(screen.definition?.columns?.length || 0)} columns`)}
@@ -563,6 +565,8 @@ async function renderSettings(env) {
   let jobs = [];
   let qualityRequest;
   let jobsReady = false;
+  let countsRequested = false;
+  const counts = new Map();
   const tiles = [['Corporate action records','corporateActions'],['Dated float records','float'],['Dated share records','shares'],['Industry classifications','classification']];
   function quality() {
     if (!data) return `<div id="quality-data">${pending('Loading warehouse quality…')}</div>`;
@@ -601,17 +605,25 @@ async function renderSettings(env) {
       <tbody id="import-rows">${importRows(warehouse.runs)}</tbody></table></div></section>`;
   }
   function configurations() {
-    return `<div class="stack"><section class="panel panel-body">${panelHead('Universes','Versioned membership and eligibility rules',action('Create universe','new-universe','plus'))}
-      ${config.universes.map((item)=>`<div class="simple-row"><div><strong>${safe(item.name)}</strong><span class="muted"> · version ${count(item.version)}</span></div>
+    const point = env.coverageContext;
+    const scope = point?.date && point?.dataVersion != null
+      ? `Saved universe counts for ${dateLabel(point.date)} · Revision ${point.dataVersion}` : 'Dated universe counts unavailable';
+    return `<div class="stack"><section class="panel panel-body">${panelHead('Universes',scope,action('Create universe','new-universe','plus'))}
+      ${config.universes.map((item)=>`<div class="simple-row"><div><strong>${safe(item.name)}</strong><span class="muted"> · version ${count(item.version)}</span>
+      <p class="muted">${safe(universeDefinition(item.id) || 'Saved eligibility rules')}</p>
+      ${universeDefinition(item.id) ? `<div data-settings-universe-count="${safe(item.id)}">${universeCountFacts(counts.get(item.id))}</div>` : ''}</div>
       <div class="actions">${item.id===env.context.universe ? chip('Selected','accent') : action('Use','use-universe','check',{value:item.id})}
       ${item.createdAt || item.created_at ? iconButton('Edit universe','edit-universe','edit',item.id)+iconButton('Delete universe','delete-universe','trash',item.id):''}</div></div>`).join('')}</section>
       <section class="panel panel-body">${panelHead('RS models','Versioned return windows and scoring methods',action('Build RS model','new-rank-model','plus'))}
-      ${config.models.map((item)=>`<div class="simple-row"><div><strong>${safe(item.name)}</strong><span class="muted"> · version ${count(item.version)}</span></div>
+      ${config.models.map((item)=>`<div class="simple-row"><div><strong>${safe(item.name)}</strong><span class="muted"> · version ${count(item.version)}</span>
+      ${item.definition?.windows?.length ? `<details class="formula-help"><summary>Return windows and weights</summary><div class="inline-stack">
+        ${item.definition.windows.map((window) => chip(`${window.kind === 'fixed' ? `${window.start}–${window.end}` : window.kind === 'ytd' ? 'YTD' : `${window.length} ${window.kind}`}${window.offset ? ` · lag ${window.offset}` : ''} · ${number(100 * window.weight, 1)}%`)).join('')}
+      </div></details>` : ''}</div>
       <div class="actions">${item.id===env.context.model ? chip('Selected','accent') : action('Use','use-model','check',{value:item.id})}
       ${iconButton(builtins.has(item.id)?'Copy model':'Edit model','edit-rank-model','edit',item.id)}
       ${builtins.has(item.id)?'':iconButton('Delete model','delete-rank-model','trash',item.id)}</div></div>`).join('')}</section>
       <section class="panel panel-body">${panelHead('Market health models','Weights for breadth, momentum, and leadership',action('Create health model','new-health','plus'))}
-      ${config.healthModels.map((item)=>`<div class="simple-row"><div><strong>${safe(item.name || 'Default market health')}</strong><span class="muted"> · version ${count(item.version)}</span></div>
+      ${(config.healthModels || []).map((item)=>`<div class="simple-row"><div><strong>${safe(item.name || 'Default market health')}</strong><span class="muted"> · version ${count(item.version)}</span></div>
       <div class="actions">${item.id===env.context.healthModel?chip('Selected','accent'):action('Use','use-health','check',{value:item.id})}
       ${item.id==='default'?'':iconButton('Edit health model','edit-health','edit',item.id)+iconButton('Delete health model','delete-health','trash',item.id)}</div></div>`).join('')}</section></div>`;
   }
@@ -724,6 +736,14 @@ async function renderSettings(env) {
     if (journal) mountJournalSettings(env,journal);
     const qualityAudit = main.querySelector('#quality-source-audit-mount');
     if (qualityAudit) mountQualityAudit(env,qualityAudit,{asOf:data.asOf,initial:data.qualityOverrides});
+    if (state.tab === 'config' && !countsRequested) {
+      countsRequested = true;
+      loadUniverseCounts(env, env.coverageContext, { signal, update(universe, values) {
+        counts.set(universe.id, values);
+        const target = main.querySelector(`[data-settings-universe-count="${universe.id}"]`);
+        if (env.isActive() && target) target.innerHTML = universeCountFacts(values);
+      } });
+    }
   }
   const launch=(path,body={})=>env.api(path,{body,plain:true}).then((job)=>jobDetails(env,job));
   async function deleteAndReset(area,id,kind,key,reset) {

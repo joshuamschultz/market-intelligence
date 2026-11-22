@@ -1,4 +1,5 @@
 import { chart } from './charts.js';
+import { rangeSegment } from './chart-ranges.js';
 import { count, dateLabel, direction, empty, notice, number, panelHead, pending, rate, safe, segment, signed } from './ui.js';
 
 const title = 'NYSE Summation Index proxy';
@@ -61,11 +62,14 @@ function describePoint(row, periods) {
 export async function mountSummation(target, env) {
   if (!target) return;
   const { api, signal, state } = env;
-  const panel = (content, controls = '') => `<section class="panel panel-body">${panelHead(title, subtitle, controls)}${content}</section>`;
-  target.innerHTML = panel(pending('Loading prepared summation history…'));
-  try {
-    const result = await api('market/summation', { signal, params: { limit: 252 } });
-    if (!target.isConnected || signal?.aborted) return;
+  let range = state?.summationRange ?? 252;
+  let average = averageChoices.some(([key]) => key === state?.summationAverage) ? state.summationAverage : 'both';
+  let result;
+  let run = 0;
+  const active = () => target.isConnected && !signal?.aborted;
+  const panel = (content, controls = '') => `<section class="panel panel-body">${panelHead(title, subtitle, rangeSegment('summation-range', range) + controls)}${content}</section>`;
+
+  function paint() {
     const { rows, status, metadata, through, preparationState } = result;
     if (!rows.length) {
       const waiting = ['queued', 'running'].includes(preparationState);
@@ -77,31 +81,48 @@ export async function mountSummation(target, env) {
 
     const summary = status === 'partial' ? notice('Summation history is incomplete', `Prepared through ${dateLabel(through)}.`) : '';
     const hasValues = rows.some((row) => row.state === 'available');
-    let selected = averageChoices.some(([key]) => key === state?.summationAverage) ? state.summationAverage : 'both';
-    function paint() {
-      const periods = selected === 'both' ? [10, 20] : [Number(selected)];
-      const latest = currentReading(rows.at(-1), metadata, periods);
-      const history = hasValues ? chart(rows, [
-        { key: 'value', label: 'Summation proxy', format: number },
-        ...periods.map((period) => ({ key: `sma${period}`, label: `${period}D SMA`, format: number, dash: period === 20,
-          color: period === 10 ? '#bae489' : '#84a9fa' })),
-      ], { label: 'Observed NYSE common-stock summation and simple moving averages in index points',
-        height: 264, describePoint: (row) => describePoint(row, periods) }) : '';
-      target.innerHTML = panel(summary + latest + (history ? `<div class="section-space">${history}</div>` : '') + methodology(metadata),
-        hasValues ? segment('summation-average', averageChoices, selected) : '');
-    }
-    paint();
-    target.addEventListener('click', (event) => {
-      const button = event.target.closest('[data-action="summation-average"]');
-      if (!button || button.dataset.value === selected) return;
-      selected = button.dataset.value;
-      if (state) state.summationAverage = selected;
+    const periods = average === 'both' ? [10, 20] : [Number(average)];
+    const latest = currentReading(rows.at(-1), metadata, periods);
+    const history = hasValues ? chart(rows, [
+      { key: 'value', label: 'Summation proxy', format: number },
+      ...periods.map((period) => ({ key: `sma${period}`, label: `${period}D SMA`, format: number, dash: period === 20,
+        color: period === 10 ? '#bae489' : '#84a9fa' })),
+    ], { label: 'Observed NYSE common-stock summation and simple moving averages in index points',
+      height: 264, describePoint: (row) => describePoint(row, periods) }) : '';
+    target.innerHTML = panel(summary + latest + (history ? `<div class="section-space">${history}</div>` : '') + methodology(metadata),
+      hasValues ? segment('summation-average', averageChoices, average) : '');
+  }
+  async function load() {
+    const id = ++run;
+    result = undefined;
+    target.innerHTML = panel(pending('Loading prepared summation history…'));
+    try {
+      const data = await api('market/summation', { signal, params: { limit: range } });
+      if (!active() || id !== run) return;
+      result = data;
       paint();
-      target.querySelector('[data-action="summation-average"][aria-pressed="true"]')?.focus();
-    }, { signal });
-  } catch (error) {
-    if (target.isConnected && !signal?.aborted && error.name !== 'AbortError') {
-      target.innerHTML = panel(notice('Summation history unavailable', error.message, '', true));
+    } catch (error) {
+      if (active() && id === run && error.name !== 'AbortError') {
+        target.innerHTML = panel(notice('Summation history unavailable', error.message, '', true));
+      }
     }
   }
+  const choose = async (event) => {
+    const button = event.target.closest('[data-action="summation-range"], [data-action="summation-average"]');
+    if (!button || button.getAttribute('aria-pressed') === 'true') return;
+    const { action, value } = button.dataset;
+    if (action === 'summation-range') {
+      range = Number(value);
+      if (state) state.summationRange = range;
+      await load();
+    } else if (result) {
+      average = value;
+      if (state) state.summationAverage = average;
+      paint();
+    }
+    target.querySelector(`[data-action="${action}"][aria-pressed="true"]`)?.focus();
+  };
+  target.addEventListener('click', choose);
+  signal?.addEventListener('abort', () => target.removeEventListener('click', choose), { once: true });
+  return load();
 }

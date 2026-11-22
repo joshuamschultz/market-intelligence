@@ -8,11 +8,11 @@ import { expectedSessions, latestFinalizableSession, shiftDate } from '../backen
 import { CALCULATION_VERSION, createJob, dataVersion, importDataset, openDatabase, recordDailyPublication, updateJob } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
 import { materializeHistory } from '../backend/materialization.mjs';
-import { enqueuePreparation, preparationSpecs } from '../backend/preparation.mjs';
-import { writePreparedSnapshot } from '../backend/prepared-snapshots.mjs';
+import { batchPreparationSpecs, enqueuePreparation, preparationSpecs } from '../backend/preparation.mjs';
+import { hasPreparedSnapshot, writePreparedSnapshot } from '../backend/prepared-snapshots.mjs';
 import { EodhdProvider, importProviderData } from '../backend/provider.mjs';
 import { createDailyTick } from '../backend/server.mjs';
-import { createService, dailyCaptureAvailability, performJob, scheduledPrecomputeKey } from '../backend/service.mjs';
+import { createService, dailyCaptureAvailability, performJob, prepareStandardHealth, scheduledPrecomputeKey } from '../backend/service.mjs';
 import { savedScreenRoute, tradingViewUrl } from '../frontend/ui.js';
 
 const bar = (symbol, date, close) => ({ symbol, date, open: close, low: close, high: close, close,
@@ -21,6 +21,38 @@ const asset = (symbol, listingDate, extra = {}) => ({ symbol, name: `${symbol} C
   listingDate, knownAt: listingDate, ...extra });
 const post = (dispatch, path, body) => dispatch({ method: 'POST', url: '/api/v1/' + path, body });
 const closeTo = (value, target) => assert.ok(Math.abs(value - target) < 1e-8, `${value} ≉ ${target}`);
+
+test('overview daily movers exclude exact ten-percent changes and return dated industries', async (t) => {
+  const { db, dispatch } = fixture(t);
+  const previous = '2024-01-04';
+  const date = '2024-01-05';
+  const closes = { BRIGHT: 140, OVERUP: 110.01, EXACTUP: 110, SMALLUP: 109.99, SMALLDOWN: 90.01, EXACTDOWN: 90, OVERDOWN: 89.99, DARK: 80 };
+  const symbols = Object.keys(closes);
+  importDataset(db, { provider: 'fixture', securities: symbols.map((symbol) => asset(symbol, previous)),
+    prices: symbols.flatMap((symbol) => [bar(symbol, previous, 100), bar(symbol, date, closes[symbol])]),
+    classifications: symbols.map((symbol) => ({ symbol, sector: 'Fixtures', industry: 'Example industry', effectiveFrom: previous, knownAt: previous })) });
+  const response = await dispatch({ url: `/api/v1/market/overview?date=${date}` });
+  assert.equal(response.status, 200, response.body.error);
+  assert.deepEqual(response.body.movers.gainers.map(({ symbol }) => symbol), ['BRIGHT', 'OVERUP']);
+  assert.deepEqual(response.body.movers.losers.map(({ symbol }) => symbol), ['DARK', 'OVERDOWN']);
+  assert.deepEqual(response.body.movers.counts, { gainers: 2, losers: 2 });
+  assert.ok([...response.body.movers.gainers, ...response.body.movers.losers].every(({ industry }) => industry === 'Example industry'));
+});
+
+test('overview counts all daily movers while returning five per side', async (t) => {
+  const { db, dispatch } = fixture(t);
+  const previous = '2024-01-04';
+  const date = '2024-01-05';
+  const symbols = Array.from({ length: 15 }, (_, index) => `MOVE${index}`);
+  importDataset(db, { provider: 'fixture', securities: symbols.map((symbol) => asset(symbol, previous)),
+    prices: symbols.flatMap((symbol, index) => [bar(symbol, previous, 100),
+      bar(symbol, date, index < 7 ? 112 + index : 88 - index)]) });
+  const response = await dispatch({ url: `/api/v1/market/overview?date=${date}` });
+  assert.equal(response.status, 200, response.body.error);
+  assert.deepEqual(response.body.movers.counts, { gainers: 7, losers: 8 });
+  assert.deepEqual(response.body.movers.gainers.map(({ symbol }) => symbol), ['MOVE6', 'MOVE5', 'MOVE4', 'MOVE3', 'MOVE2']);
+  assert.deepEqual(response.body.movers.losers.map(({ symbol }) => symbol), ['MOVE14', 'MOVE13', 'MOVE12', 'MOVE11', 'MOVE10']);
+});
 
 test('period lists rank each horizon across the full comparable universe and follow only ready EOD revisions', async (t) => {
   const { db, dispatch } = fixture(t);
@@ -313,6 +345,57 @@ test('imports and saved definitions register durable preparation before their vi
   assert.equal((await post(dispatch, 'data/preparation', { retry: true })).body.queued, 0);
   for (let pass = 0; pass < 250 && db.prepare("SELECT 1 FROM jobs WHERE status IN ('running','queued') LIMIT 1").get(); pass++) await delay(20);
   assert.equal(db.prepare("SELECT count(*) AS n FROM jobs WHERE status<>'complete'").get().n, 0);
+});
+
+test('a calculation upgrade supersedes outdated queued jobs and serves exact batched preparation', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const from = '2024-01-03';
+  const to = '2024-01-09';
+  const dates = expectedSessions(from, to);
+  importDataset(db, { provider: 'fixture', securities: [asset('FRESH', from)], prices: dates.map((date, index) => bar('FRESH', date, 100 + index)) });
+  const engine = createEngine(db);
+  const contexts = [{ universe: 'us-core' }, { universe: 'us-all' }];
+  const requested = contexts.flatMap((context) => preparationSpecs(db, engine, context,
+    { requested: context, historySessions: 3 }).filter(({ phase }) => phase === 'history'));
+  const [batched] = batchPreparationSpecs(engine, requested);
+  assert.equal(batched.members.length, 2);
+  const old = createJob(db, 'prepare-context', { ...batched, calculationVersion: 'older-calculation', jobKey: 'old-batch' });
+  const { dispatch } = createService({ db, workers: false, preparedOnly: true });
+  for (let pass = 0; pass < 100 && db.prepare("SELECT 1 FROM jobs WHERE status IN ('running','queued')").get(); pass++) await delay(10);
+  const stale = await dispatch({ url: `/api/v1/jobs/${old.id}` });
+  assert.equal(stale.body.status, 'superseded');
+  const available = await dispatch({ url: '/api/v1/data/preparation' });
+  assert.equal(available.body.contexts.filter(({ stages }) => stages.history === 'complete').length, 0);
+  for (const context of contexts) {
+    assert.equal(hasPreparedSnapshot(db, engine, engine.context(context), { velocity: true }), true);
+  }
+  const done = db.prepare("SELECT payload FROM jobs WHERE status='complete' AND type='prepare-context'").all().map(({ payload }) => JSON.parse(payload));
+  assert.equal(done.length, 1);
+  assert.equal(done[0].calculationVersion, CALCULATION_VERSION);
+  assert.equal(done[0].members.length, 2);
+});
+
+test('long daily chart requests read prepared rows beyond a year without starting jobs', async (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const dates = expectedSessions('2023-01-03', '2025-01-03').slice(-305);
+  const point = { date: dates.at(-1), universe: 'us-all', reference: 'as-of' };
+  importDataset(db, { provider: 'fixture', securities: [asset('LONGCHART', dates[0])],
+    prices: dates.map((date, index) => bar('LONGCHART', date, 100 + index)) });
+  const engine = createEngine(db);
+  const config = engine.context(point);
+  materializeHistory(db, engine, config, { limit: dates.length, withRanks: true });
+  prepareStandardHealth(db, engine, config, { limit: dates.length });
+  const { dispatch } = createService({ db, workers: false, preparedOnly: true });
+  const query = new URLSearchParams({ ...point, cadence: 'daily', limit: '1260' });
+  for (const [path, responseField] of [['market/breadth?series=1', 'rows'], ['market/monitor?metrics=above_50d', 'rows'],
+    ['market/health?series=1', 'history'], ['stocks/LONGCHART/rankings?series=1', 'rows'], ['industries/compare?ids=', 'rows']]) {
+    const response = await dispatch({ url: `/api/v1/${path}&${query}` });
+    assert.equal(response.status, 200, response.body.error);
+    assert.equal(response.body[responseField].length, dates.length, path);
+  }
+  assert.equal(db.prepare('SELECT count(*) AS count FROM jobs').get().count, 0);
 });
 
 test('a refresh retains an already published session while retrying incomplete older coverage without duplicate imports', async (t) => {

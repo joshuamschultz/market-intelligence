@@ -1,18 +1,17 @@
 import { chart, exportChart } from './charts.js';
+import { rangeLimit, rangeSegment } from './chart-ranges.js';
 import { stockQualityPanel } from './data-quality.js';
+import { renderStockMovingAverages, renderStockVolumeWindows, stockMetricValue, stockSectionTabs, stockSections, stockVolumePeriods } from './stock-sections.js';
 import { describePricePoint, plottableBar, stockScreenMatches, toWeekly } from './stocks.js';
 import {
-  action, cellValue, chip, count, dateLabel, direction, empty, fieldDetails, heading, icon, iconButton,
+  action, chip, count, dateLabel, direction, empty, fieldDetails, heading, icon, iconButton,
   money, notice, number, numeric, panelHead, pathPart, pending, rangeFieldDetails, rangeFieldId, rate, ratio, safe, segment,
   signed, summary, tradingViewLink, warming,
 } from './ui.js';
 
-const ranges = [[21, '1M'], [63, '3M'], [126, '6M']];
 const defaultRange = 126;
 const cadences = [['daily', 'Daily'], ['weekly', 'Weekly']];
 const quarters = [4, 8, 12];
-const averageWindows = [10, 20, 50, 100, 150, 200];
-const volumeWindows = [10, 20, 50, 100];
 const rangeWindows = [20, 252];
 const extraFields = [
   ...[50, 100, 150, 200].map((days) => [`return_${days}d`, `${days}D return`, 'rate']),
@@ -36,14 +35,7 @@ const extraFields = [
   ['dailyHistoricalReturn5pct', 'Daily return, 5th percentile', 'rate'],
   ['dailyHistoricalVaR95', 'Daily historical VaR (95%)', 'rate'],
   ['observations', 'Comparable risk observations', 'integer'], ['benchmarkObservations', 'Paired benchmark observations', 'integer'],
-  ...volumeWindows.flatMap((days) => [
-    [`rvol_${days}d`, `Relative volume ${days}D`, 'ratio'],
-    [`adv_${days}d`, `Avg dollar volume ${days}D`, 'compactMoney'],
-    [`avg_volume_${days}d`, `Avg share volume ${days}D`, 'compact'],
-    [`up_volume_${days}d`, `Up-volume share ${days}D`, 'rate'],
-    [`float_turnover_${days}d`, `Float turnover ${days}D`, 'rate'],
-    [`obv_slope_${days}d`, `OBV change ${days}D`, 'compact'],
-  ]),
+  ...stockVolumePeriods.map((days) => [`obv_slope_${days}d`, `${days}D OBV change`, 'compact']),
 ].map(([field, label, format = 'text']) => ({ field, label, format }));
 
 function valueTile(label, value, note = '') {
@@ -53,18 +45,15 @@ function valueTile(label, value, note = '') {
 function metrics(ids, row) {
   return ids.map((id) => {
     const { label } = fieldDetails(id, extraFields, row);
-    const observations = row[id.replace(/^udv_/, 'udv_obs_')];
-    const note = id.startsWith('udv_') && numeric(observations)
-      ? `<small>${count(observations)} comparable observations</small>` : '';
-    return `<div class="metric-tile" data-metric="${safe(id)}"><span>${safe(label)}</span><strong>${cellValue(id, row, extraFields)}</strong>${note}</div>`;
+    return `<div class="metric-tile" data-metric="${safe(id)}"><span>${safe(label)}</span><strong>${stockMetricValue(id, row, extraFields)}</strong></div>`;
   }).join('');
 }
 
-function metricPanel(title, body, { tools = '', collapse = false } = {}) {
+function metricPanel(title, body, { tools = '', collapse = false, description = '' } = {}) {
   const grid = `<div class="metric-grid${collapse ? ' section-space' : ''}">${body}</div>`;
   return collapse
     ? `<details class="panel panel-body formula-help"><summary>${safe(title)}</summary>${grid}</details>`
-    : `<section class="panel panel-body">${panelHead(title, '', tools)}${grid}</section>`;
+    : `<section class="panel panel-body">${panelHead(title, description, tools)}${grid}</section>`;
 }
 
 function participation(row) {
@@ -113,6 +102,16 @@ function companyContext(env, row, current) {
   ], row), { tools: peers });
 }
 
+function liquidityPanel(row) {
+  const fields = ['market_cap', 'market_cap_change', 'shares', 'float', 'adv_20d',
+    ...(row.marketCapDate ? ['marketCapDate'] : []), ...(row.marketCapBucket ? ['marketCapBucket'] : []),
+    ...(numeric(row.float_turnover_1d) ? ['float_turnover_1d'] : [])];
+  return metricPanel('Liquidity and company fundamentals', metrics(fields, row) + [
+    row.sharesDate && valueTile('Shares effective date', dateLabel(row.sharesDate)),
+    row.floatDate && valueTile('Float effective date', dateLabel(row.floatDate)),
+  ].filter(Boolean).join(''), { description: 'Share and float figures use the dated records available for this snapshot.' });
+}
+
 function dataContext(row, context, source) {
   return metricPanel('Security and source data', [
     valueTile('Permanent security ID', row.securityId), valueTile('ISIN', row.isin), valueTile('Security type', row.type),
@@ -159,21 +158,23 @@ function productNotice(product, subject) {
 
 function chartPanel(row, bars, range, cadence) {
   const product = row.detailPreparation?.chart;
-  if (product && product.state !== 'ready') return panelHead('Price and volume') + productNotice(product, 'Price history');
+  const controls = rangeSegment('stock-range-local', range) + segment('stock-cadence-local', cadences, cadence);
+  if (product && product.state !== 'ready') return panelHead('Price and volume', '', controls) + productNotice(product, 'Price history');
   if (product?.priceAvailability === 'no-known-observations') {
-    return panelHead('Price and volume') + notice('No prices known for this interval',
+    return panelHead('Price and volume', '', controls) + notice('No prices known for this interval',
       'The selected point-in-time revision has no usable prices in this window.');
   }
   const visible = bars.slice(-range);
   const plot = cadence === 'weekly' ? toWeekly(visible) : visible;
-  const tools = segment('stock-range-local', ranges, range) + segment('stock-cadence-local', cadences, cadence) +
-    iconButton('Export plotted prices CSV', 'stock-export-local', 'download');
+  const tools = controls + (visible.some((bar) => numeric(bar.close)) ? iconButton('Export plotted prices CSV', 'stock-export-local', 'download') : '');
   return panelHead('Price and volume', `${count(visible.length)} market sessions through ${dateLabel(row.date)} · Split-adjusted prices`, tools) +
     chart(plot, [{ key: 'close', label: 'Close', format: money }], {
       label: `${row.symbol} ${cadence} candlestick chart`, candles: true, volume: true, width: 900, height: 305,
       exportFields: ['open', 'high', 'low', 'close', 'volume'], describePoint: describePricePoint,
     });
 }
+
+const sectionVisible = (selected, scope) => selected === 'all' || scope.split(' ').includes(selected);
 
 export async function render(env) {
   const { main, params, snapshotContext = {}, signal } = env;
@@ -190,6 +191,9 @@ export async function render(env) {
   const active = () => !signal?.aborted && (env.isActive?.() ?? true);
   let range = defaultRange;
   let cadence = 'daily';
+  let rankingRange = 252;
+  let priceRun = 0;
+  let selectedSection = 'session';
 
   function display(data) {
     const info = data.materialization;
@@ -205,7 +209,7 @@ export async function render(env) {
     const current = { ...snapshotContext, date, dataVersion: row.dataVersion ?? snapshotContext.dataVersion,
       classification: snapshotContext.classification || row.classificationSystem,
       reference: snapshotContext.reference || row.referenceMode };
-    const bars = (row.chartBars || row.bars || []).filter((bar) => bar?.date && bar.date <= date).slice(-defaultRange).map(plottableBar);
+    const bars = (row.chartBars || row.bars || []).filter((bar) => bar?.date && bar.date <= date).map(plottableBar);
     const latestBar = bars.findLast((bar) => bar.source);
     const source = latestBar?.source || row.source || row.provider;
     const priceQuarantined = row.quality?.some((record) => record.kind === 'price' &&
@@ -218,58 +222,59 @@ export async function render(env) {
       priceQuarantined ? 'Price quarantined' : null].filter(Boolean).map((text) => chip(text)).join('');
     const tools = tradingViewLink(row) + action('Add to watchlist', 'stock-watch-local', 'watchlists');
     const returns = Object.keys(row).filter((key) => /^return_\d+d$/.test(key));
+    const obvChanges = stockVolumePeriods.filter((period) => period === 20 || numeric(row[`obv_slope_${period}d`]))
+      .map((period) => `obv_slope_${period}d`);
     const plotRow = { ...row, date };
+    const section = (scope, content) => `<div data-stock-section="${scope}"${sectionVisible(selectedSection, scope) ? '' : ' hidden'}>${content}</div>`;
 
     main.innerHTML = `<div id="ticker-dashboard">
       ${heading(title, `As of ${dateLabel(date)}${selectedDate && selectedDate !== date ? ` · ${contextDate}` : ''}`, tools)}
       <div class="inline-stack">${tags}${participationBadges(row)}</div>
       <div id="stock-warming" class="section-space">${preparationNotice(products?.weekly?.state === 'ready' ? null : products?.weekly || info,
         products?.metrics?.state === 'unprepared' ? 'Stock metrics' : 'Rank change and persistence')}</div>
-      <div class="summary-grid three section-space">
-        ${summary('Split-adjusted close', money(priceQuarantined ? null : row.close), priceQuarantined ? 'Source price quarantined' : rate(row.return_1d), { glyph: 'chart', style: direction(row.return_1d) })}
-        ${summary('RS percentile', number(row.rsPercentile), row.rsRank == null ? 'Unranked' : `Rank ${count(row.rsRank)}`, { glyph: 'rankings' })}
-        ${summary('4W RS velocity', signed(row.velocity4w), 'Percentile-point change', { glyph: 'pulse', style: direction(row.velocity4w) })}
-      </div>
+      ${stockSectionTabs(selectedSection)}
       <div class="stack">
-        <section class="panel panel-body" id="stock-price-panel">${chartPanel(plotRow, bars, range, cadence)}</section>
-        ${metricPanel('Participation and volume', metrics([
-          'dailyMove', 'traded', 'above_20d', 'above_50d', 'above_200d', 'nearHigh', 'topDecile', 'highVolumeMove',
-          'volume', 'dollar_volume', 'rvol_20d', 'udv_50d', 'adv_20d', 'udvChange4w', 'upVolumeShareChange4w', 'priceAndVolumeStrength',
-        ], row))}
-        ${metricPanel('Relative strength and persistence', metrics([
+        ${section('session', `<div class="summary-grid three">
+          ${summary('Split-adjusted close', money(priceQuarantined ? null : row.close), priceQuarantined ? 'Source price quarantined' : rate(row.return_1d), { glyph: 'chart', style: direction(row.return_1d) })}
+          ${summary('RS percentile', number(row.rsPercentile), row.rsRank == null ? 'Unranked' : `Rank ${count(row.rsRank)}`, { glyph: 'rankings' })}
+          ${summary('4W RS velocity', signed(row.velocity4w), 'Percentile-point change', { glyph: 'pulse', style: direction(row.velocity4w) })}
+        </div>${metricPanel('Session activity', metrics([
+          'dailyMove', 'gap', 'intraday_return', 'volume', 'dollar_volume', 'rvol_20d', 'new_high_20d', 'highVolumeMove',
+        ], row))}`)}
+        ${section('session price', `<section class="panel panel-body" id="stock-price-panel">${chartPanel(plotRow, bars, range, cadence)}</section>`)}
+        ${section('price', renderStockMovingAverages(row))}
+        ${section('price', metricPanel('Trend and participation signals', metrics([
+          'ma_aligned', 'ma_50_above_200', 'ma_rising_50', 'ma_rising_200', 'traded', 'nearHigh', 'topDecile',
+        ], row), { collapse: true }))}
+        ${section('price', metricPanel('Returns and price action', metrics([
+          'raw_close', ...new Set(['return_1d', 'return_5d', 'return_21d', 'return_63d', 'return_126d', 'return_252d', ...returns]),
+          'gap', 'gap_up', 'gap_down', 'intraday_return', 'streak', 'volatility_compression',
+          'atr_14d', 'atr_contraction', 'consolidation_range_20d', 'consolidation_duration',
+          ...[20, 50, 100, 252].flatMap((n) => [`new_high_${n}d`, `new_low_${n}d`]),
+        ], row), { collapse: true }))}
+        ${section('price', priceRanges(row))}
+        ${section('price', metricPanel('Relative strength and persistence', metrics([
           'rsRank', 'rsPercentile', 'rsScore', 'rsStatus', 'lifecycle', 'rsScoreChange', 'rsAcceleration',
           ...[1, 4, 12].flatMap((n) => [`velocity${n}w`, `rankChange${n}w`]),
           'leadingWeeks', 'leadingWeekCoverage', ...quarters.flatMap((n) => [`topDecileWeeks${n}w`, `topDecilePersistence${n}w`]),
           ...[1, 5, 10, 20].map((n) => `enteredTop${n}`),
           'rsNewHigh', 'rsHighBeforePrice', 'deterioratingOnPriceStrength', 'momentumImproving',
           'relative_strength_line', 'rs_line_new_high', 'relative_return_21d',
-        ], row))}
-        ${details('stock-rs-chart', 'rs', 'RS and volume history')}
-        ${companyContext(env, row, current)}
-        ${priceRanges(row)}
-        ${metricPanel('Returns and price action', metrics([
-          'raw_close', ...new Set(['return_1d', 'return_5d', 'return_21d', 'return_63d', 'return_126d', 'return_252d', ...returns]),
-          'gap', 'gap_up', 'gap_down', 'intraday_return', 'streak', 'volatility_compression',
-          'atr_14d', 'atr_contraction', 'consolidation_range_20d', 'consolidation_duration',
-          ...[20, 50, 100, 252].flatMap((n) => [`new_high_${n}d`, `new_low_${n}d`]),
-        ], row), { collapse: true })}
-        ${metricPanel('Moving averages', metrics([
-          'ma_aligned', 'ma_50_above_200', 'ma_rising_50', 'ma_rising_200',
-          ...averageWindows.flatMap((n) => [`sma_${n}d`, `ema_${n}d`, `above_${n}d`, `vs_sma_${n}d`, `vs_ema_${n}d`, `slope_sma_${n}d`, `slope_ema_${n}d`]),
-        ], row), { collapse: true })}
-        ${metricPanel('Liquidity, volume, and fundamentals', metrics([
-          'float', 'shares', 'market_cap', 'market_cap_change', 'marketCapDate', 'marketCapBucket', 'float_turnover_1d',
-          ...volumeWindows.flatMap((n) => [`avg_volume_${n}d`, `adv_${n}d`, `rvol_${n}d`, `udv_${n}d`,
-            `up_volume_${n}d`, `float_turnover_${n}d`, `obv_slope_${n}d`]),
-          'volume_trend', 'volume_contraction', 'breakout_volume', 'obv', 'mfi_14d', 'cmf_20d', 'clv', 'up_frequency_20d',
+        ], row), { collapse: true }))}
+        ${section('volume', renderStockVolumeWindows(row))}
+        ${section('volume', metricPanel('Volume and participation signals', metrics([
+          'volume_trend', 'volume_contraction', 'breakout_volume', 'obv', ...obvChanges, 'mfi_14d', 'cmf_20d', 'clv', 'up_frequency_20d',
           'high_volume_up_20d', 'high_volume_down_20d', 'accumulation_20d', 'high_volume_up_2x_20d', 'high_volume_down_2x_20d',
-          'accumulation_2x_20d', 'volumeDemandImproving',
-        ], row), { collapse: true })}
-        <div id="stock-risk-panel">${products?.risk?.state && products.risk.state !== 'ready' ? productNotice(products.risk, 'Risk analysis') :
-          metricPanel('Risk', metrics(['annualizedVolatility', 'maximumDrawdown', 'beta', 'correlation',
-            'dailyHistoricalReturn5pct', 'dailyHistoricalVaR95', 'observations', 'benchmarkObservations'], row.risk || {}), { collapse: true })}</div>
-        ${dataContext({ ...row, sourceKnownAt: latestBar?.knownAt }, current, source)}
-        ${details('stock-screens', 'screens', 'Saved screen membership')}
+          'accumulation_2x_20d', 'volumeDemandImproving', 'udvChange4w', 'upVolumeShareChange4w', 'priceAndVolumeStrength',
+        ], row), { collapse: true }))}
+        ${section('session price volume', details('stock-rs-chart', 'rs', 'RS and volume history'))}
+        ${section('liquidity', liquidityPanel(row))}
+        ${section('price liquidity', companyContext(env, row, current))}
+        ${section('price', `<div id="stock-risk-panel">${products?.risk?.state && products.risk.state !== 'ready' ? productNotice(products.risk, `Risk analysis · ${count(options.params.lookback)} sessions`) :
+          metricPanel(`Risk · ${count(options.params.lookback)} sessions`, metrics(['annualizedVolatility', 'maximumDrawdown', 'beta', 'correlation',
+            'dailyHistoricalReturn5pct', 'dailyHistoricalVaR95', 'observations', 'benchmarkObservations'], row.risk || {}), { collapse: true })}</div>`)}
+        ${section('liquidity', dataContext({ ...row, sourceKnownAt: latestBar?.knownAt }, current, source))}
+        ${section('session liquidity', details('stock-screens', 'screens', 'Saved screen membership'))}
         ${stockQualityPanel(row.quality, date)}
         ${warnings.length ? notice('Data quality', warnings.join(' ')) : ''}
       </div>
@@ -278,34 +283,68 @@ export async function render(env) {
     const price = main.querySelector('#stock-price-panel');
     const security = `stocks/${pathPart(row.securityId || symbol)}`;
     async function followProduct(job) {
+      const run = priceRun;
       const productsInFlight = row.detailPreparation;
       const status = productsInFlight?.chart?.state !== 'ready' ? price : main.querySelector('#stock-risk-panel');
       const subject = productsInFlight?.chart?.state !== 'ready' ? 'Price history' : 'Risk analysis';
       if (!status) return;
       try {
         const result = await env.publishedSeries(path, { ...options, initialResponse: { ...data, materialization: job } }, (_, progress) => {
-          if (active() && status.isConnected) status.innerHTML = warming(progress, subject);
+          if (active() && status.isConnected && run === priceRun) status.innerHTML = warming(progress, subject);
         });
-        if (active() && status.isConnected) display(result);
+        if (active() && status.isConnected && run === priceRun) display(result);
       } catch (error) {
-        if (active() && status.isConnected && error.name !== 'AbortError') {
+        if (active() && status.isConnected && run === priceRun && error.name !== 'AbortError') {
           status.innerHTML = notice(`${subject} unavailable`, error.message, action('Prepare price and risk', 'prepare-ticker-detail', 'refresh'), true);
         }
       }
     }
-    function changePlot(key, value) {
-      if (key === 'stock-range-local') range = Number(value);
+    async function changePlot(key, value) {
+      if (key === 'stock-range-local') {
+        range = Number(value);
+        const run = ++priceRun;
+        if (range > options.params.lookback) {
+          const requested = range;
+          const controls = rangeSegment('stock-range-local', range) + segment('stock-cadence-local', cadences, cadence);
+          price.innerHTML = panelHead('Price and volume', '', controls) + pending('Loading prices for this range…');
+          try {
+            const result = await env.api(security, { params: { ...current, lookback: requested }, signal });
+            if (!active() || !price.isConnected || run !== priceRun) return;
+            if (result.pendingOnly || !result.symbol) throw new Error('The selected price window has yet to be prepared.');
+            if (result.date !== current.date || result.dataVersion != null && String(result.dataVersion) !== String(current.dataVersion)) {
+              throw new Error('The selected price window was returned for a different session or revision.');
+            }
+            const opened = [...main.querySelectorAll('details[open] [data-action="stock-tab-local"]')].map((node) => node.dataset.value);
+            options.params = { ...current, lookback: requested };
+            display(result);
+            for (const tab of opened) main.querySelector(`[data-action="stock-tab-local"][data-value="${tab}"]`).closest('details').open = true;
+          } catch (error) {
+            if (!active() || !price.isConnected || run !== priceRun || error.name === 'AbortError') return;
+            price.innerHTML = panelHead('Price and volume', '', controls) + notice('Price window unavailable', error.message, '', true);
+          }
+          main.querySelector(`#stock-price-panel [data-action="${key}"][aria-pressed="true"]`)?.focus();
+          return;
+        }
+      }
       else cadence = value;
       price.innerHTML = chartPanel(plotRow, bars, range, cadence);
       price.querySelector(`[data-action="${key}"][aria-pressed="true"]`)?.focus();
     }
     env.setActions({
+      'stock-section': (value) => {
+        if (!stockSections.some(([key]) => key === value) || value === selectedSection) return;
+        selectedSection = value;
+        for (const control of main.querySelectorAll('[data-action="stock-section"]')) {
+          control.setAttribute('aria-pressed', String(control.dataset.value === value));
+        }
+        for (const panel of main.querySelectorAll('[data-stock-section]')) panel.hidden = !sectionVisible(value, panel.dataset.stockSection);
+      },
       'stock-range-local': (value) => changePlot('stock-range-local', value),
       'stock-cadence-local': (value) => changePlot('stock-cadence-local', value),
       'stock-watch-local': () => env.openAddWatchlist([row.securityId]),
       'stock-export-local': () => exportChart(price.querySelector('[data-chart]'), `${row.symbol}-${cadence}-plotted-prices.csv`),
       'prepare-ticker-detail': async () => {
-        const job = await env.api(`${security}/prepare`, { body: { context: current, lookback: defaultRange, followLatest: !env.context?.date }, signal });
+        const job = await env.api(`${security}/prepare`, { body: { context: current, lookback: options.params.lookback, followLatest: !env.context?.date }, signal });
         return followProduct({ pending: true, status: job.status, jobId: job.id, progress: job.progress });
       },
     });
@@ -321,11 +360,16 @@ export async function render(env) {
     const screens = main.querySelector('#stock-screens');
     const connected = (target) => active() && target.isConnected;
 
-    function load(target, endpoint, requestParams, title, paint) {
+    function onOpen(target, show) {
       const disclosure = target.closest('details');
-      disclosure.addEventListener('toggle', async function loadOnOpen() {
+      disclosure.addEventListener('toggle', function loadOnOpen() {
         if (!disclosure.open) return;
         disclosure.removeEventListener('toggle', loadOnOpen);
+        show();
+      });
+    }
+
+    async function load(target, endpoint, requestParams, title, paint) {
         target.innerHTML = pending(`Loading ${title.toLowerCase()}…`);
         const request = { signal, params: { ...context, ...requestParams } };
         try {
@@ -341,15 +385,26 @@ export async function render(env) {
         } catch (error) {
           if (connected(target) && error.name !== 'AbortError') target.innerHTML = notice(`${title} unavailable`, error.message, '', true);
         }
-      });
     }
 
-    load(history, 'rankings', { cadence: 'weekly', limit: 52 }, 'Ranking history', (result) => (result.supplyDemand?.state === 'partial'
-      ? notice('Up/down volume history partly prepared', `${count(result.supplyDemand.preparedSessions)} of ${count(result.supplyDemand.requestedSessions)} requested sessions have prepared volume readings.`) : '') + chart(result.rows || [], [
-      { key: 'percentile', label: 'RS percentile', format: number },
-      { key: 'udv_50d', label: 'U/D volume 50D', axis: 'right', format: ratio },
-    ], { domain: [0, 100], fill: true, rightAxisFormat: number, label: 'RS percentile and up/down volume history' }));
-    load(screens, 'screens', {}, 'Screen membership', (result) => stockScreenMatches(env, result));
+    function showRanks() {
+      history.innerHTML = `${rangeSegment('stock-rank-range', rankingRange)}<div class="section-space" data-rank-plot></div>`;
+      return load(history.querySelector('[data-rank-plot]'), 'rankings', { cadence: 'weekly', limit: rangeLimit(rankingRange, 'weekly') },
+        'Ranking history', (result) => (result.supplyDemand?.state === 'partial'
+          ? notice('Up/down volume history partly prepared', `${count(result.supplyDemand.preparedSessions)} of ${count(result.supplyDemand.requestedSessions)} requested sessions have prepared volume readings.`) : '') + chart(result.rows || [], [
+          { key: 'percentile', label: 'RS percentile', format: number },
+          { key: 'udv_50d', label: 'U/D volume 50D', axis: 'right', format: ratio },
+        ], { domain: [0, 100], fill: true, rightAxisFormat: number, label: 'RS percentile and up/down volume history' }));
+    }
+    onOpen(history, showRanks);
+    history.addEventListener('click', (event) => {
+      const choice = event.target.closest('[data-action="stock-rank-range"]');
+      if (!choice || Number(choice.dataset.value) === rankingRange) return;
+      rankingRange = Number(choice.dataset.value);
+      void showRanks();
+      history.querySelector('[data-action="stock-rank-range"][aria-pressed="true"]')?.focus();
+    });
+    onOpen(screens, () => load(screens, 'screens', {}, 'Screen membership', (result) => stockScreenMatches(env, result)));
   }
 
   try {

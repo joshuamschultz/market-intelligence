@@ -11,6 +11,7 @@ import { expectedSessions } from '../backend/calendar.mjs';
 import { createHandler } from '../backend/server.mjs';
 import { createService, scheduledPrecomputeKey } from '../backend/service.mjs';
 import { generateJournal } from '../backend/journal.mjs';
+import { writePreparedDetail } from '../backend/prepared-details.mjs';
 
 const require = createRequire(import.meta.url);
 let JSDOM;
@@ -26,7 +27,7 @@ const baseUrl = 'http://localhost:4173';
 const pageNames = {
   overview: 'Market Overview', monitor: 'Market Monitor', screener: 'Stock Screener', screens: 'Saved Screens', watchlists: 'Watchlists',
   rankings: 'RS Rankings', industries: 'Industries', history: 'Historical Explorer', journal: 'Market Journal', alerts: 'Alerts', settings: 'Settings & Data',
-  stock: 'Ticker',
+  stock: 'Ticker', chartbook: 'ChartBook', stocklists: 'Stock Lists',
 };
 
 function seedFixture(db) {
@@ -99,6 +100,10 @@ test('research workspace workflows use the published API and a copy of the local
   const rankingQueries = [];
   const contributorQueries = [];
   const trendQueries = [];
+  const healthQueries = [];
+  const monitorQueries = [];
+  const chartbookQueries = [];
+  let chartbookReview;
   async function request(url, options = {}) {
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const target = new URL(url, baseUrl);
@@ -129,7 +134,13 @@ test('research workspace workflows use the published API and a copy of the local
     if (target.pathname.startsWith('/api/v1/jobs/')) jobPolls++;
     if (target.pathname.endsWith('/contributors')) contributorQueries.push(target);
     if (target.pathname.startsWith('/api/v1/market/breadth/') && target.searchParams.get('series')==='1') trendQueries.push(target);
+    if (target.pathname === '/api/v1/market/health') healthQueries.push(target.searchParams);
+    if (target.pathname.startsWith('/api/v1/chartbooks') || /^\/api\/v1\/watchlists\/.*\/members$/.test(target.pathname)) {
+      chartbookQueries.push({ url: target, method: options.method || 'GET' });
+    }
+    if (status === 200 && /^\/api\/v1\/chartbooks\/[^/]+\/review$/.test(target.pathname)) chartbookReview = JSON.parse(body);
     if (target.pathname === '/api/v1/market/monitor' && typeof body === 'string') {
+      monitorQueries.push(target.searchParams);
       requestedRevisions.push(target.searchParams.get('dataVersion'));
       if (JSON.parse(body).materialization?.pending) pendingHistory++;
     }
@@ -215,7 +226,7 @@ test('research workspace workflows use the published API and a copy of the local
   };
   const route = async (name, selector) => {
     click(`nav [data-route="${name}"]`);
-    await wait(() => $('.page-intro h1')?.textContent === pageNames[name] && $(selector), name);
+    await wait(() => $('#main h1')?.textContent === pageNames[name] && $(selector), name);
   };
   const only = (name) => `Browser fixture ${name} ${Date.now()}`;
   const savedScreen = only('screen');
@@ -224,6 +235,11 @@ test('research workspace workflows use the published API and a copy of the local
   const savedAlert = only('alert');
   const savedLeaders = only('monthly leaders');
   const crossListWatch = only('cross-list watchlist');
+
+  const { dailyMoverRows } = await import('../frontend/overview.js');
+  const moves = [1.1 - 1, .0999, .9 - 1, -.0999, null, .11, -.11].map((return_1d) => ({ return_1d }));
+  assert.deepEqual(dailyMoverRows(moves, 'gainers'), [moves[5]]);
+  assert.deepEqual(dailyMoverRows(moves, 'losers'), [moves[6]]);
 
   unavailableConfig = 3;
   await import('../frontend/app.js');
@@ -253,6 +269,41 @@ test('research workspace workflows use the published API and a copy of the local
   tableFixture.remove();
   await wait(() => $('#overview-chart [data-plot]'), 'overview chart');
   assert.equal($('#breadcrumb-page').textContent, 'Market Overview');
+  const participation = $('.participation-row');
+  assert.match(participation.title, /\d[\d,]* \/ \d[\d,]* comparable/);
+  assert.match(participation.getAttribute('aria-label'), /comparable/);
+  assert.doesNotMatch(participation.textContent, /\d\s*\/\s*\d/);
+  assert.match($('[aria-label="Daily movers"] thead').textContent, /Industry/);
+  for (const [lookback, side] of [['20', 'high'], ['20', 'low'], ['252', 'low'], ['252', 'high']]) {
+    click(`[data-action="mover-view"][data-value="${lookback}"]`);
+    click(`[data-action="mover-side"][data-value="${side}"]`);
+    const key = `new_${side}_${lookback}d`;
+    const reading = expected.breadth[key];
+    await wait(() => $('#market-movers [data-mover-preview]')?.textContent.includes(reading.denominator
+      ? `${reading.numerator} qualifying stock` : 'enough comparable history'), `matching ${key} preview`);
+    const query = contributorQueries.findLast((url) => url.pathname.endsWith(`/${key}/contributors`));
+    assert.equal(query.searchParams.get('perPage'), '5');
+    assert.equal(query.searchParams.get('date'), status.latestDate);
+    assert.equal(query.searchParams.get('dataVersion'), String(status.dataVersion));
+    assert.equal(query.searchParams.get('include'), 'numerator');
+    if (reading.numerator > 0) {
+      assert.equal($$('#market-movers tbody .stock-link').length, Math.min(reading.numerator, 5));
+      const stock = new URLSearchParams($('#market-movers tbody .stock-link').hash.split('?')[1]);
+      assert.equal(stock.get('date'), status.latestDate);
+      assert.equal(stock.get('dataVersion'), String(status.dataVersion));
+      click(`#market-movers [data-action="breadth"][data-value="${key}"]`);
+      await wait(() => $('#detail #breadth-list .pagination'), 'full high or low constituent list');
+      click('#detail [data-action="close-dialog"]');
+      await wait(() => !$('#detail [data-breadth-drawer]'), 'closed full constituent list');
+    }
+  }
+  click('[data-action="mover-view"][data-value="daily"]');
+  await wait(() => $('#overview-heatmap .group-heatmap'), 'prepared group heatmap');
+  const industryView = new URLSearchParams($('#overview-heatmap').closest('section').querySelector('a').hash.split('?')[1]);
+  assert.equal(industryView.get('dataVersion'), String(status.dataVersion));
+  assert.equal(industryView.get('date'), status.latestDate);
+  click('[data-action="overview-heatmap-level"][data-value="industry"]');
+  await wait(() => $('#overview-heatmap [aria-label^="Industries by"]'), 'switch to industry heatmap');
   if (expected.coverage.state !== 'complete') assert.match($('#main').textContent, /Limited market coverage.*Market health is withheld/s);
   click('[data-action="breadth"][data-value="above_50d"]');
   await wait(() => $('#detail #breadth-list .pagination'), 'overview contributors');
@@ -281,16 +332,34 @@ test('research workspace workflows use the published API and a copy of the local
   set('#health-coverage-form [name="observedMinimum"]','3');
   set('#health-coverage-form [name="observedThreshold"]','0.75');
   submit('#health-coverage-form');
-  await wait(() => $('#current-health')?.textContent.includes('Minimum 3 traded securities · 75.0% comparable coverage'),
+  await wait(() => $('#health-coverage-policy')?.textContent.includes('Minimum 3 traded securities · 75.0% comparable coverage') &&
+    healthQueries.some((params) => params.get('coverageMode') === 'observed' && params.get('observedMinimum') === '3' &&
+      params.get('observedThreshold') === '0.75'),
     'observed health controls reach API and label coverage policy');
   click('[data-action="overview-tab"][data-value="monitor"]');
   await wait(() => $('#large-move-results [data-value="up_25pct_63d"]'), 'Overview fixed quarterly preset');
   assert.equal($('#monitor-form').closest('details').open, false);
   assert.ok($('#large-move-results [data-value="down_13pct_34d"]'));
+  assert.deepEqual($$('.breakdown-table tbody').map((body) => body.rows.length), [4, 2]);
+  assert.match($('.breakdown-table [data-value="new_high_20d"]').getAttribute('aria-label'), /comparable/);
+  assert.ok($('.breakdown-table [data-value="high_volume_down_2x"]'));
+  click('[data-action="breakdown-view"][data-value="cards"]');
+  await wait(() => $('.metric-tile[data-value="new_high_20d"]') && !$('.breakdown-table'), 'session cards layout');
+  assert.match(location.hash, /breakdownView=cards/);
+  click('[data-action="breakdown-view"][data-value="compare"]');
+  await wait(() => $('.breakdown-table'), 'return to comparison layout');
 
   await route('monitor', '.monitor-table');
   assert.equal($('#monitor-custom').open, false);
   assert.ok($('#monitor-timeline [data-value="up_25pct_63d"]'));
+  assert.match($('[data-extreme-upper]').textContent, /95th percentile/);
+  assert.match($('[data-extreme-lower]').textContent, /5th percentile/);
+  const defaultExtremeCount = $$('.monitor-table .extreme-high, .monitor-table .extreme-low').length;
+  set('[data-change="monitor-extreme-tail"]', '2');
+  assert.match($('[data-extreme-upper]').textContent, /98th percentile/);
+  assert.match($('[data-extreme-lower]').textContent, /2nd percentile/);
+  assert.ok($$('.monitor-table .extreme-high, .monitor-table .extreme-low').length <= defaultExtremeCount);
+  set('[data-change="monitor-extreme-tail"]', '5');
   const visibleHelp = $('button[aria-describedby="monitor-limit-help"]');
   const visibleTip = $('#monitor-limit-help');
   assert.equal(visibleTip.hidden, true);
@@ -305,6 +374,16 @@ test('research workspace workflows use the published API and a copy of the local
   assert.equal(visibleTip.hidden, true);
   visibleHelp.blur();
   assert.ok($$('.monitor-table tbody tr').length >= 20);
+  click('[data-action="monitor-pair-history"][data-value="2"]');
+  await wait(() => $('#detail [data-momentum-history] [data-plot]'), 'paired momentum history');
+  assert.equal($('#detail [data-action="momentum-range"][data-value="252"]').getAttribute('aria-pressed'), 'true');
+  assert.match($('#detail [data-momentum-chart] .chart-legend').textContent, /Up ≥ 50%.*Down ≥ 50%/s);
+  assert.equal($$('#detail [data-momentum-side]').length, 2);
+  assert.equal(monitorQueries.at(-1).get('dataVersion'), String(status.dataVersion));
+  assert.equal(monitorQueries.at(-1).get('universe'), 'us-core');
+  assert.equal(monitorQueries.at(-1).get('date'), status.latestDate);
+  click('#detail [data-action="close-dialog"]');
+  await wait(() => !$('#detail [data-momentum-history]'), 'closed momentum history');
   click('.monitor-table [data-action="monitor-detail"][data-value="up_13pct_34d"]');
   await wait(() => $('#detail #breadth-list .pagination') && trendQueries.some((url)=>url.searchParams.get('metrics')==='up_13pct_34d'),'custom monitor contributors and exact trend');
   click('#detail [data-action="close-dialog"]');
@@ -423,9 +502,102 @@ test('research workspace workflows use the published API and a copy of the local
   await wait(() => $('#members tbody .stock-link') && $('.library-option[aria-pressed="true"]').textContent.trim() === savedList, 'watchlist members');
   assert.equal($$('#members tbody .stock-link').length, 1);
 
+  if (!sourcePath) {
+    const list = (await request('/api/v1/watchlists').then((response) => response.json())).find(({ name }) => name === savedList);
+    const listed = expected.leaders.find(({ securityId }) => securityId === list.definition.members[0]);
+    const unlisted = expected.leaders.find(({ securityId }) => securityId !== listed.securityId);
+    const point = service.engine.context({ ...context, date: status.latestDate, dataVersion: status.dataVersion });
+    for (const securityId of [listed.securityId, unlisted.securityId, 'SPY']) {
+      const detail = service.engine.detail(point, securityId, 1310, { velocity: false });
+      writePreparedDetail(db, point, detail);
+    }
+    await route('chartbook', '[data-action="chartbook-new"]');
+    assert.ok(document.body.classList.contains('chartbook-route'));
+    click('[data-action="chartbook-new"]');
+    set('#modal [name="name"]', only('ChartBook'));
+    set('#modal [name="watchlist"]', list.id);
+    click(`#modal [name="source"][value="watchlist:${list.id}"]`);
+    set('#modal [name="manual"]', `${listed.symbol}, ${unlisted.symbol}`);
+    submit('#modal form');
+    await wait(() => $('.chartbook-candle') && !$('dialog[open]'), 'saved ChartBook and prepared candles');
+    assert.equal(chartbookReview.sort.metric, 'composite-rs');
+    assert.equal(chartbookReview.sort.direction, 'desc');
+    assert.deepEqual(new Set(chartbookReview.rows.map(({ securityId }) => securityId)), new Set([listed.securityId, unlisted.securityId]));
+    const [first, second] = chartbookReview.rows;
+    assert.equal($('.chartbook-identity h2').textContent, first.symbol);
+    assert.equal($('.chartbook-subtitle strong').textContent, '1 / 2');
+    assert.deepEqual(first.sources.map(({ type }) => type).sort(), first.securityId === listed.securityId ? ['manual', 'watchlist'] : ['manual']);
+    assert.deepEqual($$('.chartbook-badges .chip').map((node) => node.textContent), first.sources.map(({ label }) => label));
+    assert.equal($$('.chartbook-candle').length, 126);
+    assert.equal($('[data-action="chartbook-layer"][data-value="industry"]').getAttribute('aria-pressed'), 'true');
+    assert.match($('[data-chartbook-actual-range]').textContent, /126 priced of 126 requested sessions/);
+    const tickerHref = $('.chartbook-current a[href^="#stock"]').hash;
+    const tickerParams = new URLSearchParams(tickerHref.split('?')[1]);
+    assert.equal(tickerParams.get('date'), status.latestDate);
+    assert.equal(tickerParams.get('dataVersion'), String(status.dataVersion));
+    assert.equal(tickerParams.get('symbol'), first.securityId);
+    const key = (value, extra = {}, target = document.body) => target.dispatchEvent(new win.KeyboardEvent('keydown', {
+      key: value, bubbles: true, cancelable: true, ...extra,
+    }));
+    assert.equal($('#context-bar').hidden, true);
+    click('#context-toggle');
+    assert.equal($('#detail #context-bar').hidden, false);
+    key(' ');
+    key('n');
+    assert.equal($('.chartbook-identity h2').textContent, first.symbol);
+    assert.equal($('#modal').open, false);
+    key('Escape', {}, document.activeElement);
+    await wait(() => $('#context-bar').hidden && document.activeElement.id === 'context-toggle', 'context drawer closes without changing the review');
+    key(' ');
+    await wait(() => $('.chartbook-identity h2')?.textContent === second.symbol && $('.chartbook-candle'), 'Space advances to prefetched security');
+    assert.equal($('.chartbook-subtitle strong').textContent, '2 / 2');
+    assert.equal(chartbookQueries.filter(({ url }) => url.pathname.includes(`/stocks/${encodeURIComponent(second.securityId)}`) && url.searchParams.get('lookback') === '126').length, 1);
+    if (first.securityId === unlisted.securityId) {
+      key(' ', { shiftKey: true });
+      await wait(() => $('.chartbook-identity h2')?.textContent === unlisted.symbol, 'navigate to the ticker outside the watchlist');
+    }
+    key('b');
+    await wait(() => $('[data-action="chartbook-bookmark"]')?.textContent.includes('Bookmarked'), 'B saves to the default watchlist');
+    key('b');
+    assert.equal(chartbookQueries.filter(({ url, method }) => method === 'POST' && url.pathname === `/api/v1/watchlists/${list.id}/members`).length, 1);
+    const bookmarked = (await request('/api/v1/watchlists').then((response) => response.json())).find(({ id }) => id === list.id);
+    assert.ok(bookmarked.definition.members.includes(unlisted.securityId));
+    if (first.securityId === unlisted.securityId) {
+      key(' ');
+      await wait(() => $('.chartbook-identity h2')?.textContent === second.symbol, 'return to the second ranked ticker');
+    }
+    key('n');
+    await wait(() => $('#modal [name="note"]') && !$('#modal [type="submit"]').disabled, 'N opens the pinned note');
+    key(' ', {}, $('#modal [name="note"]'));
+    assert.equal($('.chartbook-identity h2').textContent, second.symbol);
+    const text = 'Review <strong>volume</strong> before adding.';
+    set('#modal [name="note"]', text, 'input');
+    submit('#modal form');
+    await wait(() => !$('#modal [name="note"]'), 'note save and dialog close');
+    key('n');
+    await wait(() => $('#modal [name="note"]')?.value === text, 'saved note reopens as plain text');
+    assert.equal($('#modal [name="note"] strong'), null);
+    key('Escape', {}, $('#modal [name="note"]'));
+    await wait(() => !$('#modal [name="note"]'), 'Escape closes note dialog');
+    key('v');
+    await wait(() => $('[data-chartbook-actual-range]')?.textContent.includes('252 priced of 252 requested'), 'V opens the next longer timeframe');
+    key('m');
+    await wait(() => $('[data-chartbook-actual-range]')?.textContent.includes('63 priced of 63 requested'), 'M opens three months');
+    key(' ', { shiftKey: true });
+    await wait(() => $('.chartbook-identity h2')?.textContent === first.symbol, 'Shift-Space goes back');
+    click('[data-action="chartbook-range"][data-value="1260"]');
+    await wait(() => $('[data-chartbook-actual-range]')?.textContent.includes('of 1,260 requested sessions'), 'short listing is not shown as full 5Y');
+    assert.match($('[data-chartbook-actual-range]').textContent, /Listing history is shorter|Full range is unavailable/);
+  }
+
   await route('rankings', '#result-table tbody .stock-link');
-  assert.equal($('.results-head h2').textContent,'Ranking warehouse');
-  click('[data-action="ranking-list"][data-value="1m"]');
+  assert.equal(document.body.classList.contains('chartbook-route'), false);
+  assert.equal($('#context-bar').hidden, false);
+  assert.equal($('#context-toggle').hidden, true);
+  assert.equal($('.results-head h2').textContent, 'Ranking warehouse');
+  assert.equal($('.ranking-lists, .model-summary, [data-action="new-model"]'), null);
+  assert.ok($('#main a[href^="#settings"][href*="tab=config"]'));
+  await route('stocklists', '[data-action="ranking-list"][data-value="1m"][aria-pressed="true"]');
   await wait(() => $('#result-table thead')?.textContent.includes('Period rank') && $('#result-table .tradingview-link'), 'monthly leaders with direct chart action');
   assert.match($('.ranking-lists').textContent, /Live EOD.*completed daily publications/);
   assert.match($('#results-meta').textContent, /top 2(?:\.00)?% cutoff: .* comparable · 21 sessions/);
@@ -469,24 +641,46 @@ test('research workspace workflows use the published API and a copy of the local
   click('.ranking-lists [data-action="save-screen"]');
   set('#modal [name="name"]', savedLeaders);
   submit('#modal form');
-  await wait(() => $('.results-head h2')?.textContent === savedLeaders && $('#result-table .tradingview-link'), 'named live list saved with charts');
+  await wait(() => location.hash.startsWith('#stocklists?') && $('.results-head h2')?.textContent === savedLeaders && $('#result-table .tradingview-link'), 'named live list saved with charts');
   const savedRule = (await request('/api/v1/screens').then((response) => response.json())).find(({ name }) => name === savedLeaders);
   assert.deepEqual([savedRule.definition.rankingPeriod, savedRule.definition.topPercent, savedRule.definition.dateMode, savedRule.definition.members],
     ['1m', 10, 'latest', undefined]);
-  await route('rankings', '[data-change="ranking-list"]');
   set('[data-change="ranking-list"]', 'top-rs');
   await wait(() => $('.results-head h2')?.textContent === 'Top RS' && $('#results-meta')?.textContent.includes('qualify of'), 'model signal list');
-  set('[data-change="ranking-list"]', '');
-  await wait(() => $('.results-head h2')?.textContent === 'Ranking warehouse' && $('#result-table tbody'), 'return to composite model results');
-  click('[data-action="new-model"]');
+  set('[data-change="saved-stock-list"]', savedRule.id);
+  await wait(() => $('.results-head h2')?.textContent === savedLeaders && $('#results-meta')?.textContent.includes('top 10'), 'reopen saved list from catalog');
+  click('#main a[href^="#screens"]');
+  await wait(() => $('#main h1')?.textContent === 'Saved Screens' && $(`[data-action="open-screen"][data-value="${savedRule.id}"]`), 'saved list in canonical screen library');
+  click('#main a[href^="#stocklists"]');
+  await wait(() => $('#main h1')?.textContent === 'Stock Lists', 'catalog link from Saved Screens');
+  const legacy = new URLSearchParams({ period: '6m', topPercent: 10, date: status.latestDate, dataVersion: status.dataVersion });
+  location.hash = `#rankings?${legacy}`;
+  await wait(() => location.hash.startsWith('#stocklists?') && $('#results-meta')?.textContent.includes('126 sessions'), 'legacy period link opens the pinned list');
+  const legacySelection = new URLSearchParams(location.hash.split('?')[1]);
+  assert.equal(legacySelection.get('date'), status.latestDate);
+  assert.equal(legacySelection.get('dataVersion'), String(status.dataVersion));
+  location.hash = '#rankings';
+  await wait(() => $('.results-head h2')?.textContent === 'Ranking warehouse', 'return to ranking warehouse');
+  click('#main a[href^="#settings"][href*="tab=config"]');
+  await wait(() => $('[data-action="new-rank-model"]'), 'model management lives in settings');
+  click('[data-action="new-rank-model"]');
   set('#modal [name="name"]', savedModel);
   submit('#modal form');
-  await wait(() => !$('#modal').open && $('.model-summary h2')?.textContent === savedModel && $('#result-table tbody'), 'custom RS model');
+  await wait(() => !$('#modal').open && $('[data-change="context"][data-value="model"]')?.selectedOptions[0]?.textContent.includes(savedModel)
+    && $('.results-head h2')?.textContent === 'Ranking warehouse' && $('#result-table tbody'), 'custom RS model');
   set('[data-change="compare-model"]', 'composite');
   await wait(() => $('#result-table thead')?.textContent.includes('Comparison rank'), 'model comparison');
 
   await route('industries', '#main .panel');
   if (!expected.coverage.classifications) assert.match($('#main').textContent, /classification has no eligible groups/);
+  if ($('#main .group-heatmap-tile')) {
+    click('[data-action="group-view"][data-value="velocity"]');
+    assert.ok($('[data-action="leadership-window"][data-value="velocity4w"]'));
+    click('[data-action="leadership-window"][data-value="velocity12w"]');
+    assert.equal($('[data-action="leadership-window"][data-value="velocity12w"]').getAttribute('aria-pressed'), 'true');
+    assert.match($('#main').textContent, /change in the group’s RS percentile in points/);
+    click('[data-action="group-view"][data-value="table"]');
+  }
   if ($('#main [data-change="group-compare"]')) {
     const metrics = $('[data-change="group-chart"]');
     assert.equal(metrics.querySelector('[value="percentile"]').textContent, 'Group RS percentile');
@@ -549,7 +743,9 @@ test('research workspace workflows use the published API and a copy of the local
   click('[data-action="alerts-tab"][data-value="rules"]');
   assert.ok($$('.library-card h2').some((node) => node.textContent === savedAlert));
 
-  await route('settings', '.quality-facts');
+  await route('settings', '[data-action="settings-tab"][data-value="quality"]');
+  click('[data-action="settings-tab"][data-value="quality"]');
+  await wait(() => $('.quality-facts'), 'data quality settings');
   assert.match($('#quality-universe-coverage').textContent,/Source expected.*Source received.*Universe expected.*Universe received/s);
   assert.match($('#quality-universe-coverage').textContent,/Excluded from expected roster.*Excluded from received capture.*Unverified provider common/s);
   if (expected.coverage.subtypeCoverage?.unverifiedProviderCommon>0) {
@@ -749,7 +945,7 @@ test('research workspace workflows use the published API and a copy of the local
     recordDailyPublication(db, { date, rawVersion: base, dataRevision: base, models: [] });
     publish(base);
     await intervalHandlers[0](true);
-    await route('rankings', '[data-action="ranking-list"][data-value="1m"]');
+    await route('stocklists', '[data-action="ranking-list"][data-value="1m"]');
     click('[data-action="ranking-list"][data-value="1m"]');
     await wait(() => $('#result-table .tradingview-link') && rankingQueries.at(-1)?.revision === base, 'live leaders use ready revision');
     const compare = JSON.parse(win.sessionStorage.getItem('market-intelligence.analysis-revision'));

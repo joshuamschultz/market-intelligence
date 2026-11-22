@@ -8,12 +8,14 @@ import { buildInformation } from '../backend/server.mjs';
 import { propertyList, serviceConfiguration } from '../scripts/local-service.mjs';
 import { buildRelease, releaseFingerprint, setActiveRelease, validateRelease } from '../scripts/release.mjs';
 
+const fixtureVersion = '0.2.0';
+
 function testRelease(t) {
   const workspace = realpathSync(mkdtempSync(join(tmpdir(), 'market-release-')));
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
   const root = join(workspace, 'data', 'releases', 'fixture-r1');
   const entries = { 'backend/server.mjs': '// fixture', 'frontend/index.html': '<title>Market</title>',
-    'package.json': JSON.stringify({ version: '0.2.0' }) };
+    'package.json': JSON.stringify({ version: fixtureVersion }) };
   const files = Object.entries(entries).map(([path, contents]) => {
     mkdirSync(dirname(join(root, path)), { recursive: true });
     writeFileSync(join(root, path), contents);
@@ -32,6 +34,7 @@ test('managed configuration selects verified artifact code and keeps workspace w
   const cfg = serviceConfiguration(workspace);
   assert.equal(cfg.release.buildHash, manifest.fingerprint);
   assert.equal(release.root, root);
+  assert.equal(release.appVersion, fixtureVersion);
   const plist = propertyList(cfg);
   assert.ok(plist.includes(`<string>${join(root, 'backend/server.mjs')}</string>`));
   assert.ok(plist.includes(`<key>WorkingDirectory</key><string>${workspace}</string>`));
@@ -63,7 +66,7 @@ test('pointer and release validation reject unsigned content, conflicting finger
 test('release build inventories approved runtime directories and excludes workspace data', async (t) => {
   const { workspace } = testRelease(t);
   const source = {
-    'package.json': '{"type":"module","version":"0.2.0"}',
+    'package.json': JSON.stringify({ type: 'module', version: fixtureVersion }),
     'backend/server.mjs': 'export {};',
     'backend/database.mjs': 'export const CALCULATION_VERSION = "2-test";',
     'frontend/index.html': '<title>Market</title>',
@@ -71,12 +74,23 @@ test('release build inventories approved runtime directories and excludes worksp
     'scripts/check.mjs': 'export {};',
     'docs/readme.md': 'Release notes',
   };
-  for (const [path, contents] of Object.entries({ ...source, '.env': 'FIXTURE_ONLY=1', 'data/runtime.sqlite': 'fixture' })) {
+  const fixtureTest = `
+    import assert from 'node:assert/strict';
+    import { readFileSync, writeFileSync } from 'node:fs';
+    import test from 'node:test';
+    test('validates fixture runtime', () => {
+      assert.equal(readFileSync('backend/server.mjs', 'utf8'), 'export {};');
+      writeFileSync('data/release-test-ran', 'passed');
+    });
+  `;
+  const excluded = { 'tests/runtime.test.mjs': fixtureTest, '.env': 'FIXTURE_ONLY=1', 'data/runtime.sqlite': 'fixture' };
+  for (const [path, contents] of Object.entries({ ...source, ...excluded })) {
     const filename = join(workspace, path);
     mkdirSync(dirname(filename), { recursive: true });
     writeFileSync(filename, contents);
   }
   const release = await buildRelease(workspace, 'fixture-r2');
+  assert.equal(readFileSync(join(workspace, 'data/release-test-ran'), 'utf8'), 'passed');
   const manifest = JSON.parse(readFileSync(join(release.root, 'release-manifest.json'), 'utf8'));
   assert.deepEqual(manifest.files.map(({ path }) => path), Object.keys(source).sort());
   assert.equal(validateRelease(workspace, release.releaseId).buildHash, manifest.fingerprint);
@@ -86,7 +100,8 @@ test('release build inventories approved runtime directories and excludes worksp
 
 test('workspace build metadata identifies app and analytics without publishing local paths', async () => {
   const metadata = await buildInformation();
-  assert.equal(metadata.appVersion, '0.2.0');
+  const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(metadata.appVersion, version);
   assert.equal(metadata.deployment, 'workspace');
   assert.equal(metadata.releaseId, null);
   assert.match(metadata.buildHash, /^[a-f0-9]{64}$/);

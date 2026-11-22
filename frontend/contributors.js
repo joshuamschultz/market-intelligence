@@ -3,8 +3,8 @@ import {
   pending, percent, publishingHistory, safe, segment, summary, table,
 } from './ui.js';
 import { chart } from './charts.js';
+import { rangeSegment } from './chart-ranges.js';
 
-const ranges = [[20, '1M'], [63, '3M'], [126, '6M'], [252, '1Y']];
 const membership = [['numerator','Qualifiers'],['denominator','Comparable'],['excluded','Excluded']];
 const sides = [['numerator','Net contributors'],['advancers','Advancers'],['decliners','Decliners'],...membership.slice(1)];
 const columns = ['symbol','name','exchange','close','return_1d','rsPercentile','breadthSelection'];
@@ -53,7 +53,7 @@ export async function openBreadthDrawer(env, { key, date, title, universe, readi
     const node = body.querySelector('#breadth-trend-controls');
     if (!node?.isConnected) return;
     const markup = `<div class="inline-form breadth-trend-toolbar">
-      ${segment('breadth-drawer-range',ranges,range)}
+      ${rangeSegment('breadth-drawer-range',range)}
       ${field('Session',`<select data-breadth-session>${dates.map((value)=>option(value,dateLabel(value),selectedDate)).join('')}</select>`)}
       <label class="checkbox-label"><input type="checkbox" data-breadth-counts${showCounts?' checked':''}> Show counts</label></div>`;
     if (node.innerHTML !== markup) node.innerHTML = markup;

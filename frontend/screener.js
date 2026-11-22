@@ -35,7 +35,9 @@ const windowKinds = [['sessions', 'Trading sessions'], ['months', 'Calendar mont
 
 function definition(state, context) {
   const list = state.rankingPeriod || state.rankingList;
-  return { filter: state.filter, search: state.search, ...(list && !state.sortCustomized ? {} : { sort: state.sort }),
+  const filter = state.listFilter && activeRules(state.filter) ? { operator: 'and', filters: [state.listFilter, state.filter] }
+    : state.listFilter || state.filter;
+  return { filter, search: state.search, ...(list && !state.sortCustomized ? {} : { sort: state.sort }),
     columns: visibleColumns(state), ...(state.rankingPeriod ? { rankingPeriod: state.rankingPeriod, topPercent: state.topPercent } : {}),
     ...(state.rankingList ? { rankingList: state.rankingList } : {}),
     computed: state.computed, groupBy: state.groupBy, includeUntraded: state.includeUntraded,
@@ -364,11 +366,12 @@ function computedEditor(env, state, apply) {
 }
 
 function saveEditor(env, state, saved, prepareRanges) {
-  const target = env.showDialog(env.modal, saved ? 'Save screen version' : 'Save a screen', `<form class="stack">
+  const list = env.page === 'stocklists';
+  const target = env.showDialog(env.modal, list ? saved ? 'Save list version' : 'Save a stock list' : saved ? 'Save screen version' : 'Save a screen', `<form class="stack">
     ${field('Name', `<input name="name" required maxlength="100" value="${safe(saved?.name || '')}" placeholder="Emerging leaders">`)}
     <label class="checkbox-label"><input type="checkbox" name="fixed" ${env.context.date ? 'checked' : ''}> Pin the selected session</label>
-    <p class="muted">This screen stores filters, columns, sorting, and the current analysis context.</p>
-    <div class="form-error" role="alert" hidden></div><div><button class="button primary" type="submit">${icon('check')} Save screen</button></div></form>`);
+    <p class="muted">${list ? 'Saved Screens stores this list’s rules, table layout, and analysis context.' : 'This screen stores filters, columns, sorting, and the current analysis context.'}</p>
+    <div class="form-error" role="alert" hidden></div><div><button class="button primary" type="submit">${icon('check')} ${list ? 'Save list' : 'Save screen'}</button></div></form>`);
   target.onsubmit = async (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
@@ -387,7 +390,8 @@ function saveEditor(env, state, saved, prepareRanges) {
       env.modal.close();
       await env.reloadConfig();
       env.toast(`Saved ${result.name}`);
-      env.go('screener', { screen: result.id, ...savedScreenRoute(body.definition) });
+      env.go(list ? 'stocklists' : 'screener', { ...(list ? { rankList: null, period: null, rankingPeriod: null, rankingList: null, topPercent: null } : {}),
+        screen: result.id, ...savedScreenRoute(body.definition) });
     } catch (error) {
       const output = target.querySelector('.form-error');
       output.hidden = false;
@@ -455,10 +459,21 @@ export function modelEditor(env, existing = null) {
 
 export async function render(env) {
   const { main, state, context, params, config, signal } = env;
-  const ranking = env.page === 'rankings';
+  const stockLists = env.page === 'stocklists';
+  const warehouse = env.page === 'rankings';
+  const ranking = warehouse || stockLists;
+  const periods = config.rankingPeriods || [];
+  const modelLists = config.rankingLists || [];
+  const top100 = { id: 'top-100', label: 'Top 100 by RS rank', description: 'Stocks ranked 1–100 by the selected RS model.' };
+  const requested = params.rankList || params.period || params.rankingPeriod || params.rankingList;
+  const knownList = [...periods, ...modelLists, top100].some(({ id }) => id === requested);
+  if (warehouse && knownList) {
+    env.go('stocklists', { rankList: requested, topPercent: params.topPercent }, true);
+    return;
+  }
   const coverage = await env.api('market/breadth', { signal }).then((data) => data.coverage);
   if (!env.isActive()) return;
-  let saved = params.screen ? config.screens.find(({ id }) => id === params.screen) : null;
+  const saved = params.screen ? config.screens.find(({ id }) => id === params.screen) : null;
   if (params.screen !== state.screen || !state.columns) {
     const data = saved?.definition || {};
     Object.assign(state, { screen: params.screen, filter: data.filter || defaultFilter(), search: data.search || '',
@@ -468,12 +483,14 @@ export async function render(env) {
       customPeriods: { ...Object.fromEntries(Object.keys(periodLabels).map((key) => [key, listPeriods(data.context?.[key])])),
         rangeWindows: usedRangeWindows(data) } });
   }
-  const selectedList = ranking ? params.rankList : saved?.definition?.rankingPeriod || saved?.definition?.rankingList;
-  const period = config.rankingPeriods?.find(({ id }) => id === selectedList);
-  const rankList = config.rankingLists?.find(({ id }) => id === selectedList);
-  const topPercent = Number(ranking ? params.topPercent || 2 : saved?.definition?.topPercent ?? 2);
-  if (state.rankingPeriod !== period?.id || state.rankingList !== rankList?.id || state.topPercent !== topPercent) state.page = 1;
-  Object.assign(state, { rankingPeriod: period?.id, rankingList: rankList?.id, topPercent });
+  const selectedList = saved ? saved.definition?.rankingPeriod || saved.definition?.rankingList
+    : stockLists ? knownList ? requested : periods.find(({ id }) => id === '1m')?.id || periods[0]?.id || top100.id : null;
+  const period = periods.find(({ id }) => id === selectedList);
+  const rankList = modelLists.find(({ id }) => id === selectedList);
+  const topPercent = Number((stockLists && !saved ? params.topPercent : saved?.definition?.topPercent) || 2);
+  if (state.activeList !== selectedList || state.topPercent !== topPercent) state.page = 1;
+  Object.assign(state, { activeList: selectedList, rankingPeriod: period?.id, rankingList: rankList?.id, topPercent,
+    listFilter: selectedList === top100.id ? { field: 'rsRank', op: 'lte', value: 100 } : null });
   state.customPeriods = { ...periodDefaults(), ...state.customPeriods };
   registerPeriods(state.customPeriods);
   const contextKey = JSON.stringify(context);
@@ -481,11 +498,6 @@ export async function render(env) {
     state.page = 1;
     state.selected.clear();
     state.contextKey = contextKey;
-  }
-  let model = config.models.find(({ id }) => id === context.model);
-  if (ranking && context.modelVersion && Number(context.modelVersion) !== model?.version) {
-    model = await env.api(`ranking-models/${pathPart(context.model)}`, { params: { version: context.modelVersion }, plain: true, signal });
-    if (!env.isActive()) return;
   }
   let request = 0;
   let queryController;
@@ -502,33 +514,35 @@ export async function render(env) {
     if (state.sortCustomized || !period && !rankList) return state.sort;
     return [{ field: period ? 'periodRank' : rankList.rankField, direction: rankList?.direction || 'asc' }];
   }
+  const openList = (value) => env.go('stocklists', { screen: null, rankList: value || null, period: null, rankingPeriod: null, rankingList: null });
   function draw() {
     const rankDescription = `Rank 1 is strongest. Percentiles are relative to the comparable securities in the selected universe.`;
     const replay = context.date || context.dataVersion;
-    const visibleName = period ? `${period.label} leaders` : rankList?.label;
+    const visibleName = period ? `${period.label} price leaders` : rankList?.label || (selectedList === top100.id ? top100.label : null);
     const timing = replay ? 'Historical replay · pinned session or data revision' : 'Live EOD · follows completed daily publications';
     const listDescription = period ? `Ranked by split-adjusted return over ${period.sessions} trading sessions. Filters apply after period ranks are assigned.`
-      : rankList?.description || 'Ranks use the selected RS model.';
-    main.innerHTML = heading(ranking ? 'RS Rankings' : 'Stock Screener', ranking ? rankDescription : 'Filter, rank, and compare securities in a historical session.',
-      ranking ? action('Build model', 'new-model', 'plus', { className: 'primary' }) : action('Save view', 'save-screen', 'screens', { className: 'primary' })) +
+      : rankList?.description || (selectedList === top100.id ? top100.description : 'Results use the saved screen definition.');
+    main.innerHTML = heading(stockLists ? 'Stock Lists' : warehouse ? 'RS Rankings' : 'Stock Screener',
+      stockLists ? 'Price leaders, RS signals, and saved lists.' : warehouse ? rankDescription : 'Filter, rank, and compare securities in a historical session.',
+      warehouse ? `<a class="button" href="${safe(env.routeUrl('settings', { tab: 'config' }))}">${icon('settings')} Manage RS models</a>`
+        : stockLists ? `<a class="button" href="${safe(env.routeUrl('screens'))}">${icon('screens')} Saved Screens</a>`
+          : action('Save view', 'save-screen', 'screens', { className: 'primary' })) +
       partialCoverage(coverage, env.routeUrl) +
-      (ranking ? `<section class="panel panel-body ranking-lists">${panelHead('RS stock lists', timing, action('Save list', 'save-screen', 'screens'))}
+      (stockLists ? `<section class="panel panel-body ranking-lists">${panelHead('Select a list', timing, action('Save list', 'save-screen', 'screens'))}
         <div class="query-options"><div><p class="muted">Period return leaders</p>${segment('ranking-list',
-          (config.rankingPeriods || []).map(({ id, label }) => [id, label]), period?.id)}</div>
+          periods.map(({ id, label }) => [id, label]), saved ? null : period?.id)}</div>
           <label class="field">RS model lists<select data-change="ranking-list">
-          ${period ? option('','Select an RS model list','') : option('', 'Composite / selected RS model', selectedList || '')}
-          ${period ? option('composite', 'Composite / selected RS model', selectedList) : ''}
-          ${(config.rankingLists || []).map(({ id, label }) => option(id, label, selectedList)).join('')}
+          ${option('', 'Select an RS model list', saved || period ? '' : selectedList)}
+          ${[top100, ...modelLists].map(({ id, label }) => option(id, label, saved ? null : selectedList)).join('')}
         </select></label>
-        ${period ? `<form id="rs-cutoff-form" class="inline-stack"><label class="field">Top percent<input name="cutoff" type="number" min="0.1" max="100" step="any" required value="${safe(topPercent)}"></label>
+        ${config.screens.length ? `<label class="field">Saved lists<select data-change="saved-stock-list">
+          ${option('', 'Select a saved list', saved?.id || '')}${config.screens.map(({ id, name }) => option(id, name, saved?.id)).join('')}
+        </select></label>` : ''}
+        ${period && !saved ? `<form id="rs-cutoff-form" class="inline-stack"><label class="field">Top percent<input name="cutoff" type="number" min="0.1" max="100" step="any" required value="${safe(topPercent)}"></label>
           <button class="button" type="submit">Apply cutoff</button></form>` : ''}</div><p class="muted">${safe(listDescription)}</p>
       </section>` : '') +
-      (ranking ? `<section class="panel model-summary">${panelHead(model?.name || 'Ranking model',
-        `${methodLabels[model?.definition?.method] || 'Custom scoring'} · ${model?.definition?.priceMode === 'total' ? 'Total return' : 'Split-adjusted'} · version ${context.modelVersion || model?.version || 1}`,
-        action(['composite','short-momentum','benchmark-relative'].includes(model?.id) ? 'Copy model' : 'Edit model', 'edit-model', 'edit'))}
-        <div class="inline-stack">${(model?.definition?.windows || []).map((row) => chip(`${row.kind === 'fixed' ? `${row.start}–${row.end}` : row.kind === 'ytd' ? 'YTD' : `${row.length} ${row.kind}`}${row.offset ? ` · lag ${row.offset}` : ''} · ${number(row.weight * 100, 0)}%`)).join('')}</div></section>` : '') +
       `<section class="panel workplace-table">
-        <header class="results-head"><div><h2>${safe(saved?.name || visibleName || (ranking ? 'Ranking warehouse' : 'Security results'))}</h2><p id="results-meta" class="muted"></p></div>
+        <header class="results-head"><div><h2>${safe(saved?.name || visibleName || (warehouse ? 'Ranking warehouse' : 'Security results'))}</h2><p id="results-meta" class="muted"></p></div>
         <div class="actions" id="selection-tools"></div></header>
         <div class="query-toolbar">
           <label class="search-field">${icon('search')}<span class="sr-only">Search stocks</span><input type="search" id="security-search" value="${safe(state.search)}" placeholder="Ticker, company, industry"></label>
@@ -552,7 +566,7 @@ export async function render(env) {
     const cutoff = main.querySelector('#rs-cutoff-form');
     if (cutoff) cutoff.onsubmit = (event) => {
       event.preventDefault();
-      env.go('rankings', { topPercent: new FormData(cutoff).get('cutoff') });
+      env.go('stocklists', { topPercent: new FormData(cutoff).get('cutoff') });
     };
     search.oninput = () => {
       clearTimeout(searchTimer);
@@ -768,9 +782,7 @@ export async function render(env) {
     },
     page: (value) => update({}, { redraw: false, page: Number(value) }),
     'retry-screen': () => load(),
-    'new-model': () => modelEditor(env),
-    'edit-model': () => modelEditor(env, model),
-    'ranking-list': (value) => env.go('rankings', { rankList: value || null }),
+    'ranking-list': openList,
     'save-screen': () => saveEditor(env, state, saved, prepareRanges),
     'export-screen': (format = 'csv') => env.exportFile('screens/query', { body: { ...definition(state, context), export: format } }, `stock-screener.${format}`),
     'add-selected': () => env.openAddWatchlist([...state.selected]),
@@ -795,7 +807,12 @@ export async function render(env) {
     'change:screen-preset': (value) => value && update({ filter: structuredClone(preset[value] || defaultFilter()) }),
     'change:include-untraded': (value, box) => update({ includeUntraded: box.checked }),
     'change:compare-model': (value) => update({ compareModel: value }),
-    'change:ranking-list': (value) => env.go('rankings', { rankList: value === 'composite' ? null : value || null }),
+    'change:ranking-list': openList,
+    'change:saved-stock-list': (id) => {
+      const screen = config.screens.find((item) => item.id === id);
+      if (screen) env.go('stocklists', { screen: id, ...savedScreenRoute(screen.definition) });
+      else openList(null);
+    },
   });
   draw();
   await load();

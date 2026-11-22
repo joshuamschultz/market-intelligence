@@ -3,6 +3,7 @@ import {
   number, numeric, option, panelHead, pathPart, pending, percent, publishingHistory, safe, segment, summary,
 } from './ui.js';
 import { chart } from './charts.js';
+import { chartRanges } from './chart-ranges.js';
 
 const entryPath = (date) => `journal/entries/${pathPart(date)}`;
 const promptText = (item) => item?.prompt ?? item?.definition?.prompt ?? '';
@@ -478,7 +479,7 @@ function forwardResults(result, env) {
 
 export async function mountJournalHistory(env, target, { firstDate, lastDate }) {
   const options = env.state.journalAnalytics ||= {
-    metric:'market_health',overlay:'benchmarkClose',retrospective:false,limit:120,priceBasis:'known',
+    metric:'market_health',overlay:'benchmarkClose',retrospective:false,limit:126,priceBasis:'known',
   };
   const scope = { universe:env.snapshotContext.universe, universeVersion:env.snapshotContext.universeVersion,
     basis:env.snapshotContext.basis, asOf:lastDate };
@@ -536,7 +537,7 @@ export async function mountJournalHistory(env, target, { firstDate, lastDate }) 
         ${field('Factor',`<select name="metric">${[...labels].map(([key,label])=>option(key,label,options.metric)).join('')}</select>`)}
         ${field('Overlay',`<select name="overlay">${option('','Journal factor only',options.overlay)}
           ${[...overlayLabels].map(([key,label])=>option(key,label,options.overlay)).join('')}</select>`)}
-        ${field('Trading sessions',`<select name="limit">${[30,63,120,252].map((n)=>option(n,`${n} sessions`,options.limit)).join('')}</select>`)}
+        ${field('Trading sessions',`<select name="limit">${chartRanges.map(([n, label])=>option(n,`${label} · ${n} sessions`,options.limit)).join('')}</select>`)}
         <button class="button primary" type="submit">Apply overlay</button>
       </form><div id="journal-overlay-plot" class="section-space">${pending()}</div></section>
       <section class="panel panel-body">${panelHead('Backtest a journal signal','Historical benchmark returns after an available signal meets your threshold.')}
@@ -580,7 +581,9 @@ export async function mountJournalHistory(env, target, { firstDate, lastDate }) 
     if (options.overlay && base.length) series.push({ key:'overlay',
       label:options.overlay==='benchmarkClose' ? `${env.context.benchmark} close` : overlayLabels.get(options.overlay),
       format:options.overlay==='benchmarkClose' ? money : percent, axis:'right', color:'#84a9fa' });
-    plot.innerHTML = (hasSignals || base.length ? chart(data,series,{height:235,domain:options.metric==='sentiment_score'?[-1,1]:['market_health','confidence'].includes(options.metric)?[0,10]:undefined}) :
+    const overlayDomain = !options.overlay || options.overlay === 'benchmarkClose' ? undefined : options.overlay === 'adSpread' ? [-100, 100] : [0, 100];
+    plot.innerHTML = (hasSignals || base.length ? chart(data,series,{height:235,domain:options.metric==='sentiment_score'?[-1,1]:['market_health','confidence'].includes(options.metric)?[0,10]:undefined,
+      ...(series.length > 1 && { rightDomain: overlayDomain, rightAxisFormat: overlayDomain ? percent : undefined })}) :
       empty('No available journal signals','The selected recipe has no comparable reports available by this session.','journal'))
       + (availability ? `<div class="section-space">${availability}</div>` : '')
       + (upcoming ? `<p class="muted section-space">${count(upcoming)} ${upcoming === 1 ? 'report has' : 'reports have'} a first tradable session beyond the loaded prices.</p>` : '')

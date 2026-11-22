@@ -23,10 +23,12 @@
         <a href="#monitor" data-route="monitor" data-icon="pulse">Market Monitor</a>
         <a href="#screener" data-route="screener" data-icon="screener">Stock Screener</a>
         <a href="#rankings" data-route="rankings" data-icon="rankings">RS Rankings</a>
+        <a href="#stocklists" data-route="stocklists" data-icon="screens">Stock Lists</a>
         <a href="#industries" data-route="industries" data-icon="industries">Industries</a>
         <a href="#history" data-route="history" data-icon="history">Historical Explorer</a>
         <a href="#journal" data-route="journal" data-icon="journal">Market Journal</a>
         <div class="nav-group">Workspace</div>
+        <a href="#chartbook" data-route="chartbook" data-icon="chart">ChartBook</a>
         <a href="#screens" data-route="screens" data-icon="screens">Saved Screens</a>
         <a href="#watchlists" data-route="watchlists" data-icon="watchlists">Watchlists</a>
         <a href="#alerts" data-route="alerts" data-icon="alerts">Alerts</a>
@@ -42,14 +44,15 @@
         <button class="icon-button menu-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar" data-icon="menu"></button>
         <div class="breadcrumb"><span data-icon="overview"></span><span>Workspace</span><span class="crumb-separator">/</span><strong id="breadcrumb-page">Market Overview</strong></div>
         <button id="ticker-search" class="button ticker-search" type="button" aria-label="Search workspace" aria-haspopup="dialog" aria-keyshortcuts="/ Meta+K Control+K"><span data-icon="search"></span><span>Search workspace</span><kbd>/</kbd></button>
+        <button id="context-toggle" class="button" type="button" data-action="open-context" data-icon="screener" aria-haspopup="dialog" aria-controls="detail" aria-expanded="false" hidden>Context</button>
         <button id="context-help" class="icon-button context-help" type="button" aria-haspopup="dialog" aria-label="Help for Market Overview" title="Help for Market Overview">?</button>
         <div id="data-badge" class="status" role="status"><span class="status-dot"></span> Checking data</div>
       </header>
       <div class="context-bar" id="context-bar" aria-label="Analysis context"></div>
       <main id="main" tabindex="-1"><div class="pending" role="status">Loading the workspace…</div></main>
-      <footer class="workspace-footer" aria-label="Application and warehouse status">
-        <div id="footer-build" class="footer-facts">Checking build</div>
-        <div id="footer-data" class="footer-facts">Checking warehouse</div>
+      <footer class="workspace-footer" aria-label="Application and warehouse status" tabindex="0">
+        <div id="footer-build" class="footer-facts">Checking app version</div>
+        <div id="footer-data" class="footer-facts" aria-live="polite">Checking analysis</div>
         <a id="footer-jobs" class="text-link" href="#settings?tab=jobs">Data &amp; jobs</a>
       </footer>
     </div>

@@ -3,9 +3,11 @@ import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { JSDOM } from 'jsdom';
+import { marketUniverses } from '../frontend/coverage.js';
 
 const html = await readFile(new URL('../frontend/index.html', import.meta.url), 'utf8');
 const guide = await readFile(new URL('../frontend/help-content.json', import.meta.url), 'utf8');
+const stylesheet = await readFile(new URL('../frontend/styles.css', import.meta.url), 'utf8');
 
 test('workspace search, route help, backdrop dismissal, and preparation preserve active context', async (t) => {
   const host = 'http://localhost';
@@ -24,6 +26,7 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
   const records = [];
   let healthPrepared = false;
   let breadthQueued = true;
+  let activeJobs = [];
   const screens = [{ id: 'income', name: 'Income candidates', definition: {} }];
   const watchlists = [{ id: 'leaders', name: 'Commanders list', definition: { members: [] } }];
   const status = { latestDate: '2026-11-20', dataVersion: 19, state: 'available', calculationVersion: '2',
@@ -31,7 +34,7 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
     runs: [{ dataset: 'bulk-eod', provider: 'eodhd', status: 'complete', scope: 'full', dates: ['2026-11-20', '2026-11-20'],
       rows: 5000, imported: 4999, detail: { invalid: 0, unresolved: 0 }, finishedAt: '2026-11-20T22:00:00Z' }] };
   const config = { status, automaticPreparation: true, availableBenchmarks: ['SPY', 'VTI'],
-    benchmarks: ['SPY', 'VTI'], universes: [{ id: 'us-extended', name: 'US extended', version: 1 }],
+    benchmarks: ['SPY', 'VTI'], universes: marketUniverses.map(({ id, name }) => ({ id, name, version: 1 })),
     models: [{ id: 'composite', name: 'Composite RS', version: 1 }], classificationSystems: ['provider', 'sec-sic'] };
   async function request(path, options = {}) {
     const url = new URL(path, host);
@@ -43,14 +46,17 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
       case '/help-content.json': return new Response(guide);
       case '/api/v1/config': return respond(config);
       case '/api/v1/data/status': return respond(status);
-      case '/api/v1/build': return respond({ appVersion: '0.2.0', version: '2.token', releaseId: 'release-r2',
+      case '/api/v1/build': return respond({ appVersion: '0.2.1', version: '2.token', releaseId: 'release-r2',
         buildHash: 'abcdef123', calculationVersion: '2', builtAt: '2026-11-21T01:00:00Z', deployment: 'preview' });
       case '/api/v1/screens': return respond(screens);
+      case '/api/v1/chartbooks': return respond({ books: [], builtins: [], screens, watchlists });
       case '/api/v1/watchlists': return respond(watchlists);
       case '/api/v1/watchlists/leaders/members': return respond({ rows: [], total: 0, page: 1, perPage: 50 });
-      case '/api/v1/jobs': return respond([]);
-      case '/api/v1/market/overview': return respond({ date, benchmark: 'VTI', breadth: {}, aggregates: {},
-        model: { name: 'Composite RS' }, coverage: { state: 'complete' }, preparation: { preparationState: 'unregistered' } });
+      case '/api/v1/jobs': return respond(activeJobs);
+      case '/api/v1/market/overview': return respond({ date: url.searchParams.get('date') || date, benchmark: 'VTI',
+        breadth: { above_50d: { numerator: 5, denominator: 8, value: 62.5 } }, aggregates: {},
+        dataVersion: Number(url.searchParams.get('dataVersion') || status.dataVersion), model: { name: 'Composite RS' },
+        coverage: { state: 'complete', listed: 10, traded: 8, ranked: 6 }, preparation: { preparationState: 'unregistered' } });
       case '/api/v1/market/health': return respond(healthPrepared
         ? { state: 'available', score: 57, components: [], history: [{ date, score: 57 }] }
         : { state: 'unprepared', components: [], materialization: { prepareAction: 'health' },
@@ -70,7 +76,8 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
             ...(query === 'oldtest' && { matchedAlias: 'OLDTEST' }) }] : [] });
       }
       case '/api/v1/stocks/fixture%3ATEST': return respond({ symbol: 'TEST', name: 'Fixture Company', securityId: 'fixture:TEST',
-        exchange: 'NYSE', date, dataVersion: 11, chartBars: [] });
+        exchange: 'NYSE', date: url.searchParams.get('date') || status.latestDate,
+        dataVersion: Number(url.searchParams.get('dataVersion') ?? status.dataVersion), chartBars: [] });
       default: return respond({ error: 'Fixture route unavailable' }, 404);
     }
   }
@@ -113,11 +120,37 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
   };
 
   await import('../frontend/app.js');
-  await until(() => $('[data-action="prepare-context"]') && $('#footer-build').textContent.includes('release-r2'), 'initial replay context');
+  await until(() => $('[data-action="prepare-context"]') && $('#footer-build').textContent.includes('App v0.2.1'), 'initial replay context');
+  const sharedContext = $('#context-bar');
+  const contextToggle = $('#context-toggle');
+  assert.equal(sharedContext.hidden, false);
+  assert.equal(contextToggle.hidden, true);
   assert.equal(posts().length, 0);
-  assert.match($('#footer-build').textContent, /App v0\.2\.0.*Build abcdef123.*Calculation 2.*preview/);
-  assert.match($('#footer-data').textContent, /Prices through Nov 20, 2026.*View Nov 18, 2026.*View revision 11 \/ warehouse 19.*3 calculations queued/);
+  assert.deepEqual([...document.querySelectorAll('#footer-build span, #footer-data span')].map((element) => element.textContent),
+    ['App v0.2.1', 'Built Nov 21, 2026', 'Prices through Nov 20, 2026', 'Last import Nov 20, 2026', 'Analysis preparing']);
+  assert.doesNotMatch($('.workspace-footer').textContent, /release-r2|abcdef123|Calculation 2|preview|revision|queued|failed/i);
+  const style = document.createElement('style');
+  style.textContent = stylesheet;
+  document.head.append(style);
+  const footerStyle = window.getComputedStyle($('.workspace-footer'));
+  assert.equal(footerStyle.flexWrap, 'nowrap');
+  assert.equal(footerStyle.whiteSpace, 'nowrap');
+  assert.equal(footerStyle.overflowX, 'auto');
+  style.remove();
+  assert.equal($('#historical-replay').hidden, false);
+  assert.match($('#historical-replay').textContent, /Historical replay · Nov 18, 2026.*Return to latest/s);
   assert.equal(new URL($('#footer-jobs').href).hash.includes('dataVersion='), false);
+  assert.equal($('[data-value="classification"]').getAttribute('aria-label'), 'Industry data');
+  assert.match($('#context-price-source').textContent, /Prices: EODHD/);
+  const fetchStart = records.length;
+  const coverageOpener = $('[data-action="universe-counts"]');
+  coverageOpener.click();
+  await until(() => $('#detail [data-universe-count="us-core"] [data-count="eligible"]')?.textContent === '10', 'opens dated universe counts');
+  const countReads = records.slice(fetchStart).filter(({ path }) => path === '/api/v1/market/overview');
+  assert.equal(countReads.length, 7);
+  assert.ok(countReads.every(({ params, body }) => params.date === date && params.dataVersion === '11' && !body));
+  key(document.activeElement, 'Escape');
+  await until(() => !$('#detail').open && document.activeElement === coverageOpener, 'universe counts restores focus');
 
   const dateInput = $('[data-value="date"]');
   key(dateInput, 'k', { ctrlKey: true });
@@ -184,6 +217,7 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
   assert.equal(tickerParams.get('date'), date);
   assert.equal(tickerParams.get('dataVersion'), '11');
   assert.equal(tickerParams.get('benchmark'), 'VTI');
+  assert.equal($('#historical-replay').hidden, false, 'replay remains visible on the ticker');
   assert.equal(posts().length, 0, 'render and navigation did not register preparation');
   window.history.back();
   await until(() => window.location.hash.startsWith('#overview?') && $('[data-action="prepare-context"]'), 'replay retained after back');
@@ -224,6 +258,12 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
 
   window.location.hash = `#overview?${params}&tab=health&coverage=observed`;
   await until(() => $('[data-action="check-health-readiness"]'), 'queued breadth prerequisite is actionable');
+  const reading = [...$('main').querySelectorAll('section h2')].find((node) => node.textContent === 'Market reading')?.closest('section');
+  assert.match(reading?.textContent, /62\.5%.*5 of 8 comparable/s);
+  assert.ok(reading.compareDocumentPosition($('#current-health')) & window.Node.DOCUMENT_POSITION_FOLLOWING);
+  assert.match($('#health-coverage-policy').textContent, /Observed universe/);
+  assert.equal($('#overview-data-notes').open, false);
+  assert.match($('#current-health').textContent, /Composite score unavailable/);
   assert.match($('#health-chart').textContent, /Breadth history is queued/);
   assert.equal(records.some(({ path }) => path === '/api/v1/jobs/breadth-prerequisite'), false);
   const healthPosts = () => records.filter(({ path }) => path === '/api/v1/market/health/prepare');
@@ -244,19 +284,74 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
 
   $('#footer-jobs').click();
   await until(() => $('#preparation-progress')?.textContent.includes('Raw warehouse revision 19'), 'jobs use latest warehouse status');
+  assert.equal(sharedContext.hidden, true);
+  assert.equal(contextToggle.hidden, false);
+  const beforeContextOpen = records.length;
+  contextToggle.click();
+  assert.equal($('#detail #context-bar'), sharedContext);
+  assert.equal(sharedContext.hidden, false);
+  assert.equal(contextToggle.getAttribute('aria-expanded'), 'true');
+  assert.equal(document.activeElement.dataset.value, 'universe');
+  assert.equal(records.length, beforeContextOpen, 'opening the existing controls makes no request');
+  key(document.activeElement, 'Escape');
+  await until(() => sharedContext.hidden && document.activeElement === contextToggle, 'context Escape restores compact mode and focus');
   $('[data-action="settings-tab"][data-value="quality"]').click();
   await until(() => $('#import-rows'), 'latest import receipts');
   assert.match($('#import-rows').textContent, /Nov 20, 2026.*Daily prices \(all tickers\).*Market-wide capture.*4,999 new or updated · 1 unchanged/s);
   await until(() => !$('main').hasAttribute('aria-busy'), 'workspace view settled');
   assert.equal(records.filter(({ path }) => path === '/api/v1/data/status').length, 1, 'footer reuses warehouse status poll');
+  const previousJobs = posts().length;
+  $('[data-action="settings-tab"][data-value="config"]').click();
+  await until(() => $('[data-settings-universe-count="us-core"]')?.textContent.includes('Eligible10'), 'settings list shows saved counts');
+  assert.match($('[data-settings-universe-count="us-core"]').parentElement.textContent, /Operating common stocks on NYSE and Nasdaq/);
+  assert.equal(posts().length, previousJobs, 'opening settings does not queue analytics');
+  status.preparation.current = { phase: 'recent', progress: 32 };
+  status.latestAnalysis = { date: status.latestDate, dataVersion: 19 };
+  contextToggle.click();
+  $('[data-action="refresh"]').click();
+  await until(() => $('#data-badge').textContent.includes('Historical backfill · 32%'), 'backfill remains visible in the header');
+  const footerReadiness = () => $('#footer-data span:last-child').textContent;
+  assert.equal(footerReadiness(), 'Analysis preparing');
+  assert.doesNotMatch($('#data-badge').textContent, /Current ready/);
+
+  const ordinaryPlan = status.preparation;
+  const complete = { total: 1, complete: 1, queued: 0, running: 0, failed: 0, superseded: 0 };
+  status.preparation = { dataVersion: 19, total: 3, complete: 3, phases: { current: complete, recent: complete, history: complete } };
+  status.currentReadiness = { state: 'ready', date: status.latestDate, dataVersion: 19 };
+  const verifyFooter = async (text, label) => {
+    $('[data-action="refresh"]').click();
+    await until(() => footerReadiness() === text, label);
+  };
+  await verifyFooter('Analysis incomplete', 'daily publication and job completion alone do not certify full analysis');
+  status.analysisReadiness = { state: 'ready', date: status.latestDate, dataVersion: 19, calculationVersion: '2' };
+  status.preparation.phases.history = { ...complete, complete: 0, queued: 1 };
+  await verifyFooter('Analysis preparing', 'pending historical work blocks ready');
+  status.preparation.phases.history = { ...complete, complete: 0, failed: 1 };
+  await verifyFooter('Analysis incomplete', 'failed historical work blocks ready');
+  assert.doesNotMatch($('.workspace-footer').textContent, /failed|failure/i);
+  status.preparation.phases.history = complete;
+  await verifyFooter('Current analysis ready', 'exact full-generation completion is accepted');
+  activeJobs = [{ id: 'external-build', type: 'optimized-five-year', status: 'building' }];
+  await verifyFooter('Analysis preparing', 'active external analysis blocks ready');
+  activeJobs = [];
+  status.analysisReadiness.calculationVersion = 'old-calculation';
+  await verifyFooter('Analysis incomplete', 'a prior calculation generation does not certify current analysis');
+  status.preparation = ordinaryPlan;
+  delete status.analysisReadiness;
+  delete status.currentReadiness;
+  key(document.activeElement, 'Escape');
+  await until(() => !$('#detail').open, 'workspace context drawer closes after readiness checks');
 
   status.latestAnalysis = { date: status.latestDate, dataVersion: 11 };
   window.location.hash = `#watchlists?${params.replace('dataVersion=11', 'dataVersion=19')}`;
   await until(() => $('main h1')?.textContent === 'Watchlists' && !$('main').hasAttribute('aria-busy'), 'pinned watchlists');
   assert.equal($('[data-action="apply-data"]'), null, 'older publication does not offer a downgrade');
+  let reportedVersion;
+  document.addEventListener('warehouse:status', (event) => { reportedVersion = event.detail.dataVersion; });
   status.dataVersion = 20;
   $('[data-action="refresh"]').click();
-  await until(() => $('#footer-data').textContent.includes('warehouse 20'), 'raw revision recorded');
+  await until(() => reportedVersion === 20, 'raw revision recorded');
+  assert.doesNotMatch($('.workspace-footer').textContent, /revision|warehouse 20/i);
   assert.equal($('[data-action="apply-data"]'), null, 'new raw but unprepared data does not offer an update');
   status.latestAnalysis = { date: status.latestDate, dataVersion: 20 };
   $('[data-action="refresh"]').click();
@@ -274,4 +369,53 @@ test('workspace search, route help, backdrop dismissal, and preparation preserve
   await until(() => JSON.parse(window.sessionStorage.getItem('market-intelligence.analysis-revision')).dataVersion === 20
     && !new URLSearchParams(window.location.hash.split('?')[1]).has('dataVersion'), 'new ready revision applied');
   assert.equal(new URLSearchParams(window.location.hash.split('?')[1]).get('date'), date, 'the historical session stays pinned');
+
+  const tickerRequests = () => records.filter(({ path }) => path === '/api/v1/stocks/fixture%3ATEST');
+  const hashParams = () => new URLSearchParams(window.location.hash.split('?')[1]);
+  window.location.hash = `#stock?${params}&symbol=fixture%3ATEST`;
+  await until(() => $('#ticker-dashboard') && !$('#historical-replay').hidden, 'ticker historical replay');
+  status.dataVersion = 22;
+  status.latestAnalysis = { date: status.latestDate, dataVersion: 21 };
+  $('#historical-replay [data-action="current"]').click();
+  await until(() => $('#historical-replay').hidden && tickerRequests().at(-1)?.params.dataVersion === '21'
+    && !$('main').hasAttribute('aria-busy'), 'latest ticker uses fresh prepared revision');
+  assert.equal(hashParams().has('date'), false);
+  assert.equal(hashParams().get('symbol'), 'fixture:TEST');
+  assert.equal(hashParams().get('universe'), 'us-extended');
+  assert.equal(hashParams().get('model'), 'composite');
+  assert.equal(hashParams().get('benchmark'), 'VTI');
+  assert.equal($('[data-action="apply-data"]'), null, 'a newer raw revision is not offered as prepared ticker data');
+
+  window.location.hash = `#stock?${params.replace('dataVersion=11', 'dataVersion=22')}&symbol=fixture%3ATEST`;
+  await until(() => !$('#historical-replay').hidden && tickerRequests().at(-1)?.params.date === date
+    && !$('main').hasAttribute('aria-busy'), 'higher pinned receipt before return');
+  status.latestAnalysis = { date: status.latestDate, dataVersion: 11 };
+  $('#historical-replay [data-action="current"]').click();
+  await until(() => $('#historical-replay').hidden && !hashParams().has('date') && !$('main').hasAttribute('aria-busy'),
+    'return preserves a newer pinned receipt when preparation status is stale');
+  assert.equal(hashParams().get('dataVersion'), '22');
+  assert.equal(tickerRequests().at(-1).params.dataVersion, '22');
+
+  window.location.hash = `#chartbook?${params}&book=journal-review&symbol=fixture%3ATEST`;
+  await until(() => $('[data-chartbook]') && sharedContext.hidden && !contextToggle.hidden, 'ChartBook starts without the context bar');
+  contextToggle.click();
+  assert.equal($('#detail #context-bar'), sharedContext);
+  change('#detail [data-change="context"][data-value="benchmark"]', 'SPY');
+  await until(() => hashParams().get('benchmark') === 'SPY' && sharedContext.hidden && !$('#detail').open, 'changing drawer context restores compact mode');
+  assert.equal(hashParams().get('symbol'), 'fixture:TEST');
+  assert.equal(hashParams().get('book'), 'journal-review');
+  assert.equal(hashParams().get('date'), date);
+  assert.equal(hashParams().get('dataVersion'), '11');
+  contextToggle.click();
+  $('#detail [data-action="universe-counts"]').click();
+  await until(() => $('#detail [data-universe-count="us-core"]') && sharedContext.hidden, 'replacing the drawer restores the context bar');
+  assert.equal(contextToggle.getAttribute('aria-expanded'), 'false');
+  key(document.activeElement, 'Escape');
+  await until(() => !$('#detail').open && document.activeElement === contextToggle, 'replacement closes back to the compact control');
+
+  contextToggle.click();
+  window.location.hash = `#overview?${params}`;
+  await until(() => $('#main h1')?.textContent === 'Market Overview' && !sharedContext.hidden && contextToggle.hidden, 'analysis route restores inline context');
+  assert.equal(document.querySelectorAll('#context-bar').length, 1);
+  assert.equal($('.workspace > #context-bar'), sharedContext);
 });

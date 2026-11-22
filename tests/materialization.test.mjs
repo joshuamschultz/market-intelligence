@@ -3,7 +3,8 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { importDataset, openDatabase, storeWorkspace } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
-import { materializeHistory, readMaterializedHistory } from '../backend/materialization.mjs';
+import { createMaterializedHistoryWriter, materializeHistory, readMaterializedHistory } from '../backend/materialization.mjs';
+import { encodeStoredJson } from '../backend/storage-codec.mjs';
 
 const dates = ['2024-01-04', '2024-01-05', '2024-01-08', '2024-01-09'];
 const [first, second, third, last] = dates;
@@ -58,6 +59,35 @@ test('compact materialization matches canonical breadth and group metrics withou
   const raw = db.prepare('SELECT value FROM market_history WHERE date=?').get(third).value;
   assert.doesNotMatch(raw, /"(?:stocks|memberIds)":/);
   assert.equal(Object.hasOwn(row, 'topDecileIds'), false);
+});
+
+test('matching thin group lists share a block and date publication rolls back if the block cannot be saved', (t) => {
+  const { db, engine } = fixture(t);
+  const standard = engine.context({ date: third });
+  const monitor = engine.context({ date: third, breadthKeys: ['up_13pct_34d'] });
+  const groups = Array.from({ length: 45 }, (_, index) => ({ id: `g:${index}`, count: index + 1,
+    level: 'industry', name: `Group ${index}`, medianRS: index % 2 ? 72 : null, memberIds: ['excluded-private-id'] }));
+  const snapshot = (config) => ({ ...engine.snapshot(config, { persist: false }), groups });
+  const first = createMaterializedHistoryWriter(db, engine, standard, [third], { shareGroups: true });
+  const second = createMaterializedHistoryWriter(db, engine, monitor, [third], { shareGroups: true });
+  db.exec('BEGIN IMMEDIATE');
+  db.exec(`CREATE TRIGGER interrupt_shared_group BEFORE INSERT ON market_history_group_blocks
+    BEGIN SELECT RAISE(ABORT, 'blocked group list'); END`);
+  assert.throws(() => first.write(snapshot(standard), null, []), /blocked group list/);
+  assert.equal(db.isTransaction, true);
+  assert.equal(db.prepare('SELECT count(*) AS count FROM market_history').get().count, 0);
+  db.exec('DROP TRIGGER interrupt_shared_group');
+  assert.equal(first.write(snapshot(standard), null, []), true);
+  assert.equal(second.write(snapshot(monitor), null, []), true);
+  db.exec('COMMIT');
+  assert.equal(db.prepare('SELECT count(*) AS count FROM market_history_group_blocks').get().count, 1);
+  const a = readMaterializedHistory(db, engine, standard, { limit: 1 }).rows[0];
+  const b = readMaterializedHistory(db, engine, monitor, { limit: 1 }).rows[0];
+  assert.equal(JSON.stringify(a.groups), JSON.stringify(b.groups));
+  assert.deepEqual(Object.keys(a.groups[0]), ['id', 'level', 'name', 'count', 'medianRS']);
+  const { materializedAt, ...legacy } = a;
+  db.prepare('UPDATE market_history SET value=?').run(encodeStoredJson(legacy, 'gzip'));
+  assert.deepEqual(readMaterializedHistory(db, engine, standard, { limit: 1 }).rows[0], a);
 });
 
 test('thin sessions retain genuine Composite and frozen prior-leader evidence without publishing constituent IDs', (t) => {

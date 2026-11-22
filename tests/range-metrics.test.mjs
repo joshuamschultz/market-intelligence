@@ -6,7 +6,7 @@ import { importDataset, openDatabase } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
 import {
   applyPreparedRangeMetrics, calculateRangeMetrics, prepareRangeHistoryBatch, prepareRangeMetrics, rangeWindowsForScreen,
-  readPreparedRangeMetrics, validateRangeWindows,
+  readPreparedRangeMetrics, validateRangeWindows, verifyPreparedExactRanges, verifyPreparedRangeHistory,
 } from '../backend/range-metrics.mjs';
 import { screenStocks } from '../backend/screener.mjs';
 import { fieldDetails, rangeFieldId } from '../frontend/ui.js';
@@ -183,10 +183,12 @@ test('bulk range history resumes by security, publishes only complete buckets, a
   const config = engine.context({ universe: 'nyse' });
   const inspect = (date, windows = [3, 20], point = config) => readPreparedRangeMetrics(db, { ...point, date }, windows);
   const seen = [];
-  const instrumented = { ...engine, detail(point, securityId, ...rest) {
-    seen.push(securityId);
-    return engine.detail(point, securityId, ...rest);
-  } };
+  const instrumented = { ...engine, *detailSources(...args) {
+    for (const detail of engine.detailSources(...args)) {
+      seen.push(detail.securityId);
+      yield detail;
+    }
+  }, snapshot() { assert.fail('Historical range preparation should not rebuild a market snapshot'); } };
   const one = prepareRangeHistoryBatch(db, instrumented, config, [3, 20], { bucketSize: 1 });
   assert.deepEqual([one.done, one.processedSecurities, one.totalSecurities], [false, 1, 3]);
   assert.deepEqual(inspect(sessions[23]).missingWindows, [3, 20]);
@@ -235,6 +237,29 @@ test('bulk range history resumes by security, publishes only complete buckets, a
   assert.equal(inspect(nextDate, [3], corrected).ready, false);
 });
 
+test('range verification reconciles every date/window and rejects deleted middle-day data without treating sparse nulls as missing', (t) => {
+  const db = openDatabase(':memory:');
+  t.after(() => db.close());
+  const sessions = dates.slice(0, 8);
+  importDataset(db, { provider: 'fixture', securities: [{ symbol: 'ONE', type: 'common', exchange: 'NYSE',
+    listingDate: sessions[0], knownAt: sessions[0] }], prices: sessions.map((date, index) => ({
+    ...bar(date, { close: 100 + index }), symbol: 'ONE', knownAt: date, volume: 10_000,
+  })) });
+  const engine = createEngine(db);
+  const config = engine.context();
+  const windows = [3, 100];
+  assert.equal(prepareRangeHistoryBatch(db, engine, config, windows, { dates: sessions }).done, true);
+  const first = verifyPreparedRangeHistory(db, config, sessions, windows);
+  assert.equal(first.pairs, 16);
+  assert.ok(first.emptyPairs >= sessions.length && first.blocks > 0);
+  assert.throws(() => verifyPreparedExactRanges(db, config, [3]), /exact range windows are missing/);
+  prepareRangeMetrics(db, engine, config, [3]);
+  assert.equal(verifyPreparedExactRanges(db, config, [3]), 1);
+  db.prepare('DELETE FROM prepared_range_history_blocks WHERE date=? AND lookback=3').run(sessions[4]);
+  assert.ok(readPreparedRangeMetrics(db, { ...config, date: sessions[4] }, [3]).ready);
+  assert.throws(() => verifyPreparedRangeHistory(db, config, sessions, windows), /block count differs/);
+});
+
 test('bulk history withholds explicitly ambiguous supplied split bases and prefers exact date preparation', (t) => {
   const db = openDatabase(':memory:');
   t.after(() => db.close());
@@ -257,6 +282,29 @@ test('bulk history withholds explicitly ambiguous supplied split bases and prefe
   const restored = readPreparedRangeMetrics(db, selected, [2]);
   assert.deepEqual(restored.sources, {});
   assert.equal(restored.values.get(2).get('uncertain-basis:SPLT')[0], 0);
+});
+
+test('bounded historical range products preserve warmup and publish only the selected contiguous output sessions', (t) => {
+  const source = openDatabase(':memory:');
+  const target = openDatabase(':memory:');
+  t.after(() => { source.close(); target.close(); });
+  const sessions = dates.slice(0, 60);
+  const securityId = 'bounded:SPLT';
+  const prices = sessions.map((date, i) => ({ symbol: 'SPLT', date, open: 100 + i, high: 101 + i,
+    low: 99 + i, close: 100 + i, volume: 50000, knownAt: date }));
+  importDataset(source, { provider: 'bounded', prices, securities: [{ symbol: 'SPLT', exchange: 'NYSE',
+    type: 'common', listingDate: sessions[0], knownAt: sessions[0] }] });
+  const engine = createEngine(source);
+  const config = engine.context();
+  const output = sessions.slice(-5);
+  const result = prepareRangeHistoryBatch(target, engine, config, [20], { dates: output, sourceDb: source });
+  assert.deepEqual([result.done, result.processedSecurities, result.written], [true, 1, output.length]);
+  assert.equal(readPreparedRangeMetrics(target, { ...config, date: sessions.at(-6) }, [20]).ready, false);
+  const stored = readPreparedRangeMetrics(target, { ...config, date: output[0] }, [20]);
+  assert.ok(stored.ready);
+  assert.equal(stored.values.get(20).get(securityId)[2], 0);
+  assert.throws(() => prepareRangeHistoryBatch(target, engine, config, [20], { dates: [output[0], output.at(-1)], sourceDb: source }),
+    /contiguous trading sessions/);
 });
 
 test('high/low controls register explicitly and save ordinary range filters and sortable columns', async (t) => {

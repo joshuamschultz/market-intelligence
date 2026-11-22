@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { gzipSync, gunzipSync } from 'node:zlib';
 import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import { expectedSessions } from './calendar.mjs';
 import { CALCULATION_VERSION } from './database.mjs';
 import { UNIVERSES } from './engine.mjs';
+import { decodeStoredJson, encodeStoredJson } from './storage-codec.mjs';
 
 const maxLookback = 7560;
 const maxWindows = 16;
@@ -214,6 +214,59 @@ function coveringRun(runs, window, date) {
     usableArchiveRow(run.bounds, { date, data_version: run.data_version }));
 }
 
+export function verifyPreparedRangeHistory(db, config, dates, windows, { sourceDb = db } = {}) {
+  const requested = validateRangeWindows(windows);
+  const result = { pairs: 0, emptyPairs: 0, runs: 0, blocks: 0 };
+  if (!dates.length || !requested.length) return result;
+  const runs = historicalRuns(db, config, dates[0]);
+  const selected = new Map();
+  for (const date of dates) for (const window of requested) {
+    const run = coveringRun(runs, window, date);
+    if (!run) throw new Error(`Prepared range history is missing ${date} / ${window} sessions`);
+    if (!selected.has(run.id)) selected.set(run.id, { run, pairs: [] });
+    selected.get(run.id).pairs.push([date, window]);
+    result.pairs++;
+  }
+  const state = db.prepare('SELECT processed,total,written FROM prepared_range_history_runs WHERE id=?');
+  const blocks = db.prepare(`SELECT date,lookback,count(*) AS count,min(bucket) AS first_bucket,max(bucket) AS last_bucket
+    FROM prepared_range_history_blocks WHERE run_id=? GROUP BY date,lookback`);
+  const roster = sourceDb.prepare(`SELECT count(*) AS total ${rosterQuery}`);
+  for (const { run, pairs } of selected.values()) {
+    const manifest = state.get(run.id);
+    if (!manifest || manifest.processed !== manifest.total || manifest.total !== roster.get(run.data_version, run.end_date).total) {
+      throw new Error(`Prepared range history roster is incomplete for ${run.end_date}`);
+    }
+    const sessions = new Set(expectedSessions([...run.starts.values()].sort()[0], run.end_date));
+    const observed = new Set();
+    let count = 0;
+    for (const row of blocks.iterate(run.id)) {
+      const { date, lookback } = row;
+      if (!sessions.has(date) || !run.starts.has(lookback) || date < run.starts.get(lookback) ||
+          row.first_bucket < 0 || row.last_bucket >= manifest.processed) {
+        throw new Error(`Prepared range history contains an out-of-scope block for ${date} / ${lookback} sessions`);
+      }
+      observed.add(`${date}:${lookback}`);
+      count += row.count;
+    }
+    if (count !== manifest.written) throw new Error(`Prepared range history block count differs from its manifest for ${run.end_date}`);
+    result.blocks += count;
+    result.runs++;
+    // A fully processed roster can have no comparable price window on a session.
+    result.emptyPairs += pairs.filter(([date, window]) => !observed.has(`${date}:${window}`)).length;
+  }
+  return result;
+}
+
+export function verifyPreparedExactRanges(db, config, windows) {
+  const requested = validateRangeWindows(windows);
+  if (!requested.length) return 0;
+  const count = hasArchive(db) ? db.prepare(`SELECT count(*) AS count FROM prepared_range_metrics
+    WHERE recipe=? AND data_version=? AND date=? AND lookback IN (SELECT value FROM json_each(?))`)
+    .get(recipeFor(config), config.dataVersion, config.date, JSON.stringify(requested)).count : 0;
+  if (count !== requested.length) throw new Error(`Prepared exact range windows are missing for ${config.date} (${config.basis})`);
+  return count;
+}
+
 export function readPreparedRangeMetrics(db, config, windows) {
   const requested = validateRangeWindows(windows);
   const values = new Map();
@@ -222,7 +275,7 @@ export function readPreparedRangeMetrics(db, config, windows) {
       WHERE recipe=? AND data_version=? AND date=? AND lookback IN (SELECT value FROM json_each(?))`)
       .iterate(recipeFor(config), config.dataVersion, config.date, JSON.stringify(requested));
     for (const row of stored) {
-      values.set(row.lookback, new Map(JSON.parse(gunzipSync(row.value)).map(([securityId, ...reading]) => [securityId, reading])));
+      values.set(row.lookback, new Map(decodeStoredJson(row.value).map(([securityId, ...reading]) => [securityId, reading])));
     }
   }
   const sources = {};
@@ -237,7 +290,7 @@ export function readPreparedRangeMetrics(db, config, windows) {
         if (!run) continue;
         const records = new Map();
         for (const { value } of blocks.iterate(run.id, config.date, window)) {
-          for (const [id, ...reading] of JSON.parse(gunzipSync(value))) records.set(id, reading);
+          for (const [id, ...reading] of decodeStoredJson(value)) records.set(id, reading);
         }
         values.set(window, records);
         sources[window] = { mode: 'reconstructed-history', dataVersion: run.data_version };
@@ -281,9 +334,13 @@ export function prepareRangeMetrics(db, engine, config, windows, { progress = ()
   const dates = expectedSessions(config.earliestDate, config.date).slice(-maxLookback);
   const snapshot = engine.snapshot(pinned, { persist: false, cache: true, velocity: false });
   const securities = snapshot.stocks.filter(({ traded }) => traded);
+  const sources = engine.detailSources?.(pinned, { securityIds: securities.map(({ securityId }) => securityId), lookback: maxLookback, signal });
+  const iterator = sources?.[Symbol.iterator]();
+  let next = iterator?.next().value;
   for (const [index, { securityId }] of securities.entries()) {
     signal?.throwIfAborted();
-    const detail = engine.detail(pinned, securityId, maxLookback, { velocity: false });
+    const detail = iterator ? (next?.securityId === securityId ? next : null) : engine.detail(pinned, securityId, maxLookback, { velocity: false });
+    if (iterator && detail) next = iterator.next().value;
     if (detail) onSecurity?.(detail, { securityId, config: pinned });
     for (const [window, row] of valuesForWindows(detail?.chartBars ?? [], missing, config.date, dates)) {
       collected.get(window).push([securityId, ...row]);
@@ -291,7 +348,7 @@ export function prepareRangeMetrics(db, engine, config, windows, { progress = ()
     if (index % 16 === 0) progress(0.95 * (index + 1) / securities.length);
   }
   signal?.throwIfAborted();
-  const encoded = missing.map((window) => [window, gzipSync(JSON.stringify(collected.get(window)), { level: 3 })]);
+  const encoded = missing.map((window) => [window, encodeStoredJson(collected.get(window))]);
   db.exec(schema);
   const write = db.prepare('INSERT OR IGNORE INTO prepared_range_metrics VALUES (?,?,?,?,?)');
   let written = 0;
@@ -318,7 +375,9 @@ function historyStatus(summary, state, progress) {
     processedSecurities: state.processed, totalSecurities: state.total, written: state.written, basisExclusions: state.basis_exclusions };
 }
 
-export function prepareRangeHistoryBatch(db, engine, config, windows, { cursor = null, progress = () => {}, signal, bucketSize, onSecurity } = {}) {
+export function prepareRangeHistoryBatch(db, engine, config, windows, {
+  cursor = null, progress = () => {}, signal, bucketSize, onSecurity, dates, sourceDb = db,
+} = {}) {
   signal?.throwIfAborted();
   const requested = validateRangeWindows(windows);
   const summary = { date: config.date, dataVersion: config.dataVersion, windows: requested };
@@ -332,7 +391,12 @@ export function prepareRangeHistoryBatch(db, engine, config, windows, { cursor =
   const size = bucketSize ?? Math.max(8, Math.floor(128 / Math.max(1, requested.length)));
   if (!Number.isInteger(size) || size < 1 || size > 256) throw new RangeError('Range history bucket size must be 1–256 securities');
   const sessions = expectedSessions(config.earliestDate, config.date).slice(-maxLookback);
-  const [first] = sessions;
+  const output = dates ?? sessions;
+  const segment = sessions.slice(-output.length);
+  if (!output.length || segment.length !== output.length || output.some((date, index) => date !== segment[index])) {
+    throw new RangeError('Range history output dates must be contiguous trading sessions through the pinned date');
+  }
+  const [first] = output;
   const recipe = recipeFor({ ...config, referenceMode: 'as-of' });
   const id = createHash('sha256').update(JSON.stringify([recipe, config.dataVersion, first, config.date, requested])).digest('hex');
   db.exec(historySchema);
@@ -341,33 +405,37 @@ export function prepareRangeHistoryBatch(db, engine, config, windows, { cursor =
   if (!state) {
     const runs = historicalRuns(db, config, first);
     const starts = requested.flatMap((window) => {
-      const date = sessions.find((session) => !coveringRun(runs, window, session));
+      const date = output.find((session) => !coveringRun(runs, window, session));
       return date ? [[window, date]] : [];
     });
-    const total = starts.length ? db.prepare(`SELECT count(*) AS total ${rosterQuery}`).get(config.dataVersion, config.date).total : 0;
+    const total = starts.length ? sourceDb.prepare(`SELECT count(*) AS total ${rosterQuery}`).get(config.dataVersion, config.date).total : 0;
     db.prepare(`INSERT OR IGNORE INTO prepared_range_history_runs(id,recipe,data_version,end_date,starts,total,complete)
       VALUES (?,?,?,?,?,?,?)`).run(id, recipe, config.dataVersion, config.date, JSON.stringify(starts), total, Number(total === 0));
     state = select.get(id);
   }
   if (state.complete) return historyStatus(summary, state, progress);
-  const ids = db.prepare(`SELECT id ${rosterQuery} AND id>? ORDER BY id LIMIT ?`)
+  const ids = sourceDb.prepare(`SELECT id ${rosterQuery} AND id>? ORDER BY id LIMIT ?`)
     .all(config.dataVersion, config.date, state.cursor ?? '', size);
   const starts = JSON.parse(state.starts);
   const anchored = pinnedRangeContext({ ...config, referenceMode: 'as-of' });
-  engine.snapshot(anchored, { cache: true, velocity: false });
-  const explicitPriceBasis = db.prepare(`SELECT 1 FROM price_revisions WHERE security_id=? AND version<=? AND date<=?
+  const sources = engine.detailSources?.(anchored, { securityIds: ids.map(({ id }) => id), lookback: maxLookback, signal });
+  if (!sources) engine.snapshot(anchored, { cache: true, velocity: false });
+  const iterator = sources?.[Symbol.iterator]();
+  let next = iterator?.next().value;
+  const explicitPriceBasis = sourceDb.prepare(`SELECT 1 FROM price_revisions WHERE security_id=? AND version<=? AND date<=?
     AND split_close>0 LIMIT 1`);
   const byWindow = new Map(starts.map(([window]) => [window, new Map()]));
   let excluded = 0;
   for (const { id: securityId } of ids) {
     signal?.throwIfAborted();
-    const detail = engine.detail(anchored, securityId, maxLookback, { velocity: false });
+    const detail = iterator ? (next?.securityId === securityId ? next : null) : engine.detail(anchored, securityId, maxLookback, { velocity: false });
+    if (iterator && detail) next = iterator.next().value;
     if (detail) onSecurity?.(detail, { securityId, config: anchored });
     if (!detail?.chartBars?.length) continue;
     // Explicit vendor-adjusted levels can use a different future split scale from raw OHLC.
     // Keep ambiguous earlier spans unavailable unless they are separately prepared at their own dates.
     const lastSplit = (detail.actions ?? []).findLast((action) => action.type === 'split' && action.factor > 0 && action.date <= config.date)?.date;
-    const splitSafeFrom = lastSplit && explicitPriceBasis.get(securityId, config.dataVersion, lastSplit) ? lastSplit : '';
+    const splitSafeFrom = lastSplit && (detail.explicitSplitPriceBasis ?? explicitPriceBasis.get(securityId, config.dataVersion, lastSplit)) ? lastSplit : '';
     if (splitSafeFrom) excluded++;
     scanHistory(detail.chartBars, sessions, starts, (date, window, values) => {
       const output = byWindow.get(window);
@@ -379,7 +447,7 @@ export function prepareRangeHistoryBatch(db, engine, config, windows, { cursor =
 
   const blocks = [];
   for (const [window, readings] of byWindow) {
-    for (const [date, rows] of readings) blocks.push([date, window, gzipSync(JSON.stringify(rows), { level: 3 })]);
+    for (const [date, rows] of readings) blocks.push([date, window, encodeStoredJson(rows)]);
   }
   const write = db.prepare('INSERT INTO prepared_range_history_blocks VALUES (?,?,?,?,?)');
   db.exec('BEGIN IMMEDIATE');

@@ -134,8 +134,11 @@ export function runningRelease(root) {
 }
 
 function checkRelease(root, executable) {
-  for (const args of [[resolve(root, 'scripts/check.mjs')], ['--test']]) {
-    const result = spawnSync(executable, args, { cwd: root, stdio: 'inherit' });
+  const env = { ...process.env };
+  // An inherited Node test context makes a nested test process skip its files.
+  delete env.NODE_TEST_CONTEXT;
+  for (const args of [[resolve(root, 'scripts/check.mjs')], ['--test', 'tests']]) {
+    const result = spawnSync(executable, args, { cwd: root, env, stdio: 'inherit' });
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error('Release validation failed');
   }

@@ -2,10 +2,10 @@ import {
   action, chip, compact, count, dateLabel, direction, empty, icon, iconButton, money, notice, number, numeric, panelHead, pathPart, pending, publishingHistory, rate, ratio, safe, segment, signed, summary, warming,
 } from './ui.js';
 import { chart, exportChart } from './charts.js';
+import { longestChartRange, rangeLimit, rangeSegment } from './chart-ranges.js';
 import { stockQualityPanel } from './data-quality.js';
 
 let drawerRequest = 0;
-const ranges = [[21, '1M'], [63, '3M'], [126, '6M'], [252, '1Y'], [504, '2Y']];
 const maPeriods = [20, 50, 200];
 
 export function plottableBar(bar) {
@@ -113,6 +113,7 @@ export async function openStock(env, id) {
   let cadence = 'daily';
   let priceStyle = 'line';
   let rsCadence = 'weekly';
+  let rsRange = 252;
   let tab = 'price';
   let data;
   let warmup = '';
@@ -120,7 +121,7 @@ export async function openStock(env, id) {
   let screenMembership;
   const body = env.showDialog(env.detail, `Security · ${id}`, pending('Loading stock detail…'));
   const stockPath = `stocks/${pathPart(id)}`;
-  const stockParams = { lookback:704 };
+  const stockParams = { lookback: longestChartRange };
   try {
     data = await env.api(stockPath,{params:stockParams,signal});
   } catch (error) {
@@ -134,14 +135,17 @@ export async function openStock(env, id) {
   env.detail.setAttribute('aria-label', heading.textContent);
 
   async function loadSeries(target) {
-    const key = rsCadence;
+    const cadence = rsCadence;
+    const limit = rangeLimit(rsRange, cadence);
+    const scope = () => `${rsCadence}:${rangeLimit(rsRange, rsCadence)}`;
+    const key = scope();
     try {
       const result = series[key] || await env.publishedSeries(`stocks/${pathPart(data.securityId)}/rankings`,
-        {signal,params:{cadence:key,limit:key==='weekly'?52:63}},(partial,job)=>{
-          if (target.isConnected && key===rsCadence) target.innerHTML=publishingHistory(job);
+        {signal,params:{cadence,limit}},(partial,job)=>{
+          if (target.isConnected && key===scope()) target.innerHTML=publishingHistory(job);
         });
       series[key] = result;
-      if (target.isConnected && key === rsCadence) {
+      if (target.isConnected && key === scope()) {
         target.innerHTML = chart(result.rows, [
           { key: 'percentile', label: 'RS percentile', format: (v) => number(v) },
           { key: 'udv_50d', label: 'U/D volume 50D', axis: 'right', format: (v) => ratio(v) },
@@ -171,7 +175,7 @@ export async function openStock(env, id) {
     const activeReasons = new Set(sourceIssues.map(({reason})=>reason));
     const otherWarnings = (data.warnings||[]).filter((reason)=>!activeReasons.has(reason));
     const currentPriceQuarantined = sourceIssues.some((row)=>row.kind==='price'&&row.effective_from<=data.date&&row.effective_to>=data.date);
-    const tools = `${segment('stock-range-local', ranges, range)}${segment('stock-cadence-local', [['daily','Daily'],['weekly','Weekly']], cadence)}
+    const tools = `${rangeSegment('stock-range-local', range)}${segment('stock-cadence-local', [['daily','Daily'],['weekly','Weekly']], cadence)}
       ${segment('stock-style-local', [['line','Line'],['candles','Candles']], priceStyle)}${iconButton('Export plotted prices CSV', 'stock-export-local', 'download')}`;
     body.innerHTML = `<div id="stock-warming">${warmup}</div><div class="stock-identity"><div class="inline-stack">${chip(data.exchange || 'Exchange unavailable')}${chip(data.type || 'Type unavailable')}
        ${chip(dateLabel(data.latestDate))}${data.rsStatus === 'NEW' ? chip('Newly ranked', 'accent') : ''}</div>
@@ -194,7 +198,8 @@ export async function openStock(env, id) {
         <div class="metric-grid section-space">${[['1W return', data.return_5d], ['1M return', data.return_21d], ['3M return', data.return_63d],
           ['6M return', data.return_126d], ['12M return', data.return_252d]].map(([label, value]) => tile(label, rate(value))).join('')}</div>`
       : tab === 'rs' ? `<section class="panel panel-body">${panelHead('Relative strength and volume history', 'Percentile and 50-session U/D volume',
-          segment('stock-rs-local', [['daily','Daily'],['weekly','Weekly']], rsCadence) + iconButton('Export ranking chart CSV', 'export-chart', 'download', 'stock-rs-history.csv'))}
+          segment('stock-rs-local', [['daily','Daily'],['weekly','Weekly']], rsCadence) + rangeSegment('stock-rs-range-local', rsRange) +
+          iconButton('Export ranking chart CSV', 'export-chart', 'download', 'stock-rs-history.csv'))}
         <div id="stock-rs-chart">${pending('Loading stock ranks…')}</div></section>
         <div class="metric-grid section-space">${[1,4,12].map((n) => tile(`${n}W rank change`, signed(data[`rankChange${n}w`], 0),
           `${signed(data[`velocity${n}w`])} percentile points`)).join('')}
@@ -228,6 +233,7 @@ export async function openStock(env, id) {
       case 'stock-style-local': priceStyle = value; draw(); break;
       case 'stock-tab-local': tab = value; draw(); break;
       case 'stock-rs-local': rsCadence = value; draw(); break;
+      case 'stock-rs-range-local': rsRange = Number(value); draw(); break;
       case 'stock-export-local':
         exportChart(body.querySelector('[data-chart]'), `${data.symbol}-${cadence}-plotted-prices.csv`);
         break;

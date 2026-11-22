@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
+import { totalmem } from 'node:os';
 import { Worker } from 'node:worker_threads';
 import { gzipSync, gunzipSync } from 'node:zlib';
+import { isAnalysisCalculationJob, readAnalysisReadiness } from './analysis-readiness.mjs';
 import { referenceArchiveScopes, reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import {
   bulkSessionStatus, CALCULATION_VERSION, createJob, dailyPublication, dataVersion, getWorkspace, importDataset, isoDate, jobById, listWorkspace, storeWorkspace,
@@ -8,7 +10,9 @@ import {
 } from './database.mjs';
 import { expectedSessions, isMarketSession, latestFinalizableSession, shiftDate, weekEnd } from './calendar.mjs';
 import { backupRetention, createCompressedBackup } from './backup.mjs';
+import { runBatchPreparation } from './batch-preparation.mjs';
 import { BREADTH_METRICS, breadthMetric, binaryMetric } from './breadth.mjs';
+import { chartBookIndustryJob, createChartBook, prepareChartBookIndustries, readChartBookSnapshot, scheduleChartBookIndustries } from './chartbook.mjs';
 import { createEngine, UNIVERSES, validateUniverse } from './engine.mjs';
 import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, volumeRatio } from './metrics.mjs';
 import {
@@ -20,7 +24,7 @@ import { materializeHistory, readMaterializedHistory } from './materialization.m
 import { precomputeProduction, precomputeWorkspace } from './precompute.mjs';
 import { createPreparedDetailWriter, detailRiskWindows, prepareDetailsBatch, readPreparedDetail, riskMetrics } from './prepared-details.mjs';
 import { hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot } from './prepared-snapshots.mjs';
-import { enqueuePreparation, preparationInput, preparationSpecs, preparationStatus, preparationSuperseded, preparationType, readPreparedRanks,
+import { batchPreparationSpecs, enqueuePreparation, preparationInput, preparationSpecs, preparationStatus, preparationSuperseded, preparationType, readPreparedRanks,
   recentPreparationSessions, registerPreparation, registeredPreparations, requirePreparationSpace, runPreparation } from './preparation.mjs';
 import { applyPreparedRangeMetrics, prepareRangeMetrics, rangeWindowsForScreen, readPreparedRangeMetrics } from './range-metrics.mjs';
 import { BENCHMARKS, EodhdProvider, importProviderData, importProviderReference, providerDates, providerOptions } from './provider.mjs';
@@ -28,8 +32,10 @@ import { BUILTIN_MODELS, RANKING_METHODS, rankBy, validateModel } from './rankin
 import { readRankArchive, writeRankArchive } from './rank-archive.mjs';
 import { analyzeCohort, calculateMarketHealth, DEFAULT_HEALTH_MODEL, findHistoricalAnalogs, leadershipTransitionMatrix,
   marketHealthHistory, runEventStudy } from './research.mjs';
+import { createRiskHistoryWriter, normalizeRiskBenchmarks, normalizeRiskWindows, prepareRiskHistoryBatch, prepareRiskHistoryBenchmarks } from './risk-history.mjs';
 import { csvRows, screenStocks, validateFilter, validateScreen } from './screener.mjs';
 import { prepareSummation, readPreparedSummation } from './summation.mjs';
+import { decodeStoredJson, encodeStoredJson } from './storage-codec.mjs';
 
 const collections = {
   screens: 'screen', watchlists: 'watchlist', 'ranking-models': 'ranking-model',
@@ -423,7 +429,7 @@ function workspaceDefinition(kind, input) {
   }
 }
 
-function savedScreenContext(definition) {
+export function savedScreenContext(definition) {
   const context = { ...definition.context };
   if (definition.dateMode === 'latest') {
     delete context.date;
@@ -587,7 +593,7 @@ function historicalScreen(db, engine, config, input, snapshot, historyReader) {
     referenceMode: snapshot.referenceMode, classificationSystem: snapshot.classificationSystem };
 }
 
-function screenDataNeeds(body) {
+export function screenDataNeeds(body) {
   const source = JSON.stringify(body);
   const context = body.context || {};
   const definitions = [
@@ -654,14 +660,17 @@ function workspaceDefaults(db) {
     classification: classificationStatus(db).defaultClassification, reference: 'latest' };
 }
 
-function summationContext(db, engine, config) {
+export function summationContext(db, engine, config) {
   const sec = db.prepare("SELECT 1 FROM classifications WHERE system='sec-sic' AND industry IS NOT NULL AND version<=? LIMIT 1").get(config.dataVersion);
   return engine.context({ ...workspaceDefaults(db), date: config.date, dataVersion: config.dataVersion,
     universe: 'nyse', universeVersion: 1, reference: 'as-of', ...(sec ? { classification: 'sec-sic' } : {}) });
 }
 
-function prepareNyseSummation(db, engine, config) {
+export function prepareNyseSummation(db, engine, config, { batch = false } = {}) {
   const sessions = expectedSessions(config.earliestDate, config.date);
+  if (batch && engine.batchAdvanceDecline) {
+    return prepareSummation(db, config, sessions, [...engine.batchAdvanceDecline(config, { dates: sessions })]);
+  }
   const observations = [];
   for (let index = 0; index < sessions.length; index += 120) {
     const dates = sessions.slice(index, index + 120);
@@ -678,7 +687,19 @@ function prepareNyseSummation(db, engine, config) {
 const rangeType = 'prepare-range';
 const rangeHistoryType = 'prepare-range-history';
 const detailType = 'prepare-stock-details';
-function rangeContext(engine, config) {
+const riskHistoryType = 'prepare-risk-history';
+const versionedPreparationTypes = [preparationType, rangeType, rangeHistoryType, detailType, riskHistoryType];
+
+function scheduledProductionVersion(jobType, spec) {
+  if (jobType !== 'production-precompute') return null;
+  return /^production-precompute:([^:]+):/.exec(spec.jobKey || '')?.[1] ?? null;
+}
+
+function obsoletePreparation(jobType, spec) {
+  const version = versionedPreparationTypes.includes(jobType) ? spec.calculationVersion : scheduledProductionVersion(jobType, spec);
+  return version != null && version !== CALCULATION_VERSION;
+}
+export function rangeContext(engine, config) {
   return engine.context({ ...preparationInput(config), universe: 'us-all', universeVersion: 1, model: 'composite', modelVersion: 1,
     benchmark: 'SPY', breadthKeys: [], windows: [], averages: [], volumeWindows: [], includeAllTimeHigh: false });
 }
@@ -721,6 +742,24 @@ function detailSpec(engine, config, { securityIds, benchmarks, riskWindows, foll
     ...(windows && { riskWindows: windows }), followLatest, calculationVersion: CALCULATION_VERSION, jobKey: `${detailType}:${key}` };
 }
 
+function riskHistorySpec(db, engine, config, { benchmarks, windows, followLatest = true } = {}) {
+  if (config.basis !== 'reconstructed' || !config.date || !config.earliestDate) return null;
+  const point = rangeContext(engine, config);
+  const periods = normalizeRiskWindows(windows);
+  const tickers = normalizeRiskBenchmarks(benchmarks, config.benchmark);
+  const history = expectedSessions(point.earliestDate, point.date);
+  const exists = db.prepare("SELECT 1 FROM sqlite_schema WHERE name='prepared_risk_history_runs'").get();
+  const archives = exists ? db.prepare(`SELECT first_date,last_date,data_version FROM prepared_risk_history_runs
+    WHERE complete=1 AND calculation_version=? AND basis=? AND windows=? AND benchmarks=? AND data_version<=?`)
+    .all(CALCULATION_VERSION, point.basis, JSON.stringify(periods), JSON.stringify(tickers), point.dataVersion) : [];
+  const bounds = reusableArchiveVersions(db, { ...point, referenceMode: 'as-of' }, archives.map(({ data_version }) => data_version));
+  const earliest = history.find((date) => !archives.some((row) => row.first_date <= date && row.last_date >= date && usableArchiveRow(bounds, { ...row, date })));
+  if (!earliest) return null;
+  const key = createHash('sha256').update(JSON.stringify([CALCULATION_VERSION, earliest, point.date, point.dataVersion, periods, tickers])).digest('hex');
+  return { type: riskHistoryType, context: preparationInput(point), from: earliest, benchmarks: tickers, riskWindows: periods,
+    followLatest, calculationVersion: CALCULATION_VERSION, jobKey: `${riskHistoryType}:${key}` };
+}
+
 function detailJobs(db, config, securityId, { exact = false, benchmark, lookback } = {}) {
   const riskScope = benchmark ? `AND ? IN (SELECT value FROM json_each(json_extract(payload,'$.benchmarks')))
     AND ? IN (SELECT value FROM json_each(coalesce(json_extract(payload,'$.riskWindows'),?)))` : '';
@@ -736,25 +775,41 @@ function detailJobs(db, config, securityId, { exact = false, benchmark, lookback
     : { preparationState: active?.status === 'failed' ? 'failed' : 'unregistered', ...(active?.error && { error: active.error }) };
 }
 
-function schedulePreparation(db, engine, { date, version = dataVersion(db), requested, retry } = {}) {
-  if (bootstrapProgress(db, { activeOnly: true })) return { jobs: [], queued: 0, waitingForCapture: true };
+function riskHistoryPending(db, config, lookback) {
+  const job = db.prepare(`SELECT id,status,progress,error FROM jobs WHERE type=? AND status IN ('queued','running','failed')
+    AND json_extract(payload,'$.context.basis')=? AND json_extract(payload,'$.context.dataVersion')=?
+    AND json_extract(payload,'$.from')<=? AND json_extract(payload,'$.context.date')>=?
+    AND ? IN (SELECT value FROM json_each(json_extract(payload,'$.benchmarks')))
+    AND ? IN (SELECT value FROM json_each(json_extract(payload,'$.riskWindows')))
+    ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,rowid DESC LIMIT 1`)
+    .get(riskHistoryType, config.basis, config.dataVersion, config.date, config.date, config.benchmark, lookback);
+  return job && { preparationState: job.status, ...(['queued', 'running'].includes(job.status) ? pendingJob(job) : { error: job.error }) };
+}
+
+export function preparationWorkspaceScopes(db, engine, { date, version = dataVersion(db) } = {}) {
   const base = { ...workspaceDefaults(db), date, dataVersion: version };
   const basePoint = engine.context(base);
   const savedScreens = listWorkspace(db, 'screen').map(({ definition }) => ({ definition,
     context: { ...savedScreenContext(definition), ...screenDataNeeds(definition), rangeWindows: rangeWindowsForScreen(definition) } }));
-  const custom = [...registeredPreparations(db), ...savedScreens.map(({ context }) => context)];
+  const alerts = listWorkspace(db, 'alert-rule').flatMap(({ definition }) => {
+    if (definition.active === false || !['stocks', 'screen'].includes(definition.type)) return [];
+    const screen = definition.type === 'screen' ? getWorkspace(db, 'screen', definition.screenId)?.definition : definition;
+    if (!screen) return [];
+    const rangeWindows = rangeWindowsForScreen(screen);
+    const context = { ...definition.context, ...savedScreenContext(screen), ...screenDataNeeds(screen), rangeWindows };
+    return [{ screen, context }];
+  });
+  const custom = [...registeredPreparations(db), ...savedScreens.map(({ context }) => context),
+    ...alerts.map(({ context }) => context)];
   const historicalScreenRanges = savedScreens.flatMap(({ definition, context }) => {
     if (context.basis !== 'known' || !context.rangeWindows.length) return [];
     let point;
     try { point = engine.context({ ...base, ...context }); } catch { return []; }
     return knownRangeDependencies(definition, point).map((dependency) => ({ ...context, ...dependency }));
   });
-  const alertRangeContexts = listWorkspace(db, 'alert-rule').flatMap(({ definition }) => {
-    if (definition.active === false || !['stocks', 'screen'].includes(definition.type)) return [];
-    const screen = definition.type === 'screen' ? getWorkspace(db, 'screen', definition.screenId)?.definition : definition;
-    const rangeWindows = rangeWindowsForScreen(screen ?? {});
+  const alertRangeContexts = alerts.flatMap(({ screen, context }) => {
+    const { rangeWindows } = context;
     if (!rangeWindows.length) return [];
-    const context = { ...definition.context, ...savedScreenContext(screen) };
     const point = engine.context({ ...base, ...context, date, dataVersion: version });
     if (!point.date) return [];
     const prior = previousSession(point.date, 1);
@@ -762,10 +817,16 @@ function schedulePreparation(db, engine, { date, version = dataVersion(db), requ
     return dates.flatMap((entry) => [{ ...context, date: entry.date, rangeWindows },
       ...knownRangeDependencies(screen, entry).map((dependency) => ({ ...context, ...dependency }))]);
   });
+  return { base, basePoint, custom, rangeInputs: [{ rangeWindows: [20, 252] }, ...custom, ...historicalScreenRanges, ...alertRangeContexts] };
+}
+
+function schedulePreparation(db, engine, { date, version = dataVersion(db), requested, retry } = {}) {
+  if (bootstrapProgress(db, { activeOnly: true })) return { jobs: [], queued: 0, waitingForCapture: true };
+  const { base, basePoint, custom, rangeInputs } = preparationWorkspaceScopes(db, engine, { date, version });
   const requestedRanges = requested?.rangeWindows?.length > 0;
   const rangeScopes = new Map();
   const rangeHistoryScopes = new Map();
-  for (const input of requested ? [requested] : [{ rangeWindows: [20, 252] }, ...custom, ...historicalScreenRanges, ...alertRangeContexts]) {
+  for (const input of requested ? [requested] : rangeInputs) {
     if (!input.rangeWindows?.length) continue;
     let point;
     try { point = engine.context({ ...base, ...input }); } catch { continue; }
@@ -795,6 +856,13 @@ function schedulePreparation(db, engine, { date, version = dataVersion(db), requ
   if (!requested) {
     if (basePoint.date) {
       detail.push(detailSpec(engine, basePoint, { followLatest: true }));
+      const risk = riskHistorySpec(db, engine, basePoint);
+      if (risk) {
+        const historical = ranges.find((job) => job.type === rangeHistoryType && job.context.date === risk.context.date &&
+          job.context.dataVersion === risk.context.dataVersion && job.context.basis === risk.context.basis);
+        if (historical) historical.sharedRisk = { from: risk.from, windows: risk.riskWindows, benchmarks: risk.benchmarks };
+        detail.push(risk);
+      }
       for (const { definition } of listWorkspace(db, 'stock-detail-preparation')) {
         const { securityId, benchmark, basis, lookback } = definition;
         const registered = engine.context({ ...base, basis, benchmark });
@@ -803,32 +871,80 @@ function schedulePreparation(db, engine, { date, version = dataVersion(db), requ
       }
     }
   }
-  return enqueuePreparation(db, [...ranges, ...detail, ...(requestedRanges ? [] : preparationSpecs(db, engine, base, { custom, requested }))],
+  const specs = requestedRanges ? [] : preparationSpecs(db, engine, base, { custom, requested });
+  const calculations = process.env.MARKET_BATCH_PREPARATION === '0' ? specs : batchPreparationSpecs(engine, specs);
+  return enqueuePreparation(db, [...ranges, ...detail, ...calculations],
     { retry, supersedeBefore: requested ? undefined : version });
+}
+
+function replaceObsoletePreparation(db, engine) {
+  const jobs = db.prepare(`SELECT id,type,payload FROM jobs WHERE status='queued'
+    AND type IN (SELECT value FROM json_each(?)) ORDER BY rowid`).all(JSON.stringify([...versionedPreparationTypes, 'production-precompute']));
+  const obsolete = jobs.map(({ payload, ...job }) => ({ ...job, spec: JSON.parse(payload) }))
+    .filter(({ type, spec }) => obsoletePreparation(type, spec));
+  if (!obsolete.length) return;
+  if (obsolete.some(({ spec }) => spec.followLatest)) schedulePreparation(db, engine);
+  const replacement = [];
+  for (const { type, spec } of obsolete) {
+    if (spec.followLatest || type === 'production-precompute') continue;
+    let point;
+    try { point = engine.context(spec.context); } catch { continue; }
+    if (type === preparationType) {
+      const inputs = spec.members?.map(({ context }) => context) ?? [spec.context];
+      const specs = inputs.flatMap((context) => preparationSpecs(db, engine, context,
+        { requested: context, historySessions: spec.historySessions }).filter(({ phase }) => phase === spec.phase));
+      replacement.push(...(process.env.MARKET_BATCH_PREPARATION === '0' ? specs : batchPreparationSpecs(engine, specs)));
+    } else if (type === detailType) {
+      replacement.push(detailSpec(engine, point, { followLatest: false, securityIds: spec.securityIds,
+        benchmarks: spec.benchmarks, riskWindows: spec.riskWindows }));
+    } else if (type === riskHistoryType) {
+      const risk = riskHistorySpec(db, engine, point, { followLatest: false, benchmarks: spec.benchmarks, windows: spec.riskWindows });
+      if (risk) replacement.push(risk);
+    } else {
+      const scope = rangeSpec(engine, point, spec.windows);
+      const prefix = type === rangeHistoryType ? rangeHistoryPrefix(point) : scope.prefix;
+      replacement.push({ ...scope, type, prefix, windows: spec.windows, persistDetails: spec.persistDetails,
+        followLatest: false, calculationVersion: CALCULATION_VERSION, jobKey: `${type}:${prefix}:${spec.windows.join(',')}` });
+    }
+  }
+  enqueuePreparation(db, replacement);
+  const supersede = db.prepare("UPDATE jobs SET status='superseded',updated_at=?,error=? WHERE id=? AND status='queued'");
+  for (const { id } of obsolete) supersede.run(new Date().toISOString(), 'A newer calculation version replaced this preparation', id);
 }
 
 const preparationPhaseLabels = { current: 'Current stock metrics', recent: 'Recent breadth and ranks', history: 'Full history' };
 
 function preparationSummary(db, version) {
+  const generation = `AND (json_extract(payload,'$.calculationVersion')=?
+    OR (json_extract(payload,'$.calculationVersion') IS NULL AND status NOT IN ('failed','superseded','cancelled','interrupted')))`;
   const records = db.prepare(`SELECT id,status,progress,error,payload,result FROM jobs WHERE type=?
-    AND json_extract(payload,'$.context.dataVersion')=? ORDER BY rowid DESC`).all(preparationType, version);
+    AND json_extract(payload,'$.context.dataVersion')=? ${generation} ORDER BY rowid DESC`).all(preparationType, version, CALCULATION_VERSION);
   const entries = new Map();
   for (const row of records) {
-    const { jobKey, context, label, phase } = JSON.parse(row.payload);
-    if (entries.has(jobKey)) continue;
+    const spec = JSON.parse(row.payload);
+    const { phase, members = [spec] } = spec;
     const detail = row.result ? JSON.parse(row.result) : {};
-    entries.set(jobKey, { id: row.id, universe: context.universe, universeVersion: context.universeVersion,
-      model: context.model, modelVersion: context.modelVersion, basis: context.basis, benchmark: context.benchmark, classification: context.classification,
-      reference: context.reference, date: context.date, phase, phaseLabel: preparationPhaseLabels[phase], label,
-      status: row.status, progress: row.progress, completedSessions: detail.completedSessions ?? 0, totalSessions: detail.totalSessions ?? null,
-      error: row.error, estimatedRemainingSeconds: detail.estimatedRemainingSeconds ?? null });
+    for (const { jobKey, context, label } of members) {
+      if (entries.has(jobKey)) continue;
+      entries.set(jobKey, { id: row.id, universe: context.universe, universeVersion: context.universeVersion,
+        model: context.model, modelVersion: context.modelVersion, basis: context.basis, benchmark: context.benchmark, classification: context.classification,
+        reference: context.reference, date: context.date, phase, phaseLabel: preparationPhaseLabels[phase], label,
+        status: row.status, progress: row.progress, completedSessions: detail.completedSessions ?? 0, totalSessions: detail.totalSessions ?? null,
+        error: row.error, estimatedRemainingSeconds: detail.estimatedRemainingSeconds ?? null });
+    }
   }
   const targets = [...entries.values()];
-  const result = { dataVersion: version, total: targets.length, complete: 0, running: 0, queued: 0, failed: 0, superseded: 0, universes: [] };
+  const phaseTotals = () => ({ total: 0, complete: 0, running: 0, queued: 0, failed: 0, superseded: 0 });
+  const phases = { current: phaseTotals(), recent: phaseTotals(), history: phaseTotals() };
+  const result = { dataVersion: version, total: targets.length, complete: 0, running: 0, queued: 0, failed: 0, superseded: 0, universes: [], phases };
   const groups = new Map();
   const contexts = new Map();
   for (const target of targets) {
     result[target.status]++;
+    if (phases[target.phase]) {
+      phases[target.phase].total++;
+      phases[target.phase][target.status]++;
+    }
     const group = groups.get(target.universe) || { universe: target.universe, complete: 0, total: 0, stages: {} };
     group.total++;
     group.complete += Number(target.status === 'complete');
@@ -848,14 +964,18 @@ function preparationSummary(db, version) {
   }
   result.universes = [...groups.values()];
   const rangeRows = db.prepare(`SELECT type,status,count(*) AS total FROM jobs WHERE type IN (?,?)
-    AND json_extract(payload,'$.context.dataVersion')=? GROUP BY type,status`).all(rangeType, rangeHistoryType, version);
+    AND json_extract(payload,'$.context.dataVersion')=? ${generation} GROUP BY type,status`).all(rangeType, rangeHistoryType, version, CALCULATION_VERSION);
   const detailRows = db.prepare(`SELECT status,count(*) AS total FROM jobs WHERE type=?
-    AND json_extract(payload,'$.context.dataVersion')=? GROUP BY status`).all(detailType, version);
+    AND json_extract(payload,'$.context.dataVersion')=? ${generation} GROUP BY status`).all(detailType, version, CALCULATION_VERSION);
   const detailCurrent = db.prepare(`SELECT id,status,progress,updated_at AS updatedAt,result FROM jobs WHERE type=?
-    AND json_extract(payload,'$.context.dataVersion')=? AND status='running' ORDER BY rowid DESC LIMIT 1`).get(detailType, version);
+    AND json_extract(payload,'$.context.dataVersion')=? ${generation} AND status='running' ORDER BY rowid DESC LIMIT 1`)
+    .get(detailType, version, CALCULATION_VERSION);
+  const riskRows = db.prepare(`SELECT status,count(*) AS total FROM jobs WHERE type=?
+    AND json_extract(payload,'$.context.dataVersion')=? ${generation} GROUP BY status`).all(riskHistoryType, version, CALCULATION_VERSION);
   return { ...result, contexts: [...contexts.values()], current: targets.find(({ status }) => status === 'running') ?? null,
     failures: targets.filter(({ status }) => status === 'failed').slice(0, 8),
     stockDetails: { ...Object.fromEntries(detailRows.map(({ status, total }) => [status, total])),
+      history: Object.fromEntries(riskRows.map(({ status, total }) => [status, total])),
       current: detailCurrent ? { ...detailCurrent, result: detailCurrent.result ? JSON.parse(detailCurrent.result) : null } : null },
     ranges: { current: Object.fromEntries(rangeRows.filter(({ type }) => type === rangeType).map(({ status, total }) => [status, total])),
       history: Object.fromEntries(rangeRows.filter(({ type }) => type === rangeHistoryType).map(({ status, total }) => [status, total])) } };
@@ -869,10 +989,17 @@ function localStatus(db) {
   const backup = db.prepare(`SELECT id,updated_at,result FROM jobs WHERE type='backup' AND status='complete'
     AND json_extract(result,'$.quickCheck')='ok' ORDER BY updated_at DESC LIMIT 1`).get();
   const verified = backup && JSON.parse(backup.result);
-  return { ...status, bootstrap: bootstrapProgress(db), latestAnalysis: latestAnalysis(db, status.dataVersion),
+  const analysis = latestAnalysis(db, status.dataVersion);
+  const preparation = preparationSummary(db, status.dataVersion);
+  const current = preparation.phases.current;
+  const currentReadiness = analysis?.date === status.latestDate && analysis?.dataVersion === status.dataVersion ? 'ready'
+    : current.running || current.queued ? 'pending' : analysis ? 'prior-revision' : 'unavailable';
+  return { ...status, bootstrap: bootstrapProgress(db), latestAnalysis: analysis,
+    analysisReadiness: readAnalysisReadiness(db, { date: status.latestDate, dataVersion: status.dataVersion, calculationVersion: CALCULATION_VERSION }),
+    currentReadiness: { state: currentReadiness, date: analysis?.date ?? null, dataVersion: analysis?.dataVersion ?? null },
     lastVerifiedBackup: backup ? { jobId: backup.id, completedAt: verified.completedAt ?? backup.updated_at,
       dataVersion: verified.dataVersion, latestDate: verified.latestDate, bytes: verified.bytes, sha256: verified.sha256 } : null,
-    preparation: preparationSummary(db, status.dataVersion), captureSchedule: { enabled: process.env.MARKET_SYNC === '1' && !!process.env.EODHD_API_KEY,
+    preparation, captureSchedule: { enabled: process.env.MARKET_SYNC === '1' && !!process.env.EODHD_API_KEY,
       ...dailyCaptureAvailability(db, session, now, after) } };
 }
 
@@ -1174,7 +1301,7 @@ function divergenceLedger(db, engine, config, model, from, coverage) {
 function readPreparedHealth(db, engine, config, model, coverage, from, limit) {
   const dates = config.date && config.earliestDate ? expectedSessions(from || config.earliestDate, config.date).slice(-limit) : [];
   return healthArchiveRows(db, engine, 'prepared_health', config, model, coverage, dates)
-    .map(({ payload, data_version }) => ({ ...JSON.parse(typeof payload === 'string' ? payload : gunzipSync(payload).toString('utf8')),
+    .map(({ payload, data_version }) => ({ ...decodeStoredJson(payload),
       dataVersion: data_version, requestedDataVersion: config.dataVersion }));
 }
 
@@ -1217,7 +1344,7 @@ function prepareHealth(db, engine, config, { model, coverage, from, limit = 315,
     for (const scope of referenceArchiveScopes(config, rows.map(({ date }) => date))) {
       const key = [healthRecipe(engine, scope.config, model, coverage), config.dataVersion, CALCULATION_VERSION];
       const scoped = scope.dates.map((date) => byDate.get(date));
-      for (const row of scoped) write.run(...key, row.date, gzipSync(JSON.stringify(row), { level: 3 }));
+      for (const row of scoped) write.run(...key, row.date, encodeStoredJson(row));
       writeDivergences(db, engine, scope.config, model, scoped.flatMap((row) => row.divergences), coverage);
     }
     db.exec('COMMIT');
@@ -1229,12 +1356,20 @@ function prepareHealth(db, engine, config, { model, coverage, from, limit = 315,
     missingDates: archived.missingDates };
 }
 
-function prepareStandardHealth(db, engine, config, slice = {}) {
+export function prepareStandardHealth(db, engine, config, slice = {}) {
+  const runs = [];
   for (const model of [DEFAULT_HEALTH_MODEL, ...listWorkspace(db, 'health-model').map(({ id, name, version, definition }) => ({ ...definition, id, name, version }))]) {
     for (const coverage of [researchCoverage(), researchCoverage({ coverageMode: 'observed' })]) {
-      prepareHealth(db, engine, config, { model, coverage, ...slice });
+      runs.push({ model: model.id, coverageMode: coverage.coverageMode,
+        ...prepareHealth(db, engine, config, { model, coverage, ...slice }) });
     }
   }
+  return runs;
+}
+
+export function preparationHistoryWarmup(db) {
+  return Math.max(extremeDefinition.lookback, healthBaseline(),
+    ...listWorkspace(db, 'health-model').map(({ definition }) => healthBaseline(definition)));
 }
 
 function materializationContext(config) {
@@ -1324,6 +1459,10 @@ function rankSeries(db, engine, config, options, enqueue, { supplyDemand = false
       row = { date, rank: stock?.rsRank ?? null, percentile: stock?.rsPercentile ?? null, score: stock?.rsScore ?? null, udv_50d: stock?.udv_50d ?? null };
     }
     if (demandDates) {
+      if (Object.hasOwn(row, 'udv_50d')) {
+        demandPrepared.push(date);
+        return { ...row, supplyDemandPrepared: true };
+      }
       const point = { ...config, date, requestedDate: date };
       const compact = demandDates.has(date) ? readPreparedSnapshot(db, engine, point, { securityIds: [options.securityId] }) : null;
       const snapshot = compact || (date === config.date && engine.snapshotAvailable(point)
@@ -1573,6 +1712,7 @@ function journalCsv(entries) {
 
 export async function performJob(db, type, payload, { provider = EodhdProvider(), progress = () => {}, journalClient, now = () => new Date() } = {}) {
   const engine = createEngine(db);
+  if (type === chartBookIndustryJob) return prepareChartBookIndustries(db, engine, payload, progress);
   if (type === 'leadership-transitions') {
     const config = engine.context(payload.context || {});
     if (!config.date || !config.earliestDate) throw asError('Load market history before comparing weekly leadership');
@@ -1700,6 +1840,21 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
   }
   if (type === 'workspace-precompute') return precomputeWorkspace(db, engine, engine.context(payload.context || {}), { ...payload, progress });
   if (type === preparationType) {
+    if (payload.contexts) {
+      const result = runBatchPreparation(db, engine, payload, progress);
+      if (result.from && result.to) for (const member of payload.contexts) {
+        if (!member.rank) continue;
+        const point = engine.context(member.context);
+        const sessions = expectedSessions(result.from, result.to).length;
+        prepareStandardHealth(db, engine, { ...point, date: result.to, requestedDate: result.to }, { from: result.from, limit: sessions });
+        if (!result.continuation && payload.phase === 'history' && point.universe.id === 'nyse' && point.model.id === 'composite'
+          && point.basis === 'reconstructed' && point.referenceMode === 'as-of' && !point.breadthKeys.length
+          && point.classification === summationContext(db, engine, point).classification) {
+          result.summation = prepareNyseSummation(db, engine, point);
+        }
+      }
+      return result;
+    }
     const result = runPreparation(db, engine, payload, progress);
     const point = engine.context(payload.context);
     if (payload.phase === 'history' && !payload.baseComplete && (result.batch?.baseComplete || !result.continuation) && point.universe.id === 'nyse' && point.model.id === 'composite'
@@ -1718,8 +1873,14 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
   if (type === rangeType) {
     requirePreparationSpace(db);
     const point = engine.context(payload.context);
-    const onSecurity = payload.persistDetails ? createPreparedDetailWriter(db, engine, point) : undefined;
+    const detail = payload.persistDetails ? createPreparedDetailWriter(db, engine, point) : null;
+    const rows = [];
+    const onSecurity = detail ? (row) => {
+      rows.push(row);
+      if (rows.length === 64) detail.batch(rows.splice(0));
+    } : undefined;
     const result = prepareRangeMetrics(db, engine, point, payload.windows, { progress, onSecurity });
+    if (rows.length) detail.batch(rows);
     if (point.dataVersion === dataVersion(db)) {
       result.alerts = updateAlerts(db, engine, { date: point.latestDate, dataVersion: point.dataVersion }, { rangeOnly: true });
     }
@@ -1736,14 +1897,35 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
   if (type === rangeHistoryType) {
     requirePreparationSpace(db, 60);
     const { prepareRangeHistoryBatch } = await import('./range-metrics.mjs');
-    const result = prepareRangeHistoryBatch(db, engine, engine.context(payload.context), payload.windows, { cursor: payload.cursor, progress });
+    const config = engine.context(payload.context);
+    let writer;
+    if (payload.sharedRisk && config.basis === 'reconstructed') {
+      const dates = expectedSessions(payload.sharedRisk.from, config.date);
+      const { windows, benchmarks } = payload.sharedRisk;
+      const risk = { dates, windows, benchmarks, batchSize: 32 };
+      const prepared = prepareRiskHistoryBenchmarks(db, engine, config, risk);
+      writer = createRiskHistoryWriter(db, config, { ...prepared, ...risk });
+    }
+    const result = prepareRangeHistoryBatch(db, engine, config, payload.windows, { cursor: payload.cursor, progress,
+      ...(writer && { onSecurity: (row) => writer.writeSecurity(row) }) });
+    if (writer) result.sharedRisk = writer.flush();
     return { ...result, completedSessions: result.processedSecurities, totalSessions: result.totalSecurities,
       ...(result.done ? {} : { continuation: { cursor: result.cursor } }) };
+  }
+  if (type === riskHistoryType) {
+    requirePreparationSpace(db, 60);
+    const config = engine.context(payload.context);
+    const dates = expectedSessions(payload.from || config.earliestDate, config.date);
+    const result = prepareRiskHistoryBatch(db, engine, config, { dates, windows: payload.riskWindows,
+      benchmarks: payload.benchmarks, progress, bucketSize: 64 });
+    return { ...result, completedSessions: result.processedSecurities, totalSessions: result.totalSecurities,
+      ...(result.done ? {} : { continuation: {} }) };
   }
   if (type === 'production-precompute') {
     const config = engine.context({ ...workspaceDefaults(db), ...payload.context });
     const result = precomputeProduction(db, engine, config, { ...payload, progress });
     prepareStandardHealth(db, engine, config);
+    scheduleChartBookIndustries(db, engine, materializationContext(config), (jobType, input) => createJob(db, jobType, input));
     return result;
   }
   if (type === 'rank-materialize') return writeRankArchive(db, engine, engine.context(payload.context || {}), { ...payload, progress });
@@ -1773,10 +1955,14 @@ function checkpointJobWrites(db) {
 
 export async function runQueuedJob(db, job, { provider, journalClient } = {}) {
   try {
+    if (obsoletePreparation(job.type, job.payload)) {
+      updateJob(db, job.id, 'superseded', 0, null, 'A newer calculation version replaced this preparation');
+      return;
+    }
     const progress = (step) => db.prepare('UPDATE jobs SET updated_at=?,progress=? WHERE id=? AND status=\'running\'')
       .run(new Date().toISOString(), Math.max(1, Math.min(99, Math.round(step * 99))), job.id);
     const result = await performJob(db, job.type, job.payload, { provider, journalClient, progress });
-    if ([preparationType, rangeHistoryType, detailType].includes(job.type) && result.continuation) {
+    if ([preparationType, rangeHistoryType, detailType, riskHistoryType].includes(job.type) && result.continuation) {
       const { continuation, ...checkpoint } = result;
       const payload = JSON.stringify({ ...job.payload, ...continuation, ...(checkpoint.baseComplete && { baseComplete: true }) });
       const superseded = preparationSuperseded(db, job.payload);
@@ -1785,8 +1971,13 @@ export async function runQueuedJob(db, job, { provider, journalClient } = {}) {
           payload, JSON.stringify(checkpoint), superseded ? 'A newer warehouse revision superseded remaining preparation' : null, job.id);
     } else {
       updateJob(db, job.id, 'complete', 100, result);
+      if (job.type === preparationType && job.payload.phase === 'current') {
+        try { scheduleChartBookIndustries(db, createEngine(db), workspaceDefaults(db), (type, input) => createJob(db, type, input)); }
+        catch (error) { console.error('Unable to plan ChartBook industry preparation:', error.message); }
+      }
       if (process.env.MARKET_PRECOMPUTE === '1' && (job.type === 'provider-bootstrap' && result.state === 'complete'
-        || job.type === 'provider-import' && !job.payload.verifiedOnly && result.imported > 0)) {
+        || job.type === 'provider-import' && !job.payload.verifiedOnly && result.imported > 0
+        || job.type === 'production-precompute' && job.payload.scheduledFor && result.dataVersion === dataVersion(db))) {
         try { schedulePreparation(db, createEngine(db)); }
         catch (error) { console.error('Unable to plan post-import preparation:', error.message); }
       }
@@ -1804,6 +1995,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
   const workerPath = new URL('./job-worker.mjs', import.meta.url);
   let pumpScheduled = false;
   let activeJob = null;
+  let checkedPreparationVersion = false;
 
   function schedulePump(wait = 0) {
     if (pumpScheduled || activeJob || !db.isOpen) return;
@@ -1839,6 +2031,10 @@ export function createService({ db, provider, journalClient, workers = true, pre
     if (db.isTransaction) { schedulePump(1000); return; }
     let job;
     try {
+      if (!checkedPreparationVersion) {
+        replaceObsoletePreparation(db, engine);
+        checkedPreparationVersion = true;
+      }
       const waiting = db.prepare(`WITH queued AS (
           SELECT id,type,updated_at,rowid, result, json_extract(payload,'$.phase') AS phase,
             json_extract(payload,'$.context.universe') AS universe,json_extract(payload,'$.context.model') AS model,
@@ -1848,16 +2044,17 @@ export function createService({ db, provider, journalClient, workers = true, pre
         )
         SELECT id FROM queued ORDER BY CASE
           WHEN type IN ('provider-import','provider-bootstrap','provider-reference','nasdaq-refresh','backup','production-precompute') THEN -1
-          WHEN type=? THEN 7
+          WHEN type IN (?,?) THEN 7
           WHEN type=? THEN 2
           WHEN type=? THEN CASE WHEN selected_details THEN 0 ELSE 2 END
+          WHEN type='chartbook-industry' THEN 1
           WHEN type<>? THEN 0
           WHEN (phase='current' OR phase='recent') AND universe IN ('us-core','us-all') AND model='composite'
             AND basis='reconstructed' AND reference='latest' THEN CASE phase WHEN 'current' THEN 1 ELSE 3 END
           WHEN phase='history' AND universe='nyse' AND model='composite' AND basis='reconstructed'
             AND reference='as-of' AND coalesce(json_extract(result,'$.baseComplete'),0)=0 THEN 4
           WHEN phase='current' THEN 5
-          WHEN phase='recent' THEN 6 ELSE 7 END, updated_at, rowid LIMIT 1`).get(rangeHistoryType, rangeType, detailType, preparationType);
+          WHEN phase='recent' THEN 6 ELSE 7 END, updated_at, rowid LIMIT 1`).get(rangeHistoryType, riskHistoryType, rangeType, detailType, preparationType);
       if (!waiting) return;
       const claimed = db.prepare(`UPDATE jobs SET status='running',progress=max(progress,1),updated_at=?
         WHERE id=? AND status='queued' AND NOT EXISTS (SELECT 1 FROM jobs WHERE status='running') RETURNING id`)
@@ -1879,13 +2076,19 @@ export function createService({ db, provider, journalClient, workers = true, pre
     }
     try {
       let failure;
-      const worker = new Worker(workerPath, { workerData: { filename: db.location(), job }, execArgv: [] });
+      const resourceLimits = job.payload.contexts ? {
+        maxOldGenerationSizeMb: Math.min(24576, Math.max(4096, Math.floor(totalmem() / 2 ** 20 * 0.18))),
+      } : undefined;
+      const worker = new Worker(workerPath, { workerData: { filename: db.location(), job }, execArgv: [], resourceLimits });
       worker.once('error', (error) => { failure = error.message; });
       worker.once('exit', (code) => finishJob(job, failure || (code === 0 ? null : `Background worker exited with code ${code}`)));
     } catch (error) { finishJob(job, error.message); }
   }
 
   function enqueue(type, payload, key = null) {
+    if (isAnalysisCalculationJob(type)) {
+      payload = { ...payload, analysisGeneration: { dataVersion: dataVersion(db), calculationVersion: CALCULATION_VERSION } };
+    }
     let job;
     if (key) {
       db.exec('BEGIN IMMEDIATE');
@@ -2008,6 +2211,22 @@ export function createService({ db, provider, journalClient, workers = true, pre
     return { ...options, unprepared: true, materialization: rangePendingStatus(db, engine, point, rangeMetrics) };
   }
 
+  const chartBook = createChartBook(db, engine, {
+    enqueue, pending: pendingPreparation,
+    readSnapshot: (config, options) => readChartBookSnapshot(db, engine, config, options) ?? preparedView(config, options),
+    resolveScreen(config, definition, read) {
+      const point = engine.context({ ...materializationContext(config), ...screenDataNeeds(definition) });
+      const velocity = screenNeedsVelocity(definition);
+      const snapshot = read(point, { velocity });
+      if (!snapshot) return { materialization: pendingPreparation(point) };
+      const windows = rangeWindowsForScreen(definition);
+      const range = windows.length ? readPreparedRangeMetrics(db, rangeContext(engine, point), windows) : null;
+      if (range && !range.ready) return { materialization: rangePendingStatus(db, engine, rangeContext(engine, point), range) };
+      return historicalScreen(db, engine, point, { ...definition, all: true },
+        range ? applyPreparedRangeMetrics(snapshot, range) : snapshot, read);
+    },
+  });
+
   async function dispatch({ method = 'GET', url = '/', body = {} } = {}) {
     try {
       const address = new URL(url, 'http://localhost');
@@ -2030,6 +2249,11 @@ export function createService({ db, provider, journalClient, workers = true, pre
         return asContext(ready ? { ...extra, date: ready.date, dataVersion: ready.dataVersion } : extra);
       };
       const rowPage = () => [parseCount(query.page, 1, 100_000, 1), parseCount(query.perPage, 1, 250, 50)];
+
+      if (area === 'chartbooks') {
+        const { data, status } = await chartBook({ method, item, action, sub, query, body, resolvePoint: listContext });
+        return response(data, status);
+      }
 
       if (area === 'journal') {
         if (item === 'settings') {
@@ -2205,7 +2429,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
             const { test, ...summary } = definition;
             return summary;
           });
-          const limit = parseCount(query.limit, 1, 252, 63);
+          const limit = parseCount(query.limit, 1, 1260, 63);
           const source = historyFor(config, { to: query.to, cadence: 'daily',
             from: query.from ? shiftDate(dateString(query.from), -2 * extremeDefinition.lookback - 16) : undefined,
             limit: limit + extremeDefinition.lookback,
@@ -2228,12 +2452,15 @@ export function createService({ db, provider, journalClient, workers = true, pre
           const { stocks, ...thin } = snapshot;
           const traded = stocks.filter((row) => row.traded);
           const leaders = traded.filter(({ rsRank }) => rsRank != null).sort((a, b) => a.rsRank - b.rsRank).slice(0, 8);
-          const movers = traded.filter((row) => finite(row.return_1d)).sort((a, b) => b.return_1d - a.return_1d);
+          const gainers = traded.filter(({ return_1d }) => finite(return_1d) && return_1d > 0.10 + Number.EPSILON)
+            .sort((a, b) => b.return_1d - a.return_1d);
+          const losers = traded.filter(({ return_1d }) => finite(return_1d) && return_1d < -0.10 - Number.EPSILON)
+            .sort((a, b) => a.return_1d - b.return_1d);
           const model = chooseHealthModel(db, query.healthModel);
           const support = !preparedOnly && snapshot.coverage.state === 'complete' && healthBaseline(model) > 44
             ? historyFor(config, { limit: healthBaseline(model) + 1, cadence: 'daily' }) : null;
           return response({ ...thin, groups: thin.groups.slice(0, 12).map(({ memberIds, ...group }) => group), leaders,
-            movers: { gainers: movers.slice(0, 5), losers: movers.slice(-5).reverse() },
+            movers: { gainers: gainers.slice(0, 5), losers: losers.slice(0, 5), counts: { gainers: gainers.length, losers: losers.length } },
             materialization: preparation?.pending || preparation?.captureInProgress ? preparation : support?.materialization, preparation,
             health: preparedOnly ? readPreparedHealth(db, engine, config, model, researchCoverage(), config.date, 1)[0]
               || { date: config.date, score: null, state: 'unprepared', reason: 'Market health calculations are not yet prepared for this context', components: [] }
@@ -2254,7 +2481,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
           if (query.series === '1' || query.from || query.to) {
             const keys = String(query.metrics || action || 'above_50d,above_200d,up_4pct,down_4pct').split(',')
               .filter((key) => breadthMetric(key) || key === 'adSpread' || leadershipHistoryMetrics.has(key));
-            const limit = parseCount(query.limit, 1, query.materializedOnly ? 7560 : 260, 80);
+            const limit = parseCount(query.limit, 1, query.materializedOnly ? 7560 : query.cadence === 'weekly' ? 260 : 1260, 80);
             const dailyLimit = query.cadence === 'weekly' ? Math.min(7560, limit * 5) : limit;
             const requestedFrom = dateString(query.from, null);
             const onlyStored = query.materializedOnly === '1';
@@ -2283,7 +2510,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
           const coverage = researchCoverage(query);
           const { snapshot, preparation } = readSnapshot(config, { summary: true });
           const model = chooseHealthModel(db, query.healthModel);
-          const visible = parseCount(query.limit, 1, 260, 45);
+          const visible = parseCount(query.limit, 1, 1260, 45);
           const requestedFrom = dateString(query.from, null);
           const stored = readPreparedHealth(db, engine, config, model, coverage, requestedFrom, visible);
           const latest = stored.at(-1);
@@ -2383,7 +2610,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
         if (action === 'rankings') {
           const security = requireStockIdentity(db, config, item);
           return response({ securityId: security.id, ...rankSeries(db, engine, config, { ...query, securityId: security.id,
-            cadence: query.cadence || 'weekly', limit: parseCount(query.limit, 1, 260, 44) }, enqueue, { supplyDemand: true, preparedOnly }) });
+            cadence: query.cadence || 'weekly', limit: parseCount(query.limit, 1, query.cadence === 'daily' ? 1260 : 260, 44) }, enqueue, { supplyDemand: true, preparedOnly }) });
         }
         const lookback = parseCount(query.lookback, 1, 2600, 252);
         const directMembership = (id) => listWorkspace(db, 'watchlist').filter((list) => list.definition.members?.includes(id)).map(({ name }) => name);
@@ -2402,7 +2629,8 @@ export function createService({ db, provider, journalClient, workers = true, pre
                 ? 'observations' : config.basis === 'known' ? 'no-known-observations' : 'no-price-observations' }),
               projected: archive.projected, ...(!chartsReady && detailJobs(db, config, security.id, { exact: config.basis === 'known' || archive.state === 'requires-exact-date' })) },
             risk: { state: archive.riskState, benchmark: config.benchmark, lookback,
-              ...(!riskReady && detailJobs(db, config, security.id, { exact: true, benchmark: config.benchmark, lookback })) },
+              ...(!riskReady && (riskHistoryPending(db, config, lookback) || detailJobs(db, config, security.id,
+                { exact: true, benchmark: config.benchmark, lookback }))) },
             metrics: { state: snapshot ? 'ready' : 'unprepared', ...(!snapshot && pendingPreparation(config)) },
             weekly: { state: weekly ? 'ready' : 'unprepared', ...(!weekly && pendingPreparation(config)) },
           };
@@ -2445,7 +2673,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
           groups: snap.groups.filter((group) => !query.level || group.level === query.level) });
         if (item === 'compare') {
           const ids = String(query.ids || '').split(',').filter(Boolean).slice(0, 8);
-          const limit = parseCount(query.limit, 1, 260, 80);
+          const limit = parseCount(query.limit, 1, query.cadence === 'weekly' ? 260 : 1260, 80);
           const cadence = query.cadence === 'weekly' ? 'weekly' : 'daily';
           const { rows: history, materialization } = historyFor(config, { ...query, cadence: 'daily',
             limit: cadence === 'weekly' ? limit * 5 : limit, visibleRequested: limit });
@@ -2546,7 +2774,9 @@ export function createService({ db, provider, journalClient, workers = true, pre
           if (kind === 'watchlist' && action === 'members' && method === 'POST') {
             if (saved.definition.screenId) throw asError('Edit the dynamic watchlist’s source screen');
             const removed = new Set(validMembers(body.remove));
-            const members = validMembers([...(saved.definition.members || []), ...validMembers(body.add)]).filter((id) => !removed.has(id));
+            const previous = saved.definition.members || [];
+            const members = validMembers([...previous, ...validMembers(body.add)]).filter((id) => !removed.has(id));
+            if (members.length === previous.length && members.every((id, index) => id === previous[index])) return response(saved);
             return response(storeWorkspace(db, kind, { name: saved.name, definition: { members, mode: 'manual', screenId: null } }, saved.id));
           }
           if (!builtin && method === 'PUT' && !action) {

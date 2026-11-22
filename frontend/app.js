@@ -2,6 +2,7 @@ import {
   action, attr, blobDownload, count, dateLabel, empty, field, heading, icon, iconButton, names, notice, option, pathPart, pending, safe, savedScreenRoute,
 } from './ui.js';
 import { exportChart } from './charts.js';
+import { industryDataExplanation, industryDataNames, openCoverageDrawer, priceProvider, universeDefinition } from './coverage.js';
 import { helpTopic, loadHelp, searchHelp } from './help.js';
 
 const viewModules = {
@@ -9,6 +10,8 @@ const viewModules = {
   monitor: () => import('./monitor.js'),
   screener: () => import('./screener.js'),
   rankings: () => import('./screener.js'),
+  stocklists: () => import('./screener.js'),
+  chartbook: () => import('./chartbook.js'),
   industries: () => import('./research.js'),
   history: () => import('./research.js'),
   journal: () => import('./journal.js'),
@@ -20,6 +23,12 @@ const viewModules = {
 };
 const main = document.querySelector('#main');
 const contextBar = document.querySelector('#context-bar');
+const contextToggle = document.querySelector('#context-toggle');
+const replayBanner = document.createElement('aside');
+replayBanner.id = 'historical-replay';
+replayBanner.className = 'historical-replay';
+replayBanner.hidden = true;
+contextBar.after(replayBanner);
 const modal = document.querySelector('#modal');
 const detail = document.querySelector('#detail');
 const help = document.querySelector('#help');
@@ -31,12 +40,14 @@ let configError = '';
 let analysisStatus = null;
 let activeImport = null;
 let activePreparation = null;
+let activeAnalysisJob = false;
 let lastStatusCheck = 0;
 let lastInteraction = Date.now();
 const batchRefreshMs = 30 * 60 * 1000;
 const startupRetryDelays = [400, 1200];
 const refreshableViews = new Set(['overview', 'monitor']);
-const listViews = new Set(['rankings', 'screener', 'watchlists']);
+const listViews = new Set(['rankings', 'screener', 'stocklists', 'watchlists']);
+const compactContextViews = new Set(['chartbook', 'screens', 'watchlists', 'settings', 'journal', 'alerts']);
 for (const type of ['pointerdown', 'keydown', 'input', 'scroll']) {
   document.addEventListener(type, () => { lastInteraction = Date.now(); }, { capture: true, passive: true });
 }
@@ -47,6 +58,7 @@ let buildVersion;
 let buildInfo;
 let nextBuildVersion;
 let checkRunning = false;
+let returningToLatest = false;
 const routePreparations = new Map();
 const contextKeys = ['universe', 'date', 'model', 'benchmark', 'basis', 'classification', 'universeVersion', 'modelVersion', 'dataVersion', 'healthModel', 'reference'];
 const recipeKeys = ['universe', 'universeVersion', 'model', 'modelVersion', 'benchmark', 'basis', 'classification', 'reference'];
@@ -214,18 +226,23 @@ function listAnalysisStatus(status, options) {
   const ready = status?.latestAnalysis;
   return ready && { ...status, latestDate: ready.date, dataVersion: ready.dataVersion, appliedAt: undefined };
 }
-function preparedAnalysisStatus(status, { allowPinned = false } = {}) {
-  if (!status?.preparation?.total || !allowPinned && (route.state.date || route.state.dataVersion)) return null;
-  const context = currentContext();
-  const point = status.preparation.contexts?.find((item) => item.date === status.latestDate &&
-    recipeKeys.every((key) => item[key] == null || String(item[key]) === String(context[key])));
+function preparedAnalysisStatus(status, { allowPinned = false, selection = route } = {}) {
+  if (!status?.preparation?.total || !allowPinned && (selection.state.date || selection.state.dataVersion)) return null;
+  const point = currentPreparationPoint(status, selection);
   return point?.stages?.current === 'complete' && point.stages.recent === 'complete'
     ? { ...status, latestDate: point.date, dataVersion: status.preparation.dataVersion, appliedAt: undefined } : null;
 }
+function currentPreparationPoint(status, selection = route) {
+  const context = currentContext(selection);
+  return status?.preparation?.contexts?.find((item) => item.date === status.latestDate &&
+    recipeKeys.every((key) => item[key] == null || String(item[key]) === String(context[key])));
+}
+const historicalBackfill = (job) => ['recent', 'history'].includes(job?.phase || job?.payload?.phase);
 function dataUpdateCandidate() {
   const status = config?.status;
   if (!status) return null;
-  const next = listViews.has(route.page) ? listAnalysisStatus(status, { allowPinned: true })
+  const next = listViews.has(route.page) || config.automaticPreparation && route.page === 'stock'
+    ? listAnalysisStatus(status, { allowPinned: true })
     : config.automaticPreparation && refreshableViews.has(route.page)
       ? preparedAnalysisStatus(status, { allowPinned: true }) : status;
   const current = snapshotContext();
@@ -236,8 +253,12 @@ function dataUpdateCandidate() {
   return revision > displayedVersion || !route.state.date && !route.state.dataVersion && next.latestDate > displayedDate ? next : null;
 }
 function newerAnalysis(next, current) {
-  return next && (!current || next.latestDate > current.latestDate
-    || next.latestDate === current.latestDate && Number(next.dataVersion) > Number(current.dataVersion));
+  if (!next?.latestDate) return false;
+  if (!current) return true;
+  const nextVersion = Number(next.dataVersion);
+  const currentVersion = Number(current.dataVersion || 0);
+  return nextVersion >= currentVersion && next.latestDate >= (current.latestDate || '') &&
+    (nextVersion > currentVersion || next.latestDate > (current.latestDate || ''));
 }
 function currentListRoute() {
   return listViews.has(route.page) && !route.state.date && !route.state.dataVersion;
@@ -263,47 +284,51 @@ function initialAnalysisStatus(status) {
 }
 
 const importLabels = { 'provider-import': 'Importing prices', 'provider-bootstrap': 'Loading market history', 'provider-reference': 'Loading reference data' };
+const calculationJobs = new Set(['prepare-context', 'prepare-stock-details', 'prepare-range', 'prepare-range-history', 'prepare-risk-history',
+  'materialize', 'rank-materialize', 'workspace-precompute', 'production-precompute', 'health-precompute', 'optimized-five-year']);
 const setIfChanged = (element, text) => { if (element.textContent !== text) element.textContent = text; };
 
-function footerStatus(status, visible, capture, preparing) {
+function analysisReadinessLabel(status) {
+  if (!status) return configError ? 'Analysis unavailable' : 'Checking analysis';
+  const { analysisReadiness: proof, preparation } = status;
+  const currentGeneration = !!proof?.date && proof.date === status.latestDate && proof.dataVersion != null &&
+    Number(proof.dataVersion) === Number(status.dataVersion) && !!proof.calculationVersion && proof.calculationVersion === status.calculationVersion;
+  const work = [preparation, ...Object.values(preparation?.phases || {}), preparation?.stockDetails, preparation?.stockDetails?.history,
+    preparation?.ranges?.current, preparation?.ranges?.history].filter(Boolean);
+  if (activeImport || activeAnalysisJob || status.bootstrap?.active || status.captureSchedule?.state === 'capturing' ||
+      preparation?.current || preparation?.stockDetails?.current || work.some((group) => group.queued > 0 || group.running > 0) ||
+      currentGeneration && proof.state === 'preparing') return 'Analysis preparing';
+
+  // The daily publication and the registered job totals do not certify the full archive.
+  const incomplete = work.some((group) => group.failed > 0 || group.superseded > 0 || group.cancelled > 0 ||
+    group.total > 0 && group.complete !== group.total);
+  return currentGeneration && proof.state === 'ready' && !incomplete ? 'Current analysis ready' : 'Analysis incomplete';
+}
+
+function footerStatus(status) {
   const writeFacts = (id, facts) => {
     const target = document.getElementById(id);
     const html = facts.filter(Boolean).map((value) => `<span>${safe(value)}</span>`).join('');
     if (target.innerHTML !== html) target.innerHTML = html;
   };
   writeFacts('footer-build', [
-    buildInfo?.appVersion ? `App v${buildInfo.appVersion}` : 'Market Intelligence',
-    buildInfo?.releaseId && `Release ${buildInfo.releaseId}`,
-    (buildInfo?.buildHash || buildInfo?.version) && `Build ${buildInfo.buildHash || buildInfo.version}`,
-    (buildInfo?.calculationVersion || status?.calculationVersion) && `Calculation ${buildInfo?.calculationVersion || status.calculationVersion}`,
-    buildInfo?.deployment, buildInfo?.builtAt && `Built ${dateLabel(buildInfo.builtAt)}`,
+    buildInfo?.appVersion ? `App v${buildInfo.appVersion}` : 'Checking app version',
+    buildInfo?.builtAt && `Built ${dateLabel(buildInfo.builtAt)}`,
   ]);
-  const context = snapshotContext();
-  const viewDate = context.date || visible?.latestDate;
-  const revision = context.dataVersion;
-  const raw = status?.dataVersion;
-  const activeCalculations = preparing?.current || activePreparation;
-  const importStatus = capture?.active ? 'History import running' : activeImport
-    ? `${importLabels[activeImport.type]} · ${count(activeImport.progress)}%`
-    : status?.lastSuccess ? `Last import ${dateLabel(status.lastSuccess)}` : '';
-  const prepStatus = activeCalculations ? `Calculations running · ${count(activeCalculations.progress)}%`
-    : preparing?.queued ? `${count(preparing.queued)} calculations queued`
-    : preparing?.failed ? `${count(preparing.failed)} calculations failed`
-    : preparing?.complete ? `${count(preparing.complete)} calculations ready` : '';
   writeFacts('footer-data', [
-    status?.latestDate ? `Prices through ${dateLabel(status.latestDate)}` : configError ? 'Warehouse unavailable' : status ? 'No prices loaded' : 'Checking warehouse',
-    viewDate && viewDate !== status?.latestDate && `View ${dateLabel(viewDate)}`,
-    raw != null && (revision != null && String(raw) !== String(revision) ? `View revision ${revision} / warehouse ${raw}` : `Warehouse revision ${raw}`),
-    importStatus, prepStatus,
+    status?.latestDate && `Prices through ${dateLabel(status.latestDate)}`,
+    status?.lastSuccess && `Last import ${dateLabel(status.lastSuccess)}`,
+    analysisReadinessLabel(status),
   ]);
 }
 
 function statusLine() {
   const status = config?.status;
   const visible = analysisStatus || status;
-  const source = (status?.runs?.find((run) => run.status === 'complete' && run.rows > 0)?.provider
-    || (status?.provider === 'eodhd' ? status.provider : null))?.toUpperCase();
-  setIfChanged(document.querySelector('#source-name'), source ? `${source} warehouse` : 'Market warehouse');
+  const source = priceProvider(status);
+  setIfChanged(document.querySelector('#source-name'), source ? `Prices: ${source}` : 'Market warehouse');
+  const priceSource = document.querySelector('#context-price-source');
+  if (priceSource) setIfChanged(priceSource, source ? `Prices: ${source}` : 'Price source unavailable');
   setIfChanged(document.querySelector('#source-caption'), visible?.latestDate ? `Through ${dateLabel(visible.latestDate)}`
     : configError ? 'Service unavailable' : 'No sessions loaded');
   const badge = document.querySelector('#data-badge');
@@ -312,11 +337,14 @@ function statusLine() {
   const histories = capture?.stages?.prices?.complete;
   const preparing = status?.preparation?.current;
   const active = preparing || activePreparation;
+  const backfill = historicalBackfill(active);
   const update = capture?.active ? (Number.isInteger(histories) && histories > 0 ? `History import · ${count(histories)} symbols` : 'Loading market history')
     : activeImport ? `${importLabels[activeImport.type]} · ${count(activeImport.progress)}%`
-    : active ? `Preparing ${config?.universes?.find(({id}) => id === preparing?.universe)?.name || 'analytics'} · ${count(active.progress)}%` : '';
+    : active ? backfill ? `Historical backfill · ${count(active.progress)}%`
+      : `Preparing ${config?.universes?.find(({id}) => id === preparing?.universe)?.name || 'analytics'} · ${count(active.progress)}%` : '';
   const contents = configError ? '<span class="status-dot"></span> Service unavailable'
-    : update ? `<span class="status-dot syncing"></span><button class="status-action" data-action="warehouse-jobs" type="button" title="View warehouse jobs">${safe(update)}</button>`
+    : update ? `<span class="status-dot syncing"></span>
+      <button class="status-action" data-action="warehouse-jobs" type="button" title="View warehouse jobs">${safe(update)}</button>`
       : visible?.latestDate ? `<span class="status-dot ${available ? 'live' : ''}"></span><span>${available ? 'EOD data' : 'Partial EOD data'}</span>`
         : '<span class="status-dot"></span> Awaiting data';
   if (badge.innerHTML !== contents) badge.innerHTML = contents;
@@ -324,7 +352,16 @@ function statusLine() {
   const viewDate = view.date || visible?.latestDate;
   badge.title = viewDate ? `Analysis through ${dateLabel(viewDate)} · revision ${view.dataVersion ?? 'unknown'}` : '';
   document.querySelector('.data-source .status-dot').classList.toggle('live', available);
-  footerStatus(status, visible, capture, status?.preparation);
+  footerStatus(status);
+  const selectedDate = currentContext().date;
+  replayBanner.hidden = !selectedDate || !status?.latestDate || selectedDate >= status.latestDate;
+  if (replayBanner.hidden) {
+    if (replayBanner.hasChildNodes()) replayBanner.replaceChildren();
+  } else {
+    const content = `<strong role="status">Historical replay · ${safe(dateLabel(selectedDate))}</strong>${action('Return to latest', 'current', 'clock',
+      { disabled: returningToLatest })}`;
+    if (replayBanner.innerHTML !== content) replayBanner.innerHTML = content;
+  }
 }
 
 function updateContextIndicators() {
@@ -391,7 +428,7 @@ async function reloadConfig({ signal, retryTransient = false } = {}) {
     const screens = await api('screens', { plain: true, signal: screensSignal }).catch(() => config?.screens || []);
     signal?.throwIfAborted();
     config = { ...settings, screens };
-    observeBuild(settings.build);
+    if (!buildInfo) observeBuild(settings.build);
     if (!analysisStatus) applyAnalysisStatus(initialAnalysisStatus(config.status));
     configError = '';
   } catch (error) {
@@ -405,11 +442,14 @@ async function reloadConfig({ signal, retryTransient = false } = {}) {
   return config;
 }
 
-function contextOptions(options, key, label, display = (item) => item.name) {
+function contextOptions(options, key, label, display = (item) => item.name, description) {
   const context = currentContext();
   const selected = ['classification', 'reference','benchmark'].includes(key) ? route.state[key] || 'auto' : context[key];
   const values = options.map((item) => typeof item === 'string' ? { id: item, name: item } : item);
-  return `<label class="context-field"><span>${safe(label)}</span><select data-change="context" data-value="${key}" aria-label="${safe(label)}">
+  const descriptionId = `context-${key}-description`;
+  return `<label class="context-field"${attr('title', description)}><span>${safe(label)}</span>
+    ${description ? `<span id="${descriptionId}" class="sr-only">${safe(description)}</span>` : ''}
+    <select data-change="context" data-value="${key}" aria-label="${safe(label)}"${attr('aria-describedby', description ? descriptionId : null)}>
     ${values.some((item) => item.id === selected) ? '' : option(selected || '', selected || 'Select', selected)}
     ${values.map((item) => option(item.id, display(item), selected)).join('')}</select></label>`;
 }
@@ -417,17 +457,19 @@ function contextOptions(options, key, label, display = (item) => item.name) {
 function contextControls() {
   if (!config) return;
   const context = currentContext();
-  contextBar.innerHTML = contextOptions(config.universes || [], 'universe', 'Universe') +
+  const source = priceProvider(config.status);
+  contextBar.innerHTML = contextOptions(config.universes || [], 'universe', 'Universe', undefined, universeDefinition(context.universe)) +
+    `<button type="button" class="button" data-action="universe-counts" aria-haspopup="dialog" aria-controls="detail">${icon('layers')}Universe counts</button>` +
     `<label class="context-field"><span>As of</span><input type="date" aria-label="As-of date" data-change="context" data-value="date"${attr('value', context.date || analysisStatus?.latestDate || config.status?.latestDate)} max="${safe(config.status?.latestDate || '')}"></label>
     ${context.date || context.dataVersion ? iconButton('Return to latest session', 'current', 'clock') : ''}` +
     contextOptions(config.models || [], 'model', 'RS model') +
     contextOptions(['auto', ...(config.benchmarks || [])], 'benchmark', 'Benchmark', (item) =>
       item.id === 'auto' ? `Auto · ${context.benchmark}` : config.availableBenchmarks?.includes(item.id) ? item.name : `${item.name} (unavailable)`) +
     contextOptions([{ id: 'reconstructed', name: 'Reconstructed' }, { id: 'known', name: 'Known then' }], 'basis', 'Data basis') +
-    contextOptions(['auto', ...(config.classificationSystems || ['provider'])], 'classification', 'Classification', (item) => {
-      const label = { provider: 'Provider classification', 'sec-sic': 'SEC filing taxonomy', nasdaq: 'Nasdaq current industries' };
-      return item.id === 'auto' ? `Auto · ${label[context.classification] || context.classification}` : label[item.id] || item.name;
-    }) +
+    contextOptions(['auto', ...(config.classificationSystems || ['provider'])], 'classification', 'Industry data', (item) =>
+      item.id === 'auto' ? `Auto · ${industryDataNames[context.classification] || context.classification}`
+        : industryDataNames[item.id] || item.name, industryDataExplanation) +
+    `<span class="chip" id="context-price-source">${safe(source ? `Prices: ${source}` : 'Price source unavailable')}</span>` +
     contextOptions([
       { id: 'auto', name: context.reference === 'latest' ? 'Auto · latest capture' : 'Auto · as of session' },
       { id: 'latest', name: 'Latest capture (current only)' }, { id: 'as-of', name: 'As of session' },
@@ -439,8 +481,32 @@ function contextControls() {
   updateContextIndicators();
 }
 
+function contextVisibility() {
+  const compact = compactContextViews.has(route.page);
+  const opened = detail.open && detail.contains(contextBar);
+  contextBar.hidden = compact && !opened;
+  contextToggle.hidden = !compact;
+  contextToggle.setAttribute('aria-expanded', String(opened));
+}
+
+function restoreContextBar() {
+  if (!detail.contains(contextBar)) return;
+  replayBanner.before(contextBar);
+  contextVisibility();
+}
+
+function openContext(opener) {
+  if (!compactContextViews.has(route.page)) return;
+  const controls = showDialog(detail, 'Analysis context', '', '', opener);
+  controls.classList.add('context-drawer-body');
+  controls.append(contextBar);
+  contextVisibility();
+  contextBar.querySelector('select')?.focus();
+}
+
 function navState() {
   const title = names[route.page];
+  document.body.classList.toggle('chartbook-route', route.page === 'chartbook');
   document.title = `${title} | Market Intelligence`;
   document.querySelector('#breadcrumb-page').textContent = title;
   helpButton.title = `Help for ${title}`;
@@ -452,6 +518,8 @@ function navState() {
     else link.removeAttribute('aria-current');
   }
   closeNavigation();
+  if (!detail.open) restoreContextBar();
+  contextVisibility();
   contextControls();
   statusLine();
 }
@@ -470,10 +538,11 @@ function focusOpener(opener) {
     [...main.querySelectorAll('[data-action]')].find((control) =>
       control.dataset.action === opener.dataset.action && control.dataset.value === opener.dataset.value);
   const target = opener.isConnected ? opener : fallback;
-  if (target && !target.disabled) target.focus();
+  if (target && !target.disabled && !target.closest('[hidden]')) target.focus();
   else if (!activeDialog()) main.focus();
 }
 
+detail.addEventListener('workspace:dialog-change', restoreContextBar);
 for (const node of [modal, detail, help]) {
   let outsideStart;
   const isBackdrop = (event) => {
@@ -493,6 +562,7 @@ for (const node of [modal, detail, help]) {
   });
   node.addEventListener('close', () => {
     if (node.open) return;
+    if (node === detail) restoreContextBar();
     outsideStart = undefined;
     const index = dialogs.indexOf(node);
     if (index !== -1) dialogs.splice(index, 1);
@@ -551,9 +621,19 @@ function makeEnvironment(signal) {
   });
   return {
     main, modal, detail, page: localRoute.page, params: localRoute.state, config, state: pageStore,
+    coverageContext: { ...requestContext, date: requestContext.date || analysisStatus?.latestDate || config?.status?.latestDate,
+      dataVersion: requestContext.dataVersion ?? config?.status?.dataVersion },
     context: currentContext(), snapshotContext: requestContext, go, routeUrl, api: request,
     publishedSeries: (path, options, onProgress) => publishedSeries(path, options, onProgress, request),
     signal, toast, render, reloadConfig, showDialog, openStock, openAddWatchlist,
+    replaceParams(patch) {
+      if (localRoute !== route || signal?.aborted) return;
+      history.replaceState(null, '', routeUrl(localRoute.page, patch, true));
+      for (const [key, value] of Object.entries(patch)) {
+        if (value == null || value === '') delete localRoute.state[key];
+        else localRoute.state[key] = String(value);
+      }
+    },
     setActions(actions) { activeView = actions; },
     isActive() { return localRoute === route && !signal?.aborted; },
     async exportFile(path, options, filename) { blobDownload(await request(path, { ...options, file: true }), filename); },
@@ -579,7 +659,7 @@ async function render({ reload = false } = {}) {
     if (current !== generation) return;
     const ready = currentListRoute() ? listAnalysisStatus(config.status)
       : refreshableViews.has(route.page) ? preparedAnalysisStatus(config.status) : null;
-    if (ready && (Number(analysisStatus?.dataVersion) !== Number(ready.dataVersion) || analysisStatus?.latestDate !== ready.latestDate)) {
+    if (newerAnalysis(ready, analysisStatus)) {
       applyAnalysisStatus(ready);
       statusLine();
     }
@@ -834,10 +914,11 @@ document.addEventListener('keydown', (event) => {
 });
 
 const globalActions = {
-  current() {
-    const screen = config?.screens.find(({ id }) => id === route.state.screen);
-    return selectContext({ date: null, dataVersion: null,
-      ...(screen && savedScreenRoute(screen.definition).date ? { screen: null } : {}) });
+  current: returnToLatest,
+  'open-context'(value, control) { return openContext(control); },
+  'universe-counts'() {
+    const env = makeEnvironment(controller?.signal);
+    return openCoverageDrawer(env, env.coverageContext);
   },
   'retry-view'() { return render({ reload: true }); },
   async refresh() {
@@ -882,6 +963,36 @@ const globalActions = {
   'close-dialog'(value, element) { element.closest('dialog')?.close(); },
   'export-chart'(value, element) { exportChart(element.closest('.panel')?.querySelector('[data-chart]'), value || 'market-series.csv'); },
 };
+
+async function returnToLatest() {
+  if (returningToLatest) return;
+  returningToLatest = true;
+  const original = route;
+  const view = snapshotContext();
+  statusLine();
+  try {
+    const fresh = await reloadConfig();
+    if (route !== original) return;
+    if (!fresh) return toast('The latest session could not be checked. Try again.');
+    const screen = fresh.screens.find(({ id }) => id === original.state.screen);
+    const patch = { date: null, dataVersion: null,
+      ...(screen && savedScreenRoute(screen.definition).date ? { screen: null } : {}) };
+    const selection = routeFromUrl(routeUrl(route.page, patch, true));
+    const ready = listAnalysisStatus(fresh.status, { selection }) ||
+      (!fresh.automaticPreparation || !fresh.status?.preparation?.total ? fresh.status : null);
+    const minimum = Math.max(Number(view.dataVersion || 0), Number(analysisStatus?.dataVersion || 0));
+    if (ready?.latestDate && Number(ready.dataVersion) >= minimum && ready.latestDate >= (view.date || '')) {
+      applyAnalysisStatus(ready);
+    } else if (Number(view.dataVersion) > Number(analysisStatus?.dataVersion || 0)) {
+      // Keep an explicitly selected, newer receipt when its replacement is still preparing.
+      patch.dataVersion = view.dataVersion;
+    }
+    await selectContext(patch);
+  } finally {
+    returningToLatest = false;
+    statusLine();
+  }
+}
 
 async function selectContext(patch) {
   const page = route.page;
@@ -983,6 +1094,7 @@ async function checkBuild(force = false) {
     if (jobs.status === 'fulfilled') {
       activeImport = jobs.value.find((job) => Object.hasOwn(importLabels, job.type) && ['queued', 'running'].includes(job.status)) || null;
       activePreparation = jobs.value.find((job) => job.type === 'prepare-context' && job.status === 'running') || null;
+      activeAnalysisJob = jobs.value.some((job) => calculationJobs.has(job.type) && ['queued', 'running', 'building'].includes(job.status));
       document.dispatchEvent(new window.CustomEvent('warehouse:jobs', { detail: jobs.value }));
     }
     if (checkStatus && build.status === 'fulfilled') observeBuild(build.value);

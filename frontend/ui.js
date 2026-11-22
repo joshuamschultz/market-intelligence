@@ -40,8 +40,8 @@ const glyphs = {
 };
 
 export const names = {
-  overview: 'Market Overview', monitor: 'Market Monitor', screener: 'Stock Screener', rankings: 'RS Rankings', industries: 'Industries',
-  history: 'Historical Explorer', journal: 'Market Journal', screens: 'Saved Screens', watchlists: 'Watchlists', alerts: 'Alerts', settings: 'Settings & Data',
+  overview: 'Market Overview', monitor: 'Market Monitor', screener: 'Stock Screener', rankings: 'RS Rankings', stocklists: 'Stock Lists', industries: 'Industries',
+  history: 'Historical Explorer', journal: 'Market Journal', chartbook: 'ChartBook', screens: 'Saved Screens', watchlists: 'Watchlists', alerts: 'Alerts', settings: 'Settings & Data',
   stock: 'Ticker',
 };
 const escaped = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -110,9 +110,9 @@ export const breadthMoveHelp = {
   visible: 'How many dated rows the table shows. Each row uses the lookback listed in its column header.',
   window: 'Trading sessions between the two split-adjusted closing prices. 63 sessions is about three months and 126 is about six. Each row uses its own closing date.',
   threshold: 'For a 34-session comparison at 13%, the downside reading counts a 34-session return of −15% and excludes −5%. The upside reading counts returns of +13% or more.',
-  scale: 'Auto gives each group a shared scale for gains and losses based on its largest visible reading. Common uses 0–100% for every group. The printed percentages retain their exact values.',
+  scale: 'Focus range gives each group a shared axis for gains and losses based on its largest visible reading. Full scale uses 0–100% for every group. Printed percentages keep their original values.',
   counts: 'The numerator counts stocks that meet the rule. The denominator counts traded stocks with enough comparable price history for that rule. 100 of 1,000 is 10%.',
-  extremes: 'Compare each reading with the prior 252 sessions. A marker requires at least 60 valid readings and identifies the top or bottom tenth.',
+  extremes: 'Compare each reading with the prior 252 sessions. A marker requires at least 60 valid readings. By default it marks the top or bottom 5%. Choose 2% for rarer extremes or 10% for more.',
   statistics: 'SMA is the average of the last 5, 10, or 20 daily participation percentages. Δ is the change in percentage points versus 1, 5, or 21 trading sessions ago.',
 };
 export function helpTooltip(id, label, description) {
@@ -341,7 +341,7 @@ export function table(rows, columns, options = {}) {
       : safe(label)}</th>`;
   }).join('');
   const rowMarkup = rows.map((row, index) => `<tr aria-rowindex="${index + 2}">${options.selectable ? `<td class="pin-check"><input type="checkbox" data-change="select-stock" value="${safe(rowKey(row))}" aria-label="Select ${safe(row.symbol)}"${options.selected.has(rowKey(row)) ? ' checked' : ''}></td>` : ''}
-    ${columns.map((id) => `<td class="${id === 'symbol' || id === 'name' ? `pin-${id}` : ''}${fieldDetails(id, computed, row).format !== 'text' ? ' numeric' : ''}">${cellValue(id, row, computed)}</td>`).join('')}
+    ${columns.map((id) => `<td class="${id === 'symbol' || id === 'name' ? `pin-${id}` : ''}${fieldDetails(id, computed, row).format !== 'text' ? ' numeric' : ''}">${options.cells?.[id]?.(row) ?? cellValue(id, row, computed)}</td>`).join('')}
     ${options.rowAction ? `<td>${options.rowAction(row)}</td>` : ''}</tr>`);
   const span = columns.length + Number(!!options.selectable) + Number(!!options.rowAction);
   const virtualId = options.virtualRows && rows.length > visibleTableRows ? `table-${++tableSequence}` : '';

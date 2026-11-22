@@ -12,8 +12,24 @@ for (const filename of analyticsSources) sourceHash.update(readFileSync(new URL(
 import { shiftDate } from './calendar.mjs';
 
 export const CALCULATION_VERSION = `2-${sourceHash.digest('hex').slice(0, 12)}`;
-export const isoDate = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
-  && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+const daysInMonth = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function decimalPair(value, offset) {
+  const tens = value.charCodeAt(offset) - 48;
+  const ones = value.charCodeAt(offset + 1) - 48;
+  return tens >= 0 && tens <= 9 && ones >= 0 && ones <= 9 ? tens * 10 + ones : -1;
+}
+
+export function isoDate(value) {
+  if (typeof value !== 'string' || value.length !== 10 || value[4] !== '-' || value[7] !== '-') return false;
+  const century = decimalPair(value, 0);
+  const yearInCentury = decimalPair(value, 2);
+  const month = decimalPair(value, 5);
+  const day = decimalPair(value, 8);
+  if (century < 0 || yearInCentury < 0 || month < 1 || month > 12 || day < 1) return false;
+  const leapDay = month === 2 && yearInCentury % 4 === 0 && (yearInCentury !== 0 || century % 4 === 0);
+  return day <= daysInMonth[month] + Number(leapDay);
+}
 export const today = () => new Date().toISOString().slice(0, 10);
 const marketDayFormat = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
 export const marketDay = (timestamp = new Date()) => marketDayFormat.format(new Date(timestamp));

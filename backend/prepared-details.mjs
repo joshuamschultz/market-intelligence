@@ -1,19 +1,18 @@
 import { createHash } from 'node:crypto';
-import { gzipSync, gunzipSync } from 'node:zlib';
 import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
 import { expectedSessions } from './calendar.mjs';
 import { CALCULATION_VERSION, isoDate, normalizeSymbol } from './database.mjs';
 import { UNIVERSES } from './engine.mjs';
 import { mean, quantile } from './metrics.mjs';
+import { detailRiskWindows, normalizeRiskBenchmarks, normalizeRiskWindows, readRiskHistory } from './risk-history.mjs';
+import { decodeStoredJson, encodeStoredJson } from './storage-codec.mjs';
 
 const format = 'prepared-details-1';
 const maximumSessions = 7560;
 const wholeCatalog = UNIVERSES.find(({ id }) => id === 'us-all');
 const pinnedScope = Symbol('prepared detail scope');
-export const detailRiskWindows = Object.freeze([21, 63, 126, 252, 504, 704]);
+export { detailRiskWindows };
 const digest = (value) => createHash('sha256').update(value).digest('hex');
-const encode = (value) => gzipSync(JSON.stringify(value), { level: 6 });
-const decode = (value) => JSON.parse(gunzipSync(value));
 const barFields = [
   'open', 'high', 'low', 'close', 'rawClose', 'volume', 'rawVolume', 'dollarVolume', 'traded',
   'missing', 'unverifiedSplit', 'priceQuarantined', 'volumeQuarantined', 'quality',
@@ -49,26 +48,10 @@ const keyFor = (config, id, dataVersion = config.dataVersion, date = config.date
 const pick = (source, names) => Object.fromEntries(names.filter((name) => Object.hasOwn(source, name)).map((name) => [name, source[name]]));
 const present = (db) => db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='prepared_detail_products'").get();
 
-function normalizedWindows(values = detailRiskWindows) {
-  if (!Array.isArray(values) || values.length > 24 || values.some((value) => !Number.isInteger(value) || value < 1 || value > maximumSessions)) {
-    throw new RangeError('Risk lookbacks must be whole trading-session counts from 1 to 7,560');
-  }
-  return [...new Set(values)].sort((a, b) => a - b);
-}
-
-function normalizedBenchmarks(values = [], preferred) {
-  if (!Array.isArray(values) || values.length > 24) throw new RangeError('Choose up to 24 prepared risk benchmarks');
-  const result = [...new Set(['SPY', 'VTI', preferred, ...values].filter(Boolean).map(normalizeSymbol))].sort();
-  if (result.length > 24) throw new RangeError('Choose up to 24 prepared risk benchmarks including SPY and VTI');
-  if (result.some((value) => !value || value.length > 30)) throw new RangeError('Invalid prepared risk benchmark');
-  return result;
-}
-
-export function riskMetrics(detail, benchmark) {
+function stockRisk(detail) {
   const bars = detail.chartBars || detail.bars;
-  const benchmarkDates = benchmark instanceof Map ? benchmark : new Map(benchmark?.map((row) => [row.date, row.close]) || []);
   const returns = [];
-  const pairing = [];
+  const edges = [];
   let peak = 0;
   let drawdown = 0;
   let previous;
@@ -85,11 +68,22 @@ export function riskMetrics(detail, benchmark) {
     if (previous) {
       const value = bar.close / previous.close - 1;
       returns.push(value);
-      if (benchmarkDates.get(previous.date) > 0 && benchmarkDates.get(bar.date) > 0) {
-        pairing.push([value, benchmarkDates.get(bar.date) / benchmarkDates.get(previous.date) - 1]);
-      }
+      edges.push([previous.date, bar.date, value]);
     }
     previous = bar;
+  }
+  const percentile = returns.length >= 20 ? quantile(returns, 0.05) : null;
+  return { edges, values: { observations: returns.length, maximumDrawdown: priced ? drawdown : null,
+    dailyHistoricalReturn5pct: percentile, dailyHistoricalVaR95: percentile == null ? null : Math.max(0, -percentile),
+    annualizedVolatility: detail.volatility_20d, atr14: detail.atr_14d } };
+}
+
+function pairedRisk(edges, benchmarkDates) {
+  const pairing = [];
+  for (const [previous, date, value] of edges) {
+    const start = benchmarkDates.get(previous);
+    const end = benchmarkDates.get(date);
+    if (start > 0 && end > 0) pairing.push([value, end / start - 1]);
   }
   const x = mean(pairing.map((item) => item[0]));
   const y = mean(pairing.map((item) => item[1]));
@@ -97,14 +91,16 @@ export function riskMetrics(detail, benchmark) {
   const stockVariance = mean(pairing.map(([a]) => (a - x) ** 2));
   const benchmarkVariance = mean(pairing.map(([, b]) => (b - y) ** 2));
   return {
-    observations: returns.length, benchmarkObservations: pairing.length,
-    maximumDrawdown: priced ? drawdown : null,
+    benchmarkObservations: pairing.length,
     beta: pairing.length >= 20 && benchmarkVariance > 0 ? covariance / benchmarkVariance : null,
     correlation: pairing.length >= 20 && stockVariance > 0 && benchmarkVariance > 0 ? covariance / Math.sqrt(stockVariance * benchmarkVariance) : null,
-    dailyHistoricalReturn5pct: returns.length >= 20 ? quantile(returns, 0.05) : null,
-    dailyHistoricalVaR95: returns.length >= 20 ? Math.max(0, -quantile(returns, 0.05)) : null,
-    annualizedVolatility: detail.volatility_20d, atr14: detail.atr_14d,
   };
+}
+
+export function riskMetrics(detail, benchmark) {
+  const benchmarkDates = benchmark instanceof Map ? benchmark : new Map(benchmark?.map((row) => [row.date, row.close]) || []);
+  const { edges, values } = stockRisk(detail);
+  return { ...values, ...pairedRisk(edges, benchmarkDates) };
 }
 
 function canonicalContext(config) {
@@ -144,7 +140,7 @@ function chartBlocks(chartBars) {
     groups.get(key).push(packedBar(bar));
   }
   return [...groups.values()].map((bars) => {
-    const blob = encode(bars);
+    const blob = encodeStoredJson(bars);
     return { first: bars[0][0], last: bars.at(-1)[0], count: bars.length, hash: digest(blob), blob };
   });
 }
@@ -180,46 +176,73 @@ function validDetail(config, detail) {
   }
 }
 
-export function writePreparedDetail(db, config, detail, { riskByBenchmark = {}, explicitSplitPriceBasis = false } = {}) {
-  validDetail(config, detail);
+const productWriters = new WeakMap();
+
+function productWriter(db) {
+  if (productWriters.has(db)) return productWriters.get(db);
   db.exec(schema);
-  const key = keyFor(config, detail.securityId);
   const check = db.prepare(`SELECT 1 FROM prepared_detail_products WHERE ${keyWhere}`);
-  const existing = check.get(...key);
-  const chart = existing ? [] : chartBlocks(detail.chartBars);
-  const chartManifest = chart.map(({ first, last, count, hash }) => ({ first, last, count, hash }));
-  const header = existing ? null : encode(productHeader(detail, explicitSplitPriceBasis));
   const getRisk = db.prepare(`SELECT value FROM prepared_detail_risk WHERE ${keyWhere} AND benchmark=?`);
   const putRisk = db.prepare(`INSERT INTO prepared_detail_risk VALUES (?,?,?,?,?,?,?)
     ON CONFLICT(calculation_version,basis,security_id,data_version,anchor_date,benchmark) DO UPDATE SET value=excluded.value`);
   const block = db.prepare('INSERT OR IGNORE INTO prepared_detail_blocks VALUES (?,?)');
   const put = db.prepare('INSERT OR IGNORE INTO prepared_detail_products VALUES (?,?,?,?,?,?,?)');
-  const nested = db.isTransaction;
-  db.exec(nested ? 'SAVEPOINT prepare_detail' : 'BEGIN IMMEDIATE');
-  let written = 0;
-  let risksWritten = 0;
-  let blocksWritten = 0;
-  try {
-    if (header && !check.get(...key)) {
-      for (const item of chart) blocksWritten += block.run(item.hash, item.blob).changes;
-      written = put.run(...key, header, encode(chartManifest)).changes;
-    }
-    for (const [benchmark, risks] of Object.entries(riskByBenchmark)) {
-      const ticker = normalizeSymbol(benchmark);
+  const writer = {
+    has(key) { return Boolean(check.get(...key)); },
+    risk(key, ticker) {
       const saved = getRisk.get(...key, ticker)?.value;
-      const values = saved ? decode(saved) : {};
-      const additions = Object.entries(risks).filter(([window]) => !Object.hasOwn(values, window));
-      if (!additions.length) continue;
-      putRisk.run(...key, ticker, encode({ ...values, ...Object.fromEntries(additions) }));
-      risksWritten += additions.length;
-    }
-    db.exec(nested ? 'RELEASE prepare_detail' : 'COMMIT');
-  } catch (error) {
-    if (nested) db.exec('ROLLBACK TO prepare_detail; RELEASE prepare_detail');
-    else if (db.isTransaction) db.exec('ROLLBACK');
-    throw error;
-  }
-  return { written: Boolean(written), risksWritten, blocksWritten, securityId: detail.securityId, date: config.date, dataVersion: config.dataVersion };
+      return saved ? decodeStoredJson(saved) : {};
+    },
+    encode(key, detail, riskByBenchmark, explicitSplitPriceBasis) {
+      const existing = writer.has(key);
+      const chart = existing ? [] : chartBlocks(detail.chartBars);
+      const manifest = chart.map(({ first, last, count, hash }) => ({ first, last, count, hash }));
+      return { key, securityId: detail.securityId, chart, riskByBenchmark,
+        header: existing ? null : encodeStoredJson(productHeader(detail, explicitSplitPriceBasis)),
+        blocks: existing ? null : encodeStoredJson(manifest) };
+    },
+    commit(records, checkpoint) {
+      if (!records.length && !checkpoint) return [];
+      const nested = db.isTransaction;
+      db.exec(nested ? 'SAVEPOINT prepare_detail' : 'BEGIN IMMEDIATE');
+      try {
+        const results = records.map(({ key, securityId, chart, header, blocks, riskByBenchmark }) => {
+          let written = false;
+          let risksWritten = 0;
+          let blocksWritten = 0;
+          if (header && !writer.has(key)) {
+            for (const item of chart) blocksWritten += block.run(item.hash, item.blob).changes;
+            written = Boolean(put.run(...key, header, blocks).changes);
+          }
+          for (const [benchmark, risks] of Object.entries(riskByBenchmark)) {
+            const ticker = normalizeSymbol(benchmark);
+            const saved = writer.risk(key, ticker);
+            const additions = Object.entries(risks).filter(([window]) => !Object.hasOwn(saved, window));
+            if (!additions.length) continue;
+            for (const [window, value] of additions) saved[window] = value;
+            putRisk.run(...key, ticker, encodeStoredJson(saved));
+            risksWritten += additions.length;
+          }
+          return { written, risksWritten, blocksWritten, securityId, date: key[4], dataVersion: key[3] };
+        });
+        checkpoint?.(results);
+        db.exec(nested ? 'RELEASE prepare_detail' : 'COMMIT');
+        return results;
+      } catch (error) {
+        if (nested) db.exec('ROLLBACK TO prepare_detail; RELEASE prepare_detail');
+        else if (db.isTransaction) db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+  };
+  productWriters.set(db, writer);
+  return writer;
+}
+
+export function writePreparedDetail(db, config, detail, { riskByBenchmark = {}, explicitSplitPriceBasis = false } = {}) {
+  validDetail(config, detail);
+  const writer = productWriter(db);
+  return writer.commit([writer.encode(keyFor(config, detail.securityId), detail, riskByBenchmark, explicitSplitPriceBasis)])[0];
 }
 
 function findProduct(db, config, securityId, { exactOnly = false } = {}) {
@@ -239,7 +262,7 @@ function findProduct(db, config, securityId, { exactOnly = false } = {}) {
     if (!usableArchiveRow(bounds, { date: config.date, data_version: row.data_version })) continue;
     const product = get.get(...keyFor(config, securityId, row.data_version, row.anchor_date));
     if (!product) continue;
-    const header = decode(product.header);
+    const header = decodeStoredJson(product.header);
     if (header.format !== format) continue;
     if (row.anchor_date !== config.date && header.unsafeBefore > config.date) {
       rejected = true;
@@ -264,7 +287,7 @@ function readBars(db, manifest, date, lookback) {
     if (block.first > date) continue;
     const payload = read.get(block.hash)?.value;
     if (!payload) throw new Error('Prepared stock chart block is missing');
-    const rows = decode(payload).filter(([rowDate]) => rowDate <= date).slice(-remaining);
+    const rows = decodeStoredJson(payload).filter(([rowDate]) => rowDate <= date).slice(-remaining);
     collected.push(rows);
     remaining -= rows.length;
   }
@@ -293,54 +316,60 @@ function splitProjection(bars, actions, date, anchorDate) {
 export function readPreparedDetail(db, config, securityId, { lookback = 252, benchmark = config.benchmark } = {}) {
   if (!Number.isInteger(lookback) || lookback < 1 || lookback > maximumSessions) throw new RangeError('Invalid stock detail lookback');
   const product = findProduct(db, config, securityId);
-  if (product.state !== 'ready') return { state: product.state, riskState: 'not-prepared', detail: null, sourceDataVersion: null, anchorDate: null, projected: false };
+  const historical = () => readRiskHistory(db, config, securityId, { lookback, benchmark });
+  if (product.state !== 'ready') {
+    const archived = historical();
+    return { state: product.state, riskState: archived.state, detail: archived.risk ? { risk: archived.risk,
+      riskSourceDataVersion: archived.sourceDataVersion } : null, sourceDataVersion: null, anchorDate: null, projected: false };
+  }
   const { header, anchorDate, sourceDataVersion } = product;
   const projected = anchorDate !== config.date;
   const { actions, quality, aliases, ...metadata } = header;
   const visibleAliases = aliases.filter((alias) => !alias.valid_from || alias.valid_from <= config.date);
   const identity = projected ? visibleAliases.filter((alias) => !alias.valid_to || alias.valid_to >= config.date)
     .toSorted((left, right) => (right.valid_from || '').localeCompare(left.valid_from || '') || left.symbol.localeCompare(right.symbol))[0] : null;
-  const chartBars = readBars(db, decode(product.blocks), config.date, lookback);
+  const chartBars = readBars(db, decodeStoredJson(product.blocks), config.date, lookback);
   const bars = projected ? splitProjection(chartBars, actions, config.date, anchorDate) : chartBars;
-  if (!bars) return { state: 'requires-exact-date', riskState: 'not-prepared', detail: null, sourceDataVersion, anchorDate, projected: false };
+  if (!bars) {
+    const archived = historical();
+    return { state: 'requires-exact-date', riskState: archived.state, detail: archived.risk ? { risk: archived.risk,
+      riskSourceDataVersion: archived.sourceDataVersion } : null, sourceDataVersion, anchorDate, projected: false };
+  }
   const quotes = bars.filter((bar) => !bar.missing);
   const current = bars.at(-1)?.date === config.date ? bars.at(-1) : null;
   const storedRisk = projected ? null : db.prepare(`SELECT value FROM prepared_detail_risk WHERE ${keyWhere} AND benchmark=?`)
     .get(...keyFor(config, securityId, sourceDataVersion, anchorDate), normalizeSymbol(benchmark))?.value;
-  const risk = storedRisk ? decode(storedRisk)[lookback] ?? null : null;
+  const exactRisk = storedRisk ? decodeStoredJson(storedRisk)[lookback] ?? null : null;
+  const archived = exactRisk ? null : historical();
+  const risk = exactRisk ?? archived?.risk ?? null;
   const visibleQuality = quality.filter((issue) => !issue.effective_from || issue.effective_from <= config.date);
   const rawMetadata = projected ? {
     symbol: identity?.symbol ?? null, exchange: identity?.exchange ?? null,
     earliestDate: metadata.earliestDate <= config.date ? metadata.earliestDate : null,
     latestDate: quotes.at(-1)?.date ?? null,
-    warnings: ['Chart prices project the prepared reconstructed split basis. Historical high and risk statistics require their exact session.'],
+    warnings: ['Chart prices project the prepared reconstructed split basis. Historical highs require their exact session.',
+      ...(risk ? [] : ['Historical risk has not been prepared for this session.'])],
   } : pick(metadata, [...identityFields, ...highFields, 'earliestDate', 'latestDate', 'warnings']);
   return {
-    state: 'ready', riskState: risk ? 'ready' : 'not-prepared', sourceDataVersion, anchorDate, projected,
+    state: 'ready', riskState: risk ? 'ready' : archived?.state ?? 'not-prepared', sourceDataVersion, anchorDate, projected,
     detail: {
       ...rawMetadata, securityId, date: config.date, dataVersion: config.dataVersion, sourceDataVersion,
       calculationVersion: CALCULATION_VERSION, basis: config.basis, referenceDate: config.date, referenceMode: 'as-of',
       close: current?.close ?? null, traded: current?.traded ?? false,
       aliases: visibleAliases, actions: actions.filter((action) => action.date <= config.date), quality: visibleQuality,
-      chartBars: bars, bars: quotes, risk,
+      chartBars: bars, bars: quotes, risk, ...(archived?.risk && { riskSourceDataVersion: archived.sourceDataVersion }),
     },
   };
 }
 
-export function createPreparedDetailWriter(db, engine, config, { benchmarks, riskWindows } = {}) {
-  const tickers = normalizedBenchmarks(benchmarks, config.benchmark);
-  const windows = normalizedWindows(riskWindows);
+export function createPreparedDetailWriter(db, engine, config, { benchmarks, riskWindows, sourceDb = db } = {}) {
+  const tickers = normalizeRiskBenchmarks(benchmarks, config.benchmark);
+  const windows = normalizeRiskWindows(riskWindows);
   const prepared = canonicalContext(config);
   if (!config.date || !config.earliestDate) throw new Error('Load prices before preparing stock detail');
-  db.exec(schema);
-  const getRisk = db.prepare(`SELECT value FROM prepared_detail_risk WHERE ${keyWhere} AND benchmark=?`);
-  const getProduct = db.prepare(`SELECT 1 FROM prepared_detail_products WHERE ${keyWhere}`);
-  const explicitPriceBasis = db.prepare(`SELECT 1 FROM price_revisions WHERE security_id=? AND version<=? AND date<=?
+  const product = productWriter(db);
+  const explicitPriceBasis = sourceDb.prepare(`SELECT 1 FROM price_revisions WHERE security_id=? AND version<=? AND date<=?
     AND split_close>0 LIMIT 1`);
-  const priorRisks = (key, ticker) => {
-    const saved = getRisk.get(...key, ticker)?.value;
-    return saved ? decode(saved) : {};
-  };
   let maps;
   function benchmarkMaps() {
     if (maps) return maps;
@@ -349,28 +378,32 @@ export function createPreparedDetailWriter(db, engine, config, { benchmarks, ris
     maps = new Map(tickers.map((ticker) => [ticker, new Map((benchmarkBars.get(ticker) ?? []).map((bar) => [bar.date, bar.close]))]));
     return maps;
   }
-  const write = (detail) => {
+  const encode = (detail) => {
     validDetail(config, detail);
     const key = keyFor(config, detail.securityId);
+    const saved = windows.length ? tickers.map((ticker) => [ticker, product.risk(key, ticker)]) : [];
     const riskByBenchmark = {};
-    for (const ticker of tickers) {
-      const existing = priorRisks(key, ticker);
-      const missing = windows.filter((window) => !Object.hasOwn(existing, window));
+    for (const window of windows) {
+      const missing = saved.filter(([, values]) => !Object.hasOwn(values, window));
       if (!missing.length) continue;
-      const map = benchmarkMaps().get(ticker);
-      riskByBenchmark[ticker] = Object.fromEntries(missing.map((window) =>
-        [window, riskMetrics({ ...detail, chartBars: detail.chartBars.slice(-window) }, map)]));
+      const { edges, values } = stockRisk({ ...detail, chartBars: detail.chartBars.slice(-window) });
+      for (const [ticker] of missing) {
+        const risks = riskByBenchmark[ticker] ||= {};
+        risks[window] = { ...values, ...pairedRisk(edges, benchmarkMaps().get(ticker)) };
+      }
     }
     const hasSplit = detail.actions?.some((action) => action.type === 'split' && action.factor > 0 && action.date <= config.date);
-    const explicit = hasSplit && Boolean(explicitPriceBasis.get(detail.securityId, config.dataVersion, config.date));
-    return writePreparedDetail(db, config, detail, { riskByBenchmark, explicitSplitPriceBasis: explicit });
+    const explicit = hasSplit && (detail.explicitSplitPriceBasis ?? Boolean(explicitPriceBasis.get(detail.securityId, config.dataVersion, config.date)));
+    return product.encode(key, detail, riskByBenchmark, explicit);
   };
+  const write = (detail) => product.commit([encode(detail)])[0];
+  write.batch = (details, checkpoint) => product.commit(details.map(encode), checkpoint);
   write.ready = (securityId) => {
     const key = keyFor(config, securityId);
-    return Boolean(getProduct.get(...key)) && tickers.every((ticker) => {
-      const saved = priorRisks(key, ticker);
+    return product.has(key) && (!windows.length || tickers.every((ticker) => {
+      const saved = product.risk(key, ticker);
       return windows.every((window) => Object.hasOwn(saved, window));
-    });
+    }));
   };
   return write;
 }
@@ -386,7 +419,7 @@ function batchResult(config, row, progress) {
 }
 
 export function prepareDetailsBatch(db, engine, config, {
-  cursor = null, bucketSize = 64, securityIds, benchmarks, riskWindows, progress = () => {}, signal,
+  cursor = null, bucketSize = 64, securityIds, benchmarks, riskWindows, progress = () => {}, signal, sourceDb = db,
 } = {}) {
   signal?.throwIfAborted();
   if (!config.date || !config.earliestDate) throw new Error('Load prices before preparing stock detail');
@@ -395,41 +428,50 @@ export function prepareDetailsBatch(db, engine, config, {
   if (securityIds != null && (!Array.isArray(securityIds) || securityIds.length > 256 ||
       securityIds.some((id) => typeof id !== 'string' || !id))) throw new TypeError('Choose up to 256 permanent security IDs');
   const ids = securityIds == null ? null : [...new Set(securityIds)].sort();
-  const tickers = normalizedBenchmarks(benchmarks, config.benchmark);
-  const windows = normalizedWindows(riskWindows);
+  const tickers = normalizeRiskBenchmarks(benchmarks, config.benchmark);
+  const windows = normalizeRiskWindows(riskWindows);
   const hash = digest(JSON.stringify([format, CALCULATION_VERSION, config.basis, config.date, config.dataVersion, tickers, windows, ids]));
   db.exec(schema);
   const read = db.prepare('SELECT * FROM prepared_detail_batches WHERE id=?');
   let state = read.get(hash);
   if (!state) {
-    const total = ids?.length ?? db.prepare(`SELECT count(*) AS count ${roster}`).get(config.dataVersion, config.date).count;
+    const total = ids?.length ?? sourceDb.prepare(`SELECT count(*) AS count ${roster}`).get(config.dataVersion, config.date).count;
     db.prepare('INSERT OR IGNORE INTO prepared_detail_batches(id,total,complete) VALUES (?,?,?)').run(hash, total, Number(total === 0));
     state = read.get(hash);
   }
   if (state.complete) return batchResult(config, state, progress);
   const previous = state.cursor ?? '';
   const requested = ids ? ids.filter((id) => id > previous).slice(0, bucketSize)
-    : db.prepare(`SELECT id ${roster} AND id>? ORDER BY id LIMIT ?`).all(config.dataVersion, config.date, previous, bucketSize).map(({ id }) => id);
+    : sourceDb.prepare(`SELECT id ${roster} AND id>? ORDER BY id LIMIT ?`).all(config.dataVersion, config.date, previous, bucketSize).map(({ id }) => id);
   const point = canonicalContext(config);
-  const write = createPreparedDetailWriter(db, engine, point, { benchmarks: tickers, riskWindows: windows });
-  const exists = ids ? db.prepare('SELECT 1 FROM securities WHERE id=?') : null;
+  const write = createPreparedDetailWriter(db, engine, point, { benchmarks: tickers, riskWindows: windows, sourceDb });
+  const exists = ids ? sourceDb.prepare('SELECT 1 FROM securities WHERE id=?') : null;
   const missing = requested.filter((id) => !write.ready(id));
-  if (missing.length) engine.snapshot(point, { cache: true, velocity: false });
-  let stored = 0;
+  const sources = engine.detailSources?.(point, { securityIds: missing, lookback: maximumSessions, signal });
+  if (missing.length && !sources) engine.snapshot(point, { cache: true, velocity: false });
+  const outputs = [];
+  const iterator = sources?.[Symbol.iterator]();
+  let next = iterator?.next().value;
   for (const id of missing) {
     signal?.throwIfAborted();
-    let detail = engine.detail(point, id, maximumSessions, { velocity: false });
+    let detail = iterator ? (next?.securityId === id ? next : null) : engine.detail(point, id, maximumSessions, { velocity: false });
+    if (iterator && detail) next = iterator.next().value;
     if (!detail && point.basis === 'known' && exists?.get(id)) {
       detail = { securityId: id, date: point.date, dataVersion: point.dataVersion, chartBars: [],
         volatility_20d: null, atr_14d: null, warnings: ['No security identity or quotes were available at the selected session.'] };
     }
-    if (detail && write(detail).written) stored++;
+    if (detail) outputs.push(detail);
   }
   signal?.throwIfAborted();
   const processed = state.processed + requested.length;
   const done = processed >= state.total || requested.length < bucketSize;
-  // Products are individually atomic. A resumed bucket may encounter completed products; their inserts are idempotent.
-  db.prepare(`UPDATE prepared_detail_batches SET cursor=?,processed=?,complete=?,written=written+? WHERE id=? AND cursor IS ?`)
-    .run(requested.at(-1) ?? state.cursor, processed, Number(done), stored, hash, state.cursor);
+  const advance = db.prepare(`UPDATE prepared_detail_batches SET cursor=?,processed=?,complete=?,written=written+? WHERE id=? AND cursor IS ?`);
+  write.batch(outputs, (results) => {
+    signal?.throwIfAborted();
+    const stored = results.filter(({ written }) => written).length;
+    if (!advance.run(requested.at(-1) ?? state.cursor, processed, Number(done), stored, hash, state.cursor).changes) {
+      throw new Error('Prepared detail roster advanced concurrently');
+    }
+  });
   return batchResult(config, read.get(hash), progress);
 }

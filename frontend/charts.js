@@ -10,12 +10,25 @@ function valuesFor(series, rows) {
 function extent(values) {
   return values.reduce(([low, high], value) => numeric(value) ? [Math.min(low, value), Math.max(high, value)] : [low, high], [Infinity, -Infinity]);
 }
-function axisDomain(values, bound) {
-  if (bound) return bound;
+export function axisDomain(values, bound, focus) {
+  if (bound && !focus) return bound;
   const [low, high] = extent(values);
-  if (!Number.isFinite(low)) return [0, 1];
-  const margin = high === low ? Math.max(Math.abs(low) * 0.05, 1) : (high - low) * 0.12;
+  if (!Number.isFinite(low)) return bound || [0, 1];
+  const margin = high === low ? bound ? (bound[1] - bound[0]) * 0.025 : Math.max(Math.abs(low) * 0.05, 1) : (high - low) * 0.12;
+  if (bound && low >= bound[0] && high <= bound[1]) {
+    return [Math.max(bound[0], low - margin), Math.min(bound[1], high + margin)];
+  }
   return [low - margin, high + margin];
+}
+
+export function focusedTickFormat(format, domain) {
+  const units = String(format(1)).trim();
+  const suffix = units.endsWith('%') ? '%' : units.endsWith('×') ? '×' : '';
+  const factor = suffix === '%' && Number.parseFloat(units) === 100 ? 100 : 1;
+  const quarter = (domain[1] - domain[0]) * factor / 4;
+  const digits = Math.max(0, Math.min(12, Math.ceil(-Math.log10(quarter)) + 1));
+  const formatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: digits });
+  return (value) => formatter.format(value * factor) + suffix;
 }
 function lineSegments(values, x, y) {
   const segments = [];
@@ -37,7 +50,7 @@ const xLabel = (date, showYear) => showYear
 const yLabel = (value) => Math.abs(value) > 100 || Number.isInteger(value) ? number(value, 0) : number(value, 1);
 
 export function chart(rows, input, options = {}) {
-  return drawChart({ rows, input, options, first: 0, end: rows.length });
+  return drawChart({ rows, input, options, first: 0, end: rows.length, scale: 'full' });
 }
 
 function drawChart(view) {
@@ -51,16 +64,23 @@ function drawChart(view) {
 
   const width = options.width || 650;
   const height = options.height || 218;
-  const left = 43;
-  const right = series.some((item) => item.axis === 'right') ? width - 47 : width - 13;
+  const hasRight = series.some((item) => item.axis === 'right');
+  const focusLeft = view.scale === 'focus' && !!options.domain;
+  const focusRight = view.scale === 'focus' && !!options.rightDomain;
+  const left = focusLeft ? 58 : 43;
+  const right = hasRight ? width - (focusRight ? 60 : 47) : width - 13;
   const top = 12;
   const bottom = height - (options.volume ? 55 : 27);
   const x = (i) => rows.length === 1 ? (left + right) / 2 : left + i * (right - left) / (rows.length - 1);
   const domain = {
     left: axisDomain([...content.flatMap((values, index) => series[index].axis === 'right' ? [] : values),
-      ...(options.candles ? rows.flatMap((row) => [row.high, row.low]) : [])], options.domain),
-    right: axisDomain(content.flatMap((values, index) => series[index].axis === 'right' ? values : []), options.rightDomain),
+      ...(options.candles ? rows.flatMap((row) => [row.high, row.low]) : [])], options.domain, focusLeft),
+    right: axisDomain(content.flatMap((values, index) => series[index].axis === 'right' ? values : []), options.rightDomain, focusRight),
   };
+  const tickLeft = options.axisFormat || yLabel;
+  const tickRight = options.rightAxisFormat || yLabel;
+  const formatLeft = focusLeft ? focusedTickFormat(tickLeft, domain.left) : tickLeft;
+  const formatRight = focusRight ? focusedTickFormat(tickRight, domain.right) : tickRight;
   const y = (value, side = 'left') => bottom - (value - domain[side][0]) * (bottom - top) / (domain[side][1] - domain[side][0]);
   const marks = Array.from({ length: 5 }, (_, index) => index / 4);
   const ticks = [...new Set(marks.map((fraction) => Math.round(fraction * (rows.length - 1))))];
@@ -68,8 +88,8 @@ function drawChart(view) {
     const py = bottom - fraction * (bottom - top);
     const value = (side) => domain[side][0] + fraction * (domain[side][1] - domain[side][0]);
     return `<line x1="${left}" y1="${py}" x2="${right}" y2="${py}" stroke="#29383f" stroke-dasharray="3 4"/>
-      <text x="${left - 8}" y="${py + 3}" text-anchor="end">${safe((options.axisFormat || yLabel)(value('left')))}</text>
-      ${right === width - 47 ? `<text x="${right + 8}" y="${py + 3}">${safe((options.rightAxisFormat || yLabel)(value('right')))}</text>` : ''}`;
+      <text data-y-tick="left" x="${left - 8}" y="${py + 3}" text-anchor="end">${safe(formatLeft(value('left')))}</text>
+      ${hasRight ? `<text data-y-tick="right" x="${right + 8}" y="${py + 3}">${safe(formatRight(value('right')))}</text>` : ''}`;
   }).join('');
   const candles = options.candles ? rows.map((row, index) => {
     if (![row.open, row.high, row.low, row.close].every(numeric)) return '';
@@ -96,7 +116,10 @@ function drawChart(view) {
     const w = Math.max(1, Math.min(9, (right - left) / rows.length * .7));
     return `<rect x="${x(index) - w / 2}" y="${bottom + 28 - h}" width="${w}" height="${h}" fill="${row.close >= (rows[index - 1]?.close ?? row.close) ? '#447c6b' : '#89515a'}"/>`;
   }).join('') : '';
-  const showYear = Date.parse(rows.at(-1).date) - Date.parse(rows[0].date) >= 31536000000;
+  const firstDate = rows[0].date;
+  const lastDate = rows.at(-1).date;
+  const showYear = Date.parse(lastDate) - Date.parse(firstDate) >= 31536000000;
+  const sameYear = new Date(firstDate).getUTCFullYear() === new Date(lastDate).getUTCFullYear();
   const axisLabels = ticks.map((index) => `<text x="${x(index)}" y="${height - 6}" text-anchor="${index === 0 ? 'start' : index === rows.length - 1 ? 'end' : 'middle'}">${safe(xLabel(rows[index].date, showYear))}</text>`).join('');
   plots.set(id, { rows, series, content, width, left, right, top, bottom, x, y, active: -1, view,
     candles: options.candles, onPick: options.onPick, describePoint: options.describePoint });
@@ -106,14 +129,18 @@ function drawChart(view) {
   const legend = series.map((item) => `<span class="legend-item"><i class="legend-mark" style="--series-color:${item.color}"></i>${safe(item.label)}</span>`).join('');
   const minimum = Math.min(5, view.rows.length);
   const zoomed = rows.length < view.rows.length;
+  const scales = options.domain || options.rightDomain ? `<div class="segmented" role="group" aria-label="Chart Y-axis scale">
+    <button type="button" data-chart-scale="full" aria-pressed="${view.scale === 'full'}">Full scale</button>
+    <button type="button" data-chart-scale="focus" aria-pressed="${view.scale === 'focus'}">Focus range</button></div>` : '';
   const controls = view.rows.length > minimum ? `<div class="chart-navigation" role="group" aria-label="Chart zoom and position">
     <button type="button" class="button" data-chart-command="earlier" ${view.first === 0 ? 'disabled' : ''}>Earlier</button>
     <button type="button" class="button" data-chart-command="zoom" ${rows.length <= minimum ? 'disabled' : ''}>Zoom in</button>
     <button type="button" class="button" data-chart-command="zoom-out" ${zoomed ? '' : 'disabled'}>Zoom out</button>
     <button type="button" class="button" data-chart-command="later" ${view.end === view.rows.length ? 'disabled' : ''}>Later</button>
     <button type="button" class="button" data-chart-command="reset" ${zoomed ? '' : 'disabled'}>Reset</button>
-    <span aria-live="polite">${safe(`${dateLabel(rows[0].date, true)} – ${dateLabel(rows.at(-1).date, true)}`)}</span></div>` : '';
+    <span aria-live="polite">${safe(`${dateLabel(firstDate, sameYear)} – ${dateLabel(lastDate, sameYear)}`)}</span></div>` : '';
   return `<div class="chart-frame" id="${id}" data-chart>
+    ${scales}
     <svg class="chart-svg" viewBox="0 0 ${width} ${height}" tabindex="0" role="img" aria-label="${safe(options.label || series.map(({ label }) => label).join(' and '))}. Use arrow keys to inspect sessions." data-plot="${id}">
       <defs><linearGradient id="${id}-gradient" x2="0" y2="1" gradientUnits="objectBoundingBox"><stop stop-color="${series[0].color}" stop-opacity=".18"/><stop offset="1" stop-color="${series[0].color}" stop-opacity=".015"/></linearGradient></defs>
       <g fill="#98aab3" font-size="10.5" font-family="monospace">${grid}${axisLabels}</g>${candles}${lines}${volume}
@@ -121,6 +148,17 @@ function drawChart(view) {
     </svg>
     <div class="chart-tooltip" hidden></div><div class="legend chart-legend">${legend}${options.volume ? '<span class="legend-item"><i class="legend-mark" style="--series-color:#5d8278"></i>Share volume</span>' : ''}</div>${controls}
   </div>`;
+}
+
+function replaceChart(frame, view, focusSelector) {
+  const markup = drawChart(view);
+  const parent = frame.parentElement;
+  const index = [...parent.children].indexOf(frame);
+  plots.delete(frame.id);
+  frame.outerHTML = markup;
+  const replacement = parent.children[index];
+  const choice = focusSelector && replacement.querySelector(focusSelector);
+  (choice || replacement.querySelector('[data-plot]'))?.focus();
 }
 
 function changeView(frame, plot, command, fromKeyboard = false) {
@@ -139,14 +177,7 @@ function changeView(frame, plot, command, fromKeyboard = false) {
   } else first += (command === 'earlier' ? -1 : 1) * Math.max(1, Math.floor(size / 2));
   first = Math.max(0, Math.min(length - nextSize, first));
   if (first === view.first && nextSize === size) return;
-  const markup = drawChart({ ...view, first, end: first + nextSize });
-  const parent = frame.parentElement;
-  const index = [...parent.children].indexOf(frame);
-  plots.delete(frame.id);
-  frame.outerHTML = markup;
-  const replacement = parent.children[index];
-  const choice = !fromKeyboard && replacement.querySelector(`[data-chart-command="${command}"]:not([disabled])`);
-  (choice || replacement.querySelector('[data-plot]'))?.focus();
+  replaceChart(frame, { ...view, first, end: first + nextSize }, !fromKeyboard && `[data-chart-command="${command}"]:not([disabled])`);
 }
 
 function showPoint(node, plot, index) {
@@ -214,6 +245,14 @@ document.addEventListener('keydown', (event) => {
   }
 });
 document.addEventListener('click', (event) => {
+  const scale = event.target.closest('[data-chart-scale]');
+  if (scale) {
+    const frame = scale.closest('[data-chart]');
+    const view = plots.get(frame?.id)?.view;
+    if (view && view.scale !== scale.dataset.chartScale) replaceChart(frame, { ...view, scale: scale.dataset.chartScale },
+      `[data-chart-scale="${scale.dataset.chartScale}"]`);
+    return;
+  }
   const button = event.target.closest('[data-chart-command]');
   if (button) {
     const frame = button.closest('[data-chart]');

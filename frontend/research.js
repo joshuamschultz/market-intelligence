@@ -3,11 +3,15 @@ import {
   observedCoverageFields, observedCoverageParams, observedCoverageSummary,
   panelHead, pagination, pathPart, pending, publishingHistory, percent, rate, ratio, safe, segment, shiftDate, signed, summary, table,
 } from './ui.js';
-import { chart, chartColors } from './charts.js';
+import { axisDomain, chart, chartColors, focusedTickFormat } from './charts.js';
+import { chartRanges, rangeLimit, rangeSegment } from './chart-ranges.js';
 import { partialCoverage } from './overview.js';
 import { mountJournalHistory } from './journal.js';
+import { buildLeadershipMap, groupHeatmapMetrics, renderGroupHeatmap } from './group-visuals.js';
 
 const groupLevels = [['industry','Industries'], ['sector','Sectors'], ['subindustry','Subindustries'], ['theme','Themes']];
+const groupViews = [['heatmap', 'Heatmap'], ['velocity', 'RS vs velocity'], ['table', 'Table']];
+const leadershipWindows = [['velocity4w', '4 weeks'], ['velocity12w', '12 weeks']];
 const rankDelta = (value) => signed(value, 0);
 const groupMetrics = {
   rank: ['Rank', count], medianRS: ['Median RS', number], velocity4w: ['4W velocity', signed], velocity12w: ['12W velocity', signed],
@@ -23,13 +27,14 @@ const groupChartMetrics = [['percentile','Group RS percentile',number], ['median
   ['above50','Above 50D SMA',percent], ['above200','Above 200D SMA',percent], ['upDownDollar','U/D dollar volume',ratio],
   ['topDecile','Top decile',percent], ['emergingLeaderCount','Emerging leader count',count], ['rank','Group rank',count]];
 const stockColumns = ['symbol','name','rsRank','rsPercentile','velocity4w','return_21d','udv_50d','industry'];
-const comparisonWidths = [[20,'1M'],[63,'3M'],[126,'6M'],[252,'1Y']];
-const historicalWidths = [...comparisonWidths, [1260,'5Y'], [2520,'10Y']];
+const historicalWidths = [...chartRanges, [2520,'10Y']];
+const groupChartDomain = (metric) => metric === 'largestPositiveDollarShare' ? [0, 1]
+  : ['percentile', 'medianRS', 'above50', 'above200', 'topDecile'].includes(metric) ? [0, 100] : undefined;
 const rotationFields = {
   percentile: ['Group RS percentile', (value) => number(value, 0), [0, 100]],
   medianRS: ['Median constituent RS', (value) => number(value, 0), [0, 100]],
-  velocity4w: ['4W RS velocity', signed],
-  velocity12w: ['12W RS velocity', signed],
+  velocity4w: ['4W RS velocity (pts)', signed],
+  velocity12w: ['12W RS velocity (pts)', signed],
   rankChange4w: groupMetrics.rankChange4w,
   rankChange12w: groupMetrics.rankChange12w,
   breadthChange: ['4W breadth change', signed],
@@ -42,6 +47,7 @@ const rotationFields = {
 const parentMetrics = ['parentRelativeRS', 'parentRelativeReturn'];
 const directionMetrics = new Set(['velocity4w', 'velocity12w', 'rankChange4w', 'rankChange12w', 'breadthChange',
   'equalWeight', 'relativeReturn', ...parentMetrics]);
+const rankingHistoryMetrics = new Set(['velocity4w', 'velocity12w', 'rankChange4w', 'rankChange12w']);
 
 function groupTable(groups, sort, selected, level) {
   const visible = ['rank','medianRS','rankChange4w','rankChange12w','velocity4w','velocity12w','topDecile','above50','above200',
@@ -52,18 +58,19 @@ function groupTable(groups, sort, selected, level) {
       <button type="button" class="table-sort" data-action="group-sort" data-value="${key}">${groupMetrics[key][0]}${sort.key === key ? icon(sort.direction === 1 ? 'up' : 'down') : ''}</button></th>`).join('')}</tr></thead><tbody>
     ${groups.map((group) => `<tr><td><input type="checkbox" data-change="group-compare" value="${safe(group.id)}" aria-label="Compare ${safe(group.name)}" ${selected.has(group.id) ? 'checked' : ''}></td>
       <td><button type="button" class="stock-link" data-action="industry" data-value="${safe(group.id)}">${safe(group.name)}</button></td><td class="numeric">${count(group.count)}</td>
-      ${visible.map((key) => `<td class="numeric ${directionMetrics.has(key) ? direction(group[key]) : ''}">${groupMetrics[key][1](group[key])}</td>`).join('')}</tr>`).join('')}
+      ${visible.map((key) => `<td class="numeric ${directionMetrics.has(key) ? direction(group[key]) : ''}">${rankingHistoryMetrics.has(key) && !numeric(group[key])
+        ? '<span title="History unavailable" aria-label="History unavailable">—</span>' : groupMetrics[key][1](group[key])}</td>`).join('')}</tr>`).join('')}
     </tbody></table></div>`;
 }
 
-function rotationPlot(groups, settings) {
+function rotationPlot(groups, settings, { leadership = false } = {}) {
   const { rotationX: xKey, rotation: yKey, rotationColor: colorKey, rotationSize: sizeKey } = settings;
   const rows = groups.filter((group) => numeric(group[xKey]) && numeric(group[yKey]));
   if (!rows.length) return empty('No comparable rotation observations', 'Choose axes with group values in the selected session.', 'industries');
   const domain = (key) => {
     const fixed = rotationFields[key][2];
-    if (fixed) return fixed;
     const values = rows.map((row) => row[key]);
+    if (fixed) return axisDomain(values, fixed, settings.rotationScale === 'focus');
     const bound = Math.max(['relativeReturn', 'parentRelativeReturn'].includes(key) ? 0.01 : 1, ...values.map(Math.abs));
     return [-bound, bound];
   };
@@ -75,14 +82,20 @@ function rotationPlot(groups, settings) {
   const maxSize = Math.max(1,...rows.map((row) => row[sizeKey] || 0));
   const label = (key) => rotationFields[key][0];
   const format = (key,value) => rotationFields[key][1](value);
+  const tickFormat = (key, bounds) => settings.rotationScale === 'focus' && rotationFields[key][2]
+    ? focusedTickFormat(rotationFields[key][1], bounds) : rotationFields[key][1];
+  const xTicks = tickFormat(xKey, [xMin, xMax]);
+  const yTicks = tickFormat(yKey, [yMin, yMax]);
   const colorBound = Math.max(0.01, ...rows.map((row) => Math.abs(row[colorKey] || 0)));
   const sizeLabel = sizeKey === 'count' ? 'eligible constituents' : 'market cap';
   return `<div class="rotation-layout"><svg class="rotation-chart" viewBox="0 0 600 218" role="img" aria-label="${safe(`${label(xKey)} versus ${label(yKey)}`)}">
     <g fill="#a4b3bb" font-size="10" font-family="monospace">
     ${dataTicks(xMin,xMax).map((x) => `<line x1="${px(x)}" y1="17" x2="${px(x)}" y2="181" stroke="#29383f" stroke-dasharray="3 4"/>
-      <text x="${px(x)}" y="196" text-anchor="middle">${safe(format(xKey,x))}</text>`).join('')}
+      <text x="${px(x)}" y="196" text-anchor="middle">${safe(xTicks(x))}</text>`).join('')}
     ${dataTicks(yMin,yMax).map((y) => `<line x1="49" y1="${py(y)}" x2="559" y2="${py(y)}" stroke="#3d4d56" stroke-dasharray="3 4"/>
-      <text x="43" y="${py(y)+3}" text-anchor="end">${safe(format(yKey,y))}</text>`).join('')}
+      <text x="43" y="${py(y)+3}" text-anchor="end">${safe(yTicks(y))}</text>`).join('')}
+    ${leadership ? `<line x1="${px(50)}" y1="17" x2="${px(50)}" y2="181" stroke="#70808a"/>
+      <line x1="49" y1="${py(0)}" x2="559" y2="${py(0)}" stroke="#70808a"/>` : ''}
     <text x="304" y="212" text-anchor="middle">${safe(label(xKey))}</text></g>
     ${rows.toSorted((a,b) => (b[sizeKey] || 0) - (a[sizeKey] || 0)).map((row) => {
       const colorValue = row[colorKey];
@@ -94,6 +107,17 @@ function rotationPlot(groups, settings) {
       return `<a href="#industry-detail" data-action="industry" data-value="${safe(row.id)}" aria-label="${safe(title)}">
         <circle cx="${px(row[xKey])}" cy="${py(row[yKey])}" r="${radius}" fill="${fill}" opacity="${opacity}"/><title>${safe(title)}</title></a>`;
     }).join('')}</svg><p class="muted">Bubble area reflects ${sizeLabel}. Color shows ${safe(label(colorKey).toLowerCase())}.</p></div>`;
+}
+
+function leadershipMap(groups, state) {
+  const { points, plotted, omitted, velocity, quadrants } = buildLeadershipMap(groups, { level: state.level, velocity: state.leadershipVelocity });
+  const summary = [['RS ≥ 50, rising', quadrants.higherRSRising], ['RS ≥ 50, falling', quadrants.higherRSFalling],
+    ['RS < 50, rising', quadrants.lowerRSRising], ['RS < 50, falling', quadrants.lowerRSFalling], ['Unchanged', quadrants.flat]];
+  return `<div class="inline-form">${segment('leadership-window', leadershipWindows, velocity)}</div>
+    <p class="muted section-space">Vertical axis measures change in the group’s RS percentile in points. ${count(plotted)} groups plotted${omitted ? ` · ${count(omitted)} lack a comparable RS percentile or velocity` : ''}.</p>
+    ${plotted ? `${rotationPlot(points, { rotationX: 'percentile', rotation: velocity, rotationColor: velocity, rotationSize: 'count', rotationScale: 'full' }, { leadership: true })}
+      <div class="inline-stack" aria-label="Leadership map categories">${summary.map(([label, value]) => chip(`${label} · ${count(value)}`)).join('')}</div>`
+    : empty('RS velocity unavailable', 'The selected industry data does not have enough dated group observations for this window.', 'industries')}`;
 }
 
 function themeEditor(env, existing = null) {
@@ -143,6 +167,10 @@ async function renderIndustries(env) {
   state.rotationX ||= 'percentile';
   state.rotationColor ||= 'breadthChange';
   state.rotationSize ||= 'count';
+  state.rotationScale ||= 'full';
+  state.groupView = groupViews.some(([key]) => key === env.params.groupView) ? env.params.groupView : state.groupView || 'heatmap';
+  state.heatmapMetric ||= 'medianRS';
+  state.leadershipVelocity ||= 'velocity4w';
   const [data, themes] = await Promise.all([env.api('industries', { signal }), env.api('themes', { signal, plain: true })]);
   if (!env.isActive()) return;
   let groupPanel;
@@ -168,32 +196,44 @@ async function renderIndustries(env) {
     const preferred = env.context.date ? ['sec-sic', 'nasdaq'] : ['nasdaq', 'sec-sic'];
     const alternative = preferred.find((system) => system !== env.context.classification && env.config.classificationSystems?.includes(system));
     const sourceName = { nasdaq: 'Nasdaq', 'sec-sic': 'SEC filing taxonomy' };
-    const referenceNote = data.referenceMode === 'latest' && data.referenceDate
-      ? notice('Current reference capture', `Price session ${dateLabel(data.date)} · classification reference through ${dateLabel(data.referenceDate)}.`) : '';
-    const missingRotationHistory = data.classificationSystem === 'nasdaq' && groups.length > 0 &&
-      !groups.some((group) => numeric(group.velocity4w) || numeric(group.rankChange4w));
-    const rotationNote = missingRotationHistory ? notice('Nasdaq group history is unavailable',
-      'Current Nasdaq classifications do not establish membership four or twelve weeks earlier. Historical SEC groups are available where filing-dated evidence exists.',
-      env.config.classificationSystems?.includes('sec-sic') ? action('Use SEC groups as of session', 'use-industry-source', 'layers', { value: 'sec-sic' }) : '') : '';
+    const referenceNote = data.referenceMode === 'latest' && data.referenceDate ? ` · Industry directory through ${dateLabel(data.referenceDate)}` : '';
+    const ranked = data.groups.filter((group) => group.level === state.level && numeric(group.rank));
+    const ready4w = ranked.filter((group) => numeric(group.velocity4w)).length;
+    const ready12w = ranked.filter((group) => numeric(group.velocity12w)).length;
+    const source = data.classificationSystem || env.context.classification;
+    const missingNasdaqHistory = source === 'nasdaq' && state.level !== 'theme' && ranked.length > 0 && !ready4w && !ready12w;
+    const filingDatedLink = missingNasdaqHistory && env.config.classificationSystems?.includes('sec-sic')
+      ? `<a class="text-link" href="${safe(env.routeUrl('industries', { ...env.snapshotContext, date: data.date,
+        classification: 'sec-sic', reference: 'as-of', level: state.level, groupView: state.groupView }))}">View filing-dated SEC groups ${icon('chevron-right')}</a>` : '';
+    const rotationNote = missingNasdaqHistory ? `<div class="inline-stack section-space"><p class="muted">The Nasdaq directory was captured recently, so dated industry history is unavailable. Price history alone cannot establish past group membership.</p>${filingDatedLink}</div>`
+      : source === 'sec-sic' && ranked.length ? `<p class="muted section-space">Velocity available for ${count(ready4w)} of ${count(ranked.length)} ranked groups over 4 weeks and ${count(ready12w)} over 12 weeks.</p>` : '';
     main.innerHTML = heading('Industries', 'Compare group leadership, participation, and rotation.', action('Create theme', 'create-theme', 'plus', { className: 'primary' })) +
-      partialCoverage(data.coverage, env.routeUrl) + referenceNote + rotationNote +
+      partialCoverage(data.coverage, env.routeUrl) +
       segment('industry-level', groupLevels, state.level, 'tabs') +
-      `<div class="stack"><section class="panel panel-body">${panelHead('Group rankings', `${count(groups.length)} comparable groups · ${dateLabel(data.date)}`,
+      `<div class="stack"><section class="panel panel-body">${panelHead('Group rankings', `${count(groups.length)} groups · ${dateLabel(data.date)}${referenceNote}`,
         `<label class="checkbox-label"><input type="checkbox" data-change="group-emerging"${state.emergingOnly?' checked':''}> Emerging groups</label>`)}
-        ${groups.length ? groupTable(groups, state.sort, state.compare, state.level) : empty('No groups in this context',
+        ${segment('group-view', groupViews, state.groupView)}
+        ${rotationNote}
+        <div class="section-space">${groups.length && state.groupView === 'heatmap' ? `
+          <div class="inline-form">${field('Heatmap metric', `<select data-change="group-heatmap-metric">${groupHeatmapMetrics.map(([key, label]) => option(key, label, state.heatmapMetric)).join('')}</select>`)}</div>
+          ${renderGroupHeatmap(groups, { level: state.level, metric: state.heatmapMetric, date: data.date, action: 'industry' })}`
+          : groups.length && state.groupView === 'velocity' ? leadershipMap(groups, state)
+          : groups.length ? groupTable(groups, state.sort, state.compare, state.level) : empty('No groups in this context',
           state.level === 'theme' ? 'Create a theme or select a session with existing dated theme membership.' : 'The selected classification has no eligible groups for this price session.',
-          'industries', alternative ? action(`Use ${sourceName[alternative]}`, 'use-industry-source', 'layers', {value:alternative}) : '')}
+          'industries', alternative ? action(`Use ${sourceName[alternative]}`, 'use-industry-source', 'layers', {value:alternative}) : '')}</div>
         </section>
       ${state.level === 'theme' && themes.length ? `<section class="panel panel-body">${panelHead('Saved themes', 'Dated membership definitions')}${themes.map((theme) => `<div class="simple-row"><div><strong>${safe(theme.name)}</strong>
         <span class="muted"> · ${count(theme.definition?.members?.length)} saved members</span></div><div class="actions">${action('Edit','edit-theme','edit',{ value: theme.id })}
         ${action('Delete','delete-theme','trash',{ value: theme.id, className: 'danger' })}</div></div>`).join('')}</section>` : ''}
-      ${groups.length ? `<div class="split-grid">
+      ${groups.length && state.groupView === 'table' ? `<div class="split-grid">
         <section class="panel panel-body">${panelHead('Rotation map', 'Positive rank changes indicate an improved rank. Parent comparisons use the group’s sector or industry.')}
           <div class="inline-form rotation-controls">
           ${[['X axis', 'rotation-x', rotationSettings.rotationX], ['Y axis', 'rotation', rotationSettings.rotation]].map(([label,change,current]) =>
             field(label, `<select data-change="${change}">${rotationChoices.map(([key,[text]])=>option(key,text,current)).join('')}</select>`)).join('')}
           ${field('Color', `<select data-change="rotation-color">${['breadthChange','velocity4w','velocity12w','relativeReturn'].map((key)=>option(key,rotationFields[key][0],state.rotationColor)).join('')}</select>`)}
           ${field('Size', `<select data-change="rotation-size">${option('count','Constituents',state.rotationSize)}${option('marketCap','Market cap',state.rotationSize)}</select>`)}
+          ${[rotationSettings.rotationX, rotationSettings.rotation].some((key) => rotationFields[key][2])
+            ? segment('rotation-scale', [['full', 'Full scale'], ['focus', 'Focus range']], state.rotationScale) : ''}
           </div>${rotationPlot(groups,rotationSettings)}</section>
         <section class="panel panel-body">${panelHead('Group comparison', 'Select up to eight groups from the table.', iconButton('Export group comparison CSV','export-chart','download','industry-comparison.csv'))}
           <div class="inline-form">
@@ -201,10 +241,10 @@ async function renderIndustries(env) {
           ${field('Second metric', `<select data-change="group-secondary"${state.compare.size!==1?' disabled':''}>${option('','No comparison',state.chartSecondary||'')}
             ${groupChartMetrics.map(([id,label])=>option(id,label,state.chartSecondary)).join('')}</select>`,'Select one group to compare its metrics.')}
           ${field('Sampling', `<select data-change="group-cadence">${option('daily','Daily',state.chartCadence)}${option('weekly','Weekly',state.chartCadence)}</select>`)}
-          ${segment('group-range',comparisonWidths,state.limit)}</div>
+          ${rangeSegment('group-range',state.limit)}</div>
           <div id="industry-chart" class="section-space"></div></section>
         </div>` : ''}</div>`;
-    if (groups.length) loadComparison();
+    if (groups.length && state.groupView === 'table') loadComparison();
   }
 
   async function loadComparison() {
@@ -218,7 +258,8 @@ async function renderIndustries(env) {
     const run = ++compareRun;
     target.innerHTML = pending();
     try {
-      const result = await env.publishedSeries('industries/compare', { signal, params: { ids: ids.join(','), limit: state.limit, cadence: state.chartCadence } }, (partial, job) => {
+      const result = await env.publishedSeries('industries/compare', { signal,
+        params: { ids: ids.join(','), limit: rangeLimit(state.limit, state.chartCadence), cadence: state.chartCadence } }, (partial, job) => {
         if (target.isConnected && run === compareRun) target.innerHTML = publishingHistory(job);
       });
       if (run !== compareRun || !target.isConnected) return;
@@ -228,7 +269,8 @@ async function renderIndustries(env) {
         return { key: `${id}:${metric}`, label: `${byId.get(id).name} · ${label}`,
           axis: axis===1?'right':'left', color: chartColors[index+axis], format, value: (row) => row.groups.find((group) => group.id === id)?.[metric] };
       }));
-      target.innerHTML = chart(result.rows, labels, { fill: ids.length === 1, axisFormat:labels[0]?.format, rightAxisFormat:labels[1]?.format });
+      target.innerHTML = chart(result.rows, labels, { fill: ids.length === 1, axisFormat:labels[0]?.format, rightAxisFormat:labels[1]?.format,
+        domain: groupChartDomain(selectedMetrics[0]), rightDomain: groupChartDomain(selectedMetrics[1]) });
     } catch (error) {
       if (target.isConnected && error.name !== 'AbortError') target.innerHTML = notice('Group comparison unavailable', error.message, '', true);
     }
@@ -239,8 +281,10 @@ async function renderIndustries(env) {
     const run = ++memberRun;
     target.innerHTML = pending();
     try {
+      const params = { date: data.date };
       const [detail, members] = await Promise.all([
-        env.api(`industries/${pathPart(group.id)}`), env.api(`industries/${pathPart(group.id)}/members`, { params: { page, perPage: 30 } }),
+        env.api(`industries/${pathPart(group.id)}`, { signal, params }),
+        env.api(`industries/${pathPart(group.id)}/members`, { signal, params: { ...params, page, perPage: 30 } }),
       ]);
       if (run !== memberRun || !target.isConnected) return;
       target.innerHTML = `<div class="summary-grid three">${summary('Constituents', count(detail.count), `${count(detail.rankedCount)} ranked`)}
@@ -265,6 +309,9 @@ async function renderIndustries(env) {
       draw();
     },
     'group-sort'(key) { state.sort = { key, direction: state.sort.key === key ? -state.sort.direction : key === 'rank' ? 1 : -1 }; draw(); },
+    'group-view'(value) { state.groupView = value; draw(); },
+    'change:group-heatmap-metric'(value) { state.heatmapMetric = value; draw(); },
+    'leadership-window'(value) { state.leadershipVelocity = value; draw(); },
     'change:group-compare'(id, input) {
       if (input.checked && state.compare.size >= 8) { input.checked = false; env.toast('Compare up to eight groups.'); return; }
       if (input.checked) state.compare.add(id);
@@ -278,6 +325,7 @@ async function renderIndustries(env) {
     'change:rotation-x'(value) { state.rotationX = value; draw(); },
     'change:rotation-color'(value) { state.rotationColor = value; draw(); },
     'change:rotation-size'(value) { state.rotationSize = value; draw(); },
+    'rotation-scale'(value) { state.rotationScale = value; draw(); },
     'change:group-chart'(key) { state.chartMetric = key; loadComparison(); },
     'change:group-secondary'(key) { state.chartSecondary = key; loadComparison(); },
     'change:group-cadence'(value) { state.chartCadence = value; loadComparison(); },
@@ -578,7 +626,7 @@ async function renderHistory(env) {
     const run = ++historyRun;
     const keys = [...new Set([state.primary,state.secondary].filter(Boolean))];
     try {
-      const maxDays = state.archive ? (state.from ? 7560 : state.limit) : state.from ? 260 : state.limit;
+      const maxDays = state.from ? state.archive ? 7560 : rangeLimit(1260, state.cadence) : rangeLimit(state.limit, state.cadence);
       const result = await env.publishedSeries('market/breadth', { signal, params: { series: 1, metrics: keys.join(','), from: state.from, to: state.to,
         limit: maxDays, cadence: state.cadence, ...(state.archive ? { materializedOnly: 1 } : {}) } }, (partial, job) => {
         if (target.isConnected && run === historyRun) target.innerHTML = publishingHistory(job);
@@ -618,7 +666,9 @@ async function renderHistory(env) {
       const describePoint = leadership ? (row) => [row.previousLeaderDate && numeric(row.leadershipRankObservations) && numeric(row.leaderReturnExpected)
         ? `${count(row.leadershipRankObservations)} of ${count(row.leaderReturnExpected)} prior-session leaders have comparable ranks · ${dateLabel(row.previousLeaderDate)}`
         : 'Prior-session leadership comparison unavailable'] : undefined;
+      const domain = (key) => state.transform !== 'values' || !key || !isPercent(key) ? undefined : key === 'adSpread' ? [-100, 100] : [0, 100];
       target.innerHTML = chart(data,series,{height:260,fill:true,axisFormat:axis(keys[0]),rightAxisFormat:axis(keys[1]),
+        domain: domain(keys[0]), rightDomain: domain(keys[1]),
         describePoint, onPick:({date})=>env.go('history',{date,dataVersion:env.snapshotContext.dataVersion})})+realized+
         (leadership ? '<p class="muted section-space">Persistence is the share of comparable prior-session top-decile leaders that remain in the top decile. Turnover is the share that drop below it. Weekly sampling shows the final session’s reading.</p>' : '');
     } catch(error) {
@@ -674,8 +724,7 @@ async function renderHistory(env) {
     'history-range'(value) {
       state.limit = Number(value);
       state.archive = state.limit > 252;
-      if (state.archive) state.cadence = 'weekly';
-      state.from = state.archive ? rangeStart(state.limit === 1260 ? 1827 : 3653) : '';
+      state.from = '';
       state.to = last;
       draw();
     },

@@ -1,4 +1,4 @@
-import { AVERAGES, deviation, finite, mean, quantile, ratio } from './metrics.mjs';
+import { AVERAGES, deviation, finite, mean, quantile, ratio, sortedQuantile } from './metrics.mjs';
 import { rankBy } from './ranking.mjs';
 
 export function binaryMetric(rows, evaluate) {
@@ -71,6 +71,8 @@ add('outperform_industry', 'Outperforming industry', 'Leadership', '21-session r
 add('top_decile', 'Top-decile RS', 'Leadership', 'Relative-strength percentile ≥ 90.', compare('rsPercentile', (v) => v >= 90));
 
 const definitions = new Map(entries.map((item) => [item.key, item]));
+const contextualBreadth = new Set(['outperform_industry', 'top_decile']);
+const stockBreadth = entries.filter(({ key }) => !contextualBreadth.has(key));
 export const BREADTH_METRICS = entries.map(({ test, ...item }) => item);
 export function breadthMetric(key) {
   if (definitions.has(key)) return definitions.get(key);
@@ -88,7 +90,7 @@ export function breadthMetric(key) {
   };
 }
 
-export function aggregateRows(rows) {
+export function aggregateRows(rows, { distribution = true } = {}) {
   const result = {
     upVolume: 0, downVolume: 0, upDollar: 0, downDollar: 0, advancingVolume: 0,
     positiveDollarObservations: 0, dollarVolumeObservations: 0, volumeObservations: 0,
@@ -121,11 +123,14 @@ export function aggregateRows(rows) {
   result.netDollar = result.dollarVolumeObservations ? result.upDollar - result.downDollar : null;
   result.equalWeightReturn = mean(returns);
   result.capWeightReturn = cap > 0 ? capWeighted.reduce((sum, row) => sum + row.prior_market_cap * row.return_1d, 0) / cap : null;
-  result.medianReturn = quantile(returns, 0.5);
-  result.distribution = Object.fromEntries([10, 25, 50, 75, 90].map((p) => [`p${p}`, quantile(returns, p / 100)]));
-  result.returnDispersion = deviation(returns);
-  result.returnSkewness = result.returnDispersion > 0
-    ? mean(returns.map((value) => ((value - result.equalWeightReturn) / result.returnDispersion) ** 3)) : null;
+  if (distribution) {
+    const sortedReturns = returns.toSorted((a, b) => a - b);
+    result.medianReturn = sortedQuantile(sortedReturns, 0.5);
+    result.distribution = Object.fromEntries([10, 25, 50, 75, 90].map((p) => [`p${p}`, sortedQuantile(sortedReturns, p / 100)]));
+    result.returnDispersion = deviation(returns);
+    result.returnSkewness = result.returnDispersion > 0
+      ? mean(returns.map((value) => ((value - result.equalWeightReturn) / result.returnDispersion) ** 3)) : null;
+  }
   const largest = capWeighted.toSorted((a, b) => b.prior_market_cap - a.prior_market_cap).slice(0, Math.ceil(capWeighted.length * 0.1));
   result.largestCapCohortCount = largest.length;
   result.largestPositiveDollarShare = largest.length ? ratio(largest.filter((row) => row.return_1d > 0 && finite(row.dollar_volume))
@@ -135,10 +140,58 @@ export function aggregateRows(rows) {
   return result;
 }
 
-export function calculateBreadth(traded, extraKeys = []) {
+function popcount(word) {
+  word -= (word >>> 1) & 0x55555555;
+  word = (word & 0x33333333) + ((word >>> 2) & 0x33333333);
+  return (((word + (word >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+// A dated stock occupies one bit per comparable/qualifying metric. Multiple
+// universe memberships reduce the same stock observations without retesting them.
+export function createBreadthFrame(capacity) {
+  const words = Math.ceil(capacity / 32);
+  const metrics = stockBreadth.map(({ key, test }) => ({ key, test, compared: new Uint32Array(words), matched: new Uint32Array(words) }));
+  const ordinals = new WeakMap();
+  let size = 0;
+  return function count(traded, baseFor) {
+    const membership = new Uint32Array(words);
+    for (const row of traded) {
+      const base = baseFor(row);
+      let ordinal = ordinals.get(base);
+      if (ordinal == null) {
+        ordinal = size++;
+        if (ordinal >= capacity) throw new RangeError('Breadth frame exceeded its dated stock roster');
+        ordinals.set(base, ordinal);
+        const word = ordinal >>> 5;
+        const bit = 1 << (ordinal & 31);
+        for (const { test, compared, matched } of metrics) {
+          const included = test(base);
+          if (included == null) continue;
+          compared[word] |= bit;
+          if (included) matched[word] |= bit;
+        }
+      }
+      membership[ordinal >>> 5] |= 1 << (ordinal & 31);
+    }
+    const counts = {};
+    const populated = Math.ceil(size / 32);
+    for (const { key, compared, matched } of metrics) {
+      let numerator = 0;
+      let denominator = 0;
+      for (let word = 0; word < populated; word++) {
+        numerator += popcount(matched[word] & membership[word]);
+        denominator += popcount(compared[word] & membership[word]);
+      }
+      counts[key] = { numerator, denominator, value: denominator ? 100 * numerator / denominator : null };
+    }
+    return counts;
+  };
+}
+
+export function calculateBreadth(traded, extraKeys = [], stockCounts = {}) {
   const data = {};
   for (const item of [...entries, ...extraKeys.filter((key) => !definitions.has(key)).map(breadthMetric).filter(Boolean)]) {
-    data[item.key] = binaryMetric(traded, item.test);
+    data[item.key] = stockCounts[item.key] ?? binaryMetric(traded, item.test);
   }
   const { advancers, decliners } = data;
   const denominator = advancers.denominator;
@@ -149,67 +202,108 @@ export function calculateBreadth(traded, extraKeys = []) {
   return data;
 }
 
+export function projectBreadth(base, traded, extraKeys, { regrouped = false, reranked = false } = {}) {
+  const data = {};
+  for (const item of entries) {
+    const recompute = regrouped && item.key === 'outperform_industry' || reranked && item.key === 'top_decile';
+    data[item.key] = recompute ? binaryMetric(traded, item.test) : base[item.key];
+  }
+  for (const key of extraKeys) data[key] = base[key] ?? binaryMetric(traded, breadthMetric(key).test);
+  data.adSpread = base.adSpread;
+  data.adRatio = base.adRatio;
+  return data;
+}
+
 function currentThemeMembership(theme, asOf) {
   return (theme.definition.members || []).filter((item) => typeof item !== 'string'
     && (!item.effectiveFrom || item.effectiveFrom <= asOf) && (!item.effectiveTo || item.effectiveTo >= asOf)
     && (!item.knownAt || item.knownAt <= asOf));
 }
 
-export function calculateGroups(traded, themes, date, benchmarkReturn) {
+export function createGroupFrame(traded, themes, date) {
   const byGroup = new Map();
-  function addToGroup(level, name, row, parent = null, themeId = null) {
+  function addToGroup(level, name, position, parent = null, themeId = null) {
     if (!name) return null;
     const id = `${level}:${themeId || `${parent ? `${parent}/` : ''}${name}`}`;
-    if (!byGroup.has(id)) byGroup.set(id, { id, level, name, parent, members: [] });
-    byGroup.get(id).members.push(row);
+    if (!byGroup.has(id)) byGroup.set(id, { id, level, name, parent, positions: [] });
+    byGroup.get(id).positions.push(position);
     return id;
   }
-  const byId = new Map(traded.map((row) => [row.securityId, row]));
-  for (const row of traded) {
-    row.sectorId = addToGroup('sector', row.sector, row);
-    row.industryId = addToGroup('industry', row.industry, row, row.sectorId);
-    row.subindustryId = addToGroup('subindustry', row.subindustry, row, row.industryId);
-  }
+  const byId = new Map(traded.map((row, position) => [row.securityId, position]));
+  const memberships = traded.map((row, position) => {
+    const sector = addToGroup('sector', row.sector, position);
+    const industry = addToGroup('industry', row.industry, position, sector);
+    return [sector, industry, addToGroup('subindustry', row.subindustry, position, industry)];
+  });
   for (const theme of themes) {
     const unique = new Set(currentThemeMembership(theme, date).map((member) => member.securityId));
     for (const id of unique) {
-      const row = byId.get(id);
-      if (row) addToGroup('theme', theme.name, row, null, theme.id);
+      const position = byId.get(id);
+      if (position != null) addToGroup('theme', theme.name, position, null, theme.id);
     }
   }
-  const groups = [...byGroup.values()].map(({ members, ...group }) => {
-    const ranked = members.map((row) => row.rsPercentile).filter(finite);
-    const equalWeight = mean(members.map((row) => row.return_21d).filter(finite));
-    const volumes = aggregateRows(members);
-    const topDecile = binaryMetric(members, (row) => finite(row.rsPercentile) ? row.rsPercentile >= 90 : null);
-    const above50 = binaryMetric(members, truth('above_50d'));
-    const above200 = binaryMetric(members, truth('above_200d'));
-    const emergingLeaders = binaryMetric(members, (row) => {
-      if (![row.rsPercentile, row.return_21d, row.return_63d, row.return_252d].every(finite) || row.above_50d == null) return null;
-      return row.rsPercentile >= 75 && row.rsPercentile < 90 && row.above_50d && row.return_21d > 0 && 4 * row.return_63d > row.return_252d;
-    });
-    const winners = members.filter((row) => finite(row.rsPercentile)).toSorted((a, b) => b.rsPercentile - a.rsPercentile).slice(0, 3);
+  const groups = [...byGroup.values()].map(({ positions, ...group }) => {
+    const members = positions.map((position) => traded[position]);
     return {
-      ...group, count: members.length, memberIds: members.map((row) => row.securityId),
+      group, positions, memberIds: members.map((row) => row.securityId),
+      equalWeight: mean(members.map((row) => row.return_21d).filter(finite)),
+      volumes: aggregateRows(members, { distribution: false }),
+      above50: binaryMetric(members, truth('above_50d')), above200: binaryMetric(members, truth('above_200d')),
+      positiveMomentum: binaryMetric(members, compare('return_21d', (value) => value > 0)).value,
+      newHighBreadth: binaryMetric(members, truth('new_high_252d')).value,
+      marketCap: members.some((row) => row.market_cap > 0) ? members.reduce((sum, row) => sum + (row.market_cap || 0), 0) : null,
+    };
+  });
+  return { memberships, groups };
+}
+
+export function calculateGroups(traded, themes, date, benchmarkReturn, scope = createGroupFrame(traded, themes, date)) {
+  const groups = scope.groups.map(({ group, positions, memberIds, equalWeight, volumes, above50, above200,
+    positiveMomentum, newHighBreadth, marketCap }) => {
+    const ranked = [];
+    let topDecileCount = 0;
+    let emergingLeaderCount = 0;
+    let emergingObservations = 0;
+    let first = -Infinity, second = -Infinity, third = -Infinity;
+    for (const position of positions) {
+      const row = traded[position];
+      const percentile = row.rsPercentile;
+      if (!finite(percentile)) continue;
+      ranked.push(percentile);
+      if (percentile >= 90) topDecileCount++;
+      if (percentile > first) { third = second; second = first; first = percentile; }
+      else if (percentile > second) { third = second; second = percentile; }
+      else if (percentile > third) third = percentile;
+      if (finite(row.return_21d) && finite(row.return_63d) && finite(row.return_252d) && row.above_50d != null) {
+        emergingObservations++;
+        if (percentile >= 75 && percentile < 90 && row.above_50d && row.return_21d > 0 && 4 * row.return_63d > row.return_252d) emergingLeaderCount++;
+      }
+    }
+    const topDecile = { numerator: topDecileCount, denominator: ranked.length, value: ranked.length ? 100 * topDecileCount / ranked.length : null };
+    return {
+      ...group, count: positions.length, memberIds,
       rankedCount: ranked.length, medianRS: quantile(ranked, 0.5), meanRS: mean(ranked),
       equalWeight, dailyReturn: volumes.equalWeightReturn, capWeightedDaily: volumes.capWeightReturn,
       relativeReturn: finite(equalWeight) && finite(benchmarkReturn) ? equalWeight - benchmarkReturn : null,
       topDecile: topDecile.value, above50: above50.value, above200: above200.value,
-      positiveMomentum: binaryMetric(members, compare('return_21d', (v) => v > 0)).value,
-      newHighBreadth: binaryMetric(members, truth('new_high_252d')).value,
+      positiveMomentum, newHighBreadth,
       upDownDollar: volumes.upDownDollar, upDollar: volumes.upDollar, downDollar: volumes.downDollar,
-      leadingConcentration: ratio(winners.reduce((sum, row) => sum + row.rsPercentile, 0), ranked.reduce((sum, value) => sum + value, 0)),
+      leadingConcentration: ratio((finite(first) ? first : 0) + (finite(second) ? second : 0) + (finite(third) ? third : 0),
+        ranked.reduce((sum, value) => sum + value, 0)),
       largestPositiveDollarShare: volumes.largestPositiveDollarShare,
-      emergingLeaderCount: emergingLeaders.denominator ? emergingLeaders.numerator : null,
-      emergingLeaderObservations: emergingLeaders.denominator,
-      marketCap: members.some((row) => row.market_cap > 0) ? members.reduce((sum, row) => sum + (row.market_cap || 0), 0) : null,
+      emergingLeaderCount: emergingObservations ? emergingLeaderCount : null,
+      emergingLeaderObservations: emergingObservations, marketCap,
       counts: { topDecile, above50, above200 },
     };
   });
   const groupMap = new Map(groups.map((group) => [group.id, group]));
-  for (const row of traded) {
-    const industry = groupMap.get(row.industryId);
-    const sector = groupMap.get(row.sectorId);
+  for (const [position, row] of traded.entries()) {
+    const [sectorId, industryId, subindustryId] = scope.memberships[position];
+    row.sectorId = sectorId;
+    row.industryId = industryId;
+    row.subindustryId = subindustryId;
+    const industry = groupMap.get(industryId);
+    const sector = groupMap.get(sectorId);
     row.industryRS = industry?.medianRS ?? null;
     row.industryBreadth = industry?.above50 ?? null;
     row.industryRelativeRS = finite(row.rsPercentile) && finite(industry?.medianRS) ? row.rsPercentile - industry.medianRS : null;
