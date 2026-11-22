@@ -10,7 +10,9 @@ const context = {
   date, dataVersion: 19, classification: 'sec-sic', reference: 'as-of', basis: 'known',
 };
 
-function setup(t, api) {
+const noteRequest = { path: 'research-notes', params: { ...context, subjectType: 'stock', subjectId: securityId } };
+
+function setup(t, api, noteApi = () => ({ notes: [] })) {
   const dom = new JSDOM('<main></main>');
   const previousDocument = globalThis.document;
   globalThis.document = dom.window.document;
@@ -19,18 +21,19 @@ function setup(t, api) {
     dom.window.close();
   });
   const calls = [];
+  const controller = new AbortController();
   const env = {
     main: document.querySelector('main'), params: { symbol: securityId }, snapshotContext: context, context,
-    signal: new AbortController().signal, config: { models: [{ id: 'composite', version: 3, name: 'Composite RS' }] },
+    signal: controller.signal, config: { models: [{ id: 'composite', version: 3, name: 'Composite RS' }] },
     isActive: () => true, routeUrl: (page, patch) => `#${page}?${new URLSearchParams(patch)}`,
     setActions(actions) { this.actions = actions; },
     async api(path, options) {
       calls.push({ path, params: { ...context, ...options.params } });
-      return api(path, options);
+      return path === 'research-notes' ? noteApi(options) : api(path, options);
     },
     async publishedSeries() { assert.fail('Polled without an existing preparation job'); },
   };
-  return { env, calls };
+  return { env, calls, controller };
 }
 
 function chartBars(length = 130) {
@@ -67,7 +70,7 @@ test('ticker dashboard defaults to 126 daily candles and uses the selected histo
   const { render } = await import('../frontend/ticker.js');
   await render(env);
   const { main } = env;
-  assert.deepEqual(calls, [{ path: 'stocks/fixture%3AARCT', params: { ...context, lookback: 126 } }]);
+  assert.deepEqual(calls, [{ path: 'stocks/fixture%3AARCT', params: { ...context, lookback: 126 } }, noteRequest]);
   assert.equal(main.querySelector('h1').textContent, 'ARCT · Arctic Technologies');
   assert.match(main.querySelector('.subtitle').textContent, /May 30, 2025/);
   assert.match(main.querySelector('.inline-stack').textContent, /Fixture prices.*Composite RS/);
@@ -104,7 +107,7 @@ test('ticker dashboard defaults to 126 daily candles and uses the selected histo
   main.querySelector('[data-value="rs"]').click();
   main.querySelector('[data-value="screens"]').click();
   await setImmediate();
-  assert.deepEqual(calls.slice(1), [
+  assert.deepEqual(calls.slice(2), [
     { path: 'stocks/fixture%3AARCT/rankings', params: { ...context, cadence: 'weekly', limit: 52 } },
     { path: 'stocks/fixture%3AARCT/screens', params: context },
   ]);
@@ -171,7 +174,7 @@ test('ticker sections switch locally and expose prepared values, dated fundament
   assert.strictEqual(main.querySelector('#stock-price-panel [data-chart]'), chart);
   assert.equal(panel('[data-metric="sma_20d"]').hidden, false);
   assert.equal(panel('[data-metric="avg_volume_20d"]').hidden, true);
-  assert.equal(calls.length, 1);
+  assert.deepEqual(calls.slice(1), [noteRequest]);
 });
 
 test('ticker dashboard shows unavailable historical preparation without re-querying a newer session', async (t) => {
@@ -204,7 +207,7 @@ test('ticker dashboard follows an existing preparation job for the selected sess
   };
   const { render } = await import('../frontend/ticker.js');
   await render(env);
-  assert.equal(calls.length, 1);
+  assert.deepEqual(calls.slice(1), [noteRequest]);
   assert.match(env.main.querySelector('.subtitle').textContent, /May 30, 2025/);
   assert.ok(env.main.querySelector('#stock-price-panel [data-plot]'));
   assert.equal(env.main.querySelector('#stock-warming').textContent, '');
@@ -232,11 +235,65 @@ test('a pending price product preserves displayed RS until explicit scoped prepa
   };
   const { render } = await import('../frontend/ticker.js');
   await render(env);
-  assert.equal(calls.length, 1);
+  assert.deepEqual(calls.slice(1), [noteRequest]);
   assert.equal(env.main.querySelector('[data-metric="rsPercentile"] strong').textContent, '96.0');
   assert.match(env.main.querySelector('#stock-price-panel').textContent, /requires its own prepared price frame/);
   await env.actions['prepare-ticker-detail']();
-  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.slice(1).map(({ path }) => path), ['research-notes', 'stocks/fixture%3AARCT/prepare', 'research-notes']);
   assert.ok(env.main.querySelector('#stock-price-panel [data-plot]'));
   assert.equal(env.main.querySelector('[data-metric="observations"] strong').textContent, '125');
+});
+
+test('ticker shows all dated notes and updates exact visible markers after an edit', async (t) => {
+  const bars = chartBars(180);
+  const older = bars[1].date;
+  const visible = bars.at(-10).date;
+  const midweek = bars.at(-3).date;
+  let notes = [older, visible, midweek, date].map((session, index) => ({
+    id: `fixture-note-${index}`, subjectType: 'stock', subjectId: securityId, date: session,
+    markdown: index ? 'Close <script>fixture</script>' : 'Older observation', source: 'chartbook-note', version: 1,
+    createdAt: '2025-06-01T14:15:00.000Z', updatedAt: '2025-06-01T14:15:00.000Z',
+  }));
+  const writes = [];
+  const { env, calls, controller } = setup(t, () => ({ symbol: 'ARCT', securityId, date, dataVersion: 19, chartBars: bars,
+    listingDate: '2024-01-05', earliestDate: bars[0].date }), (options) => {
+    if (options.method === 'PUT') {
+      writes.push(options);
+      const updated = { ...notes.find((note) => note.id === options.body.noteId), markdown: options.body.markdown, version: 2 };
+      notes = notes.map((note) => note.id === updated.id ? updated : note);
+      return updated;
+    }
+    return { notes };
+  });
+  const { render } = await import('../frontend/ticker.js');
+  await render(env);
+  await setImmediate();
+  const markers = () => [...env.main.querySelectorAll('[data-research-note-marker]')].map((node) => node.dataset.researchNoteMarker);
+  const history = env.main.querySelector('#stock-research-notes');
+  assert.equal(history.querySelector('input[type="date"]').min, bars[0].date);
+  assert.equal(history.querySelector('input[type="date"]').max, date);
+  assert.deepEqual(markers(), [visible, midweek, date]);
+  assert.equal(history.querySelectorAll('article').length, 4);
+  assert.equal(history.querySelector('script'), null);
+  assert.match(history.textContent, /Created.*Updated.*Older observation/s);
+  env.actions['stock-range-local']('21');
+  assert.deepEqual(markers(), [visible, midweek, date]);
+  env.actions['stock-cadence-local']('weekly');
+  const markedWeeks = [...env.main.querySelectorAll('[data-research-note-marker]')];
+  assert.deepEqual(markedWeeks.map((node) => node.dataset.researchNoteDates), [visible, `${midweek} ${date}`]);
+  assert.match(markedWeeks[1].getAttribute('aria-label'), /2 research notes in week ending May 30, 2025/);
+  env.actions['stock-cadence-local']('daily');
+  history.querySelectorAll('[data-research-note-edit]')[3].click();
+  const editor = document.querySelector('[data-research-note-editor]');
+  const form = editor.querySelector('form');
+  form.elements.namedItem('note').value = 'Earlier observation updated';
+  form.dispatchEvent(new document.defaultView.Event('submit', { bubbles: true, cancelable: true }));
+  await setImmediate();
+  assert.deepEqual(writes[0].params, context);
+  assert.deepEqual(writes[0].body, { subjectType: 'stock', subjectId: securityId, date: older, markdown: 'Earlier observation updated',
+    expectedVersion: 1, noteId: 'fixture-note-0' });
+  assert.match(history.textContent, /Earlier observation updated/);
+  assert.deepEqual(markers(), [visible, midweek, date]);
+  controller.abort();
+  assert.equal(calls.filter(({ path }) => path === 'research-notes').length, 3);
 });

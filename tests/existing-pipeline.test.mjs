@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
@@ -14,11 +14,19 @@ import { createPreparedDetailWriter } from '../backend/prepared-details.mjs';
 import { prepareRangeHistoryBatch, prepareRangeMetrics } from '../backend/range-metrics.mjs';
 import { createRiskHistoryWriter, prepareRiskHistoryBenchmarks } from '../backend/risk-history.mjs';
 import { prepareNyseSummation, prepareStandardHealth, preparationWorkspaceScopes, summationContext } from '../backend/service.mjs';
+import { decodeStoredJson, encodeStoredJson } from '../backend/storage-codec.mjs';
 import { benchmarkContexts, exactRangePlans } from '../scripts/pipeline-verification.mjs';
 import { verifyExistingPipeline } from '../scripts/verify-existing-pipeline.mjs';
 
 const hash = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const fileHash = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
+const ledgerPath = (options) => join(options.receiptsDirectory, 'verification-receipts.json');
+const readLedger = (options) => JSON.parse(readFileSync(ledgerPath(options), 'utf8'));
+
+function comparableReport(report) {
+  const { verificationElapsedMs, ...performance } = report.performance;
+  return { ...report, performance };
+}
 
 function archiveFixture(t, { includeHighBucket = false } = {}) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'market-recovery-')));
@@ -151,4 +159,93 @@ test('recovery accepts the unsigned high bit for stock frame bucket 31', async (
     assert.ok(archive.prepare('SELECT 1 FROM prepared_snapshot_contexts WHERE delta_mask>=2147483648 LIMIT 1').get());
   } finally { archive.close(); }
   assert.equal((await verifyExistingPipeline(options)).state, 'verified');
+});
+
+test('parallel cold oracle tiles reproduce the serial proof and durable receipt contents', async (t) => {
+  const options = { ...archiveFixture(t), tileSize: 1 };
+  const hashes = [fileHash(options.sourcePath), fileHash(options.archivePath)];
+  const serial = await verifyExistingPipeline(options);
+  const parallelOptions = { ...options, oracleWorkers: 3, receiptsDirectory: options.receiptsDirectory + '.parallel',
+    reportPath: options.reportPath + '.parallel' };
+  const parallel = await verifyExistingPipeline(parallelOptions);
+  assert.deepEqual(comparableReport(parallel), comparableReport(serial));
+  assert.deepEqual(readLedger(parallelOptions), readLedger(options));
+  assert.deepEqual(parallel.boundaryOracle.map(({ sessions }) => sessions), [2, 2]);
+  assert.ok(parallel.boundaryOracle.every(({ priorLeaderRosters }) => priorLeaderRosters > 0));
+  assert.deepEqual([fileHash(options.sourcePath), fileHash(options.archivePath)], hashes);
+  assert.deepEqual(readdirSync(parallelOptions.receiptsDirectory), ['verification-receipts.json']);
+});
+
+test('parallel verification reuses completed serial tiles and validates their exact coverage', async (t) => {
+  const options = { ...archiveFixture(t), tileSize: 1 };
+  const abort = new AbortController();
+  await assert.rejects(verifyExistingPipeline({ ...options, signal: abort.signal, onProgress: ({ phase }) => {
+    if (phase === 'oracle-core') abort.abort(new Error('Fixture interrupted after its first tile'));
+  } }), /interrupted after its first tile/);
+  assert.equal(existsSync(options.reportPath), false);
+  const first = readLedger(options);
+  const oracleNames = Object.keys(first.completed).filter((name) => name.startsWith('oracle-'));
+  assert.deepEqual(oracleNames, ['oracle-core:2026-11-18:2026-11-18']);
+  const resumed = [];
+  const report = await verifyExistingPipeline({ ...options, oracleWorkers: 4, onProgress: (event) => {
+    if (event.phase.startsWith('oracle-')) resumed.push(event);
+  } });
+  assert.equal(report.state, 'verified');
+  assert.deepEqual(resumed.filter(({ reused }) => reused).map(({ through }) => through), ['2026-11-18']);
+  assert.equal(resumed.filter(({ reused }) => !reused).length, 3);
+  const ledger = readLedger(options);
+  const [firstName] = oracleNames;
+  assert.deepEqual(ledger.completed[firstName], first.completed[firstName]);
+
+  const empty = { sessions: 1, velocitySnapshots: 0, leaderContexts: 0, priorLeaderRosters: 0 };
+  ledger.completed[firstName] = { result: empty, digest: hash([ledger.identity, firstName, empty]) };
+  writeFileSync(ledgerPath(options), JSON.stringify(ledger));
+  const invalidReport = join(dirname(options.reportPath), 'unverified.json');
+  await assert.rejects(verifyExistingPipeline({ ...options, oracleWorkers: 4, reportPath: invalidReport }), /oracle coverage is invalid/);
+  assert.equal(existsSync(invalidReport), false);
+  assert.deepEqual(readdirSync(options.receiptsDirectory), ['verification-receipts.json']);
+});
+
+test('a failed independent worker cannot publish a report or receipt for its tile', async (t) => {
+  const options = { ...archiveFixture(t), tileSize: 1, oracleWorkers: 4 };
+  const archive = new DatabaseSync(options.archivePath);
+  try {
+    const dates = archive.prepare("SELECT * FROM market_history WHERE date='2026-11-18'").all();
+    const update = archive.prepare(`UPDATE market_history SET value=? WHERE universe=? AND model=? AND data_version=?
+      AND calculation_version=? AND definition_key=? AND date=?`);
+    assert.ok(dates.length > 0);
+    for (const row of dates) {
+      const stored = decodeStoredJson(row.value);
+      const projection = Array.isArray(stored) ? stored[2] : stored;
+      projection.aggregates.leaderReturn = 12345;
+      update.run(encodeStoredJson(stored), row.universe, row.model, row.data_version, row.calculation_version, row.definition_key, row.date);
+    }
+    archive.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  } finally { archive.close(); }
+  const hashes = [fileHash(options.sourcePath), fileHash(options.archivePath)];
+  await assert.rejects(verifyExistingPipeline(options), /Boundary oracle worker core:2026-11-18:2026-11-18: Serial leader oracle disagrees/);
+  assert.equal(existsSync(options.reportPath), false);
+  assert.equal(Object.hasOwn(readLedger(options).completed, 'oracle-core:2026-11-18:2026-11-18'), false);
+  assert.deepEqual(readdirSync(options.receiptsDirectory), ['verification-receipts.json']);
+  assert.deepEqual([fileHash(options.sourcePath), fileHash(options.archivePath)], hashes);
+});
+
+test('cancelling the parallel oracle settles the remaining workers and keeps the verified tile only', async (t) => {
+  const options = { ...archiveFixture(t), tileSize: 1, oracleWorkers: 4 };
+  const abort = new AbortController();
+  await assert.rejects(verifyExistingPipeline({ ...options, signal: abort.signal, onProgress: ({ phase }) => {
+    if (phase.startsWith('oracle-')) abort.abort(new Error('Fixture cancelled remaining workers'));
+  } }), /cancelled remaining workers/);
+  assert.equal(existsSync(options.reportPath), false);
+  assert.equal(Object.keys(readLedger(options).completed).filter((key) => key.startsWith('oracle-')).length, 1);
+  assert.deepEqual(readdirSync(options.receiptsDirectory), ['verification-receipts.json']);
+});
+
+test('oracle worker count is restricted to integers from one to eight', async (t) => {
+  const options = archiveFixture(t);
+  for (const oracleWorkers of [0, 9, 1.5, NaN, 'many']) {
+    await assert.rejects(verifyExistingPipeline({ ...options, oracleWorkers }), /Choose oracle workers from 1 through 8/);
+  }
+  assert.equal(existsSync(options.receiptsDirectory), false);
+  assert.equal(existsSync(options.reportPath), false);
 });

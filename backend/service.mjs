@@ -13,6 +13,7 @@ import { backupRetention, createCompressedBackup } from './backup.mjs';
 import { runBatchPreparation } from './batch-preparation.mjs';
 import { BREADTH_METRICS, breadthMetric, binaryMetric } from './breadth.mjs';
 import { chartBookIndustryJob, createChartBook, prepareChartBookIndustries, readChartBookSnapshot, scheduleChartBookIndustries } from './chartbook.mjs';
+import { createResearchNotes } from './research-notes.mjs';
 import { createEngine, UNIVERSES, validateUniverse } from './engine.mjs';
 import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, volumeRatio } from './metrics.mjs';
 import {
@@ -2212,8 +2213,14 @@ export function createService({ db, provider, journalClient, workers = true, pre
     return { ...options, unprepared: true, materialization: rangePendingStatus(db, engine, point, rangeMetrics) };
   }
 
+  const researchNotes = createResearchNotes(db, engine);
   const chartBook = createChartBook(db, engine, {
     enqueue, pending: pendingPreparation,
+    readHealth(point, query, lookback) {
+      const coverage = researchCoverage(query);
+      const model = chooseHealthModel(db, query.healthModel);
+      return { rows: readPreparedHealth(db, engine, point, model, coverage, null, lookback), ...coverage };
+    },
     readSnapshot: (config, options) => readChartBookSnapshot(db, engine, config, options) ?? preparedView(config, options),
     resolveScreen(config, definition, read) {
       const point = engine.context({ ...materializationContext(config), ...screenDataNeeds(definition) });
@@ -2251,6 +2258,12 @@ export function createService({ db, provider, journalClient, workers = true, pre
       };
       const rowPage = () => [parseCount(query.page, 1, 100_000, 1), parseCount(query.perPage, 1, 250, 50)];
 
+      if (area === 'research-notes') {
+        const outcome = researchNotes.route({ method, item, query, body, resolvePoint: asContext,
+          resolveIdentity: (point, id) => stockIdentity(db, point, id) });
+        if (!outcome) throw asError('Research notes route not found', 404);
+        return response(outcome.data, outcome.status);
+      }
       if (area === 'chartbooks') {
         const { data, status } = await chartBook({ method, item, action, sub, query, body, resolvePoint: listContext });
         return response(data, status);

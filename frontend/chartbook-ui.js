@@ -1,4 +1,5 @@
 import { compact, count, dateLabel, direction, money, number, numeric, rate, ratio, safe, signed } from './ui.js';
+import { bindResearchNoteMarkers, renderResearchNoteMarkers } from './research-notes.js';
 
 export const chartbookDefaultRange = 126;
 export const chartbookLayers = [
@@ -99,7 +100,7 @@ function lineMarkup(rows, key, x, y) {
       stroke-width="${key.startsWith('sma') ? 1.15 : 1.45}" opacity=".74"${key === 'industry' ? ' stroke-dasharray="5 2"' : ''} vector-effect="non-scaling-stroke"/>`).join('');
 }
 
-export function renderChartbookChart(data, layers, symbol) {
+export function renderChartbookChart(data, layers, symbol, notes = []) {
   const { rows, comparisons, anchor } = data;
   const lanes = ['sma20', 'sma50', 'benchmark', 'industry'].filter((key) => layers[key]);
   const prices = rows.flatMap((row) => [row.low, row.high, row.close, ...lanes.map((key) => row[key])]).filter(positive);
@@ -130,27 +131,33 @@ export function renderChartbookChart(data, layers, symbol) {
   const labels = dates.map((index) => `<text x="${x(index)}" y="396" text-anchor="${index === 0 ? 'start' : index === rows.length - 1 ? 'end' : 'middle'}">${safe(dateLabel(rows[index].date, sameYear))}</text>`).join('');
   const markers = layers.moves ? rows.map((row, index) => numeric(row.change) && Math.abs(row.change) >= threshold
     ? `<circle class="chartbook-move ${row.change > 0 ? 'rising' : 'falling'}" cx="${x(index)}" cy="373" r="2"/>` : '').join('') : '';
+  const annotations = renderResearchNoteMarkers(notes, { rows, x, y: plot.top + 3 });
   const title = `${symbol} candlestick chart. Use Up and Down Arrow or Home and End to inspect sessions.`;
-  return { rows, x, comparisons, anchor, html: `<div class="chartbook-plot" data-chartbook-plot>
-    <svg viewBox="0 0 ${chartWidth} ${chartHeight}" preserveAspectRatio="none" role="img" tabindex="0" aria-label="${safe(title)}">
+  return { rows, x, comparisons, anchor, notes, html: `<div class="chartbook-plot" data-chartbook-plot>
+    <svg viewBox="0 0 ${chartWidth} ${chartHeight}" preserveAspectRatio="none" role="${annotations ? 'group' : 'img'}" tabindex="0" aria-label="${safe(title)}">
       <g class="chartbook-grid">${grid}<line x1="${plot.left}" x2="${plot.right}" y1="${plot.bottom}" y2="${plot.bottom}"/>${labels}</g>
       ${lanes.map((key) => lineMarkup(rows, key, x, y)).join('')}${preparedCandles}${closes}${markers}
-      <line x1="0" x2="0" y1="${plot.top}" y2="${plot.bottom}" class="chartbook-crosshair" hidden/>
+      <line x1="0" x2="0" y1="${plot.top}" y2="${plot.bottom}" class="chartbook-crosshair" hidden/>${annotations}
     </svg><div class="chartbook-point" data-chartbook-point role="status" aria-live="polite" hidden></div></div>` };
 }
 
-export function bindChartbookChart(container, chart) {
-  if (!chart.html) return () => false;
+export function bindChartbookChart(container, chart, { onNoteEdit, signal } = {}) {
+  if (!chart.html || signal?.aborted) return Object.assign(() => false, { cleanup() {} });
   const svg = container.querySelector('[data-chartbook-plot] svg');
   const tooltip = container.querySelector('[data-chartbook-point]');
   const crosshair = svg.querySelector('.chartbook-crosshair');
   let index = -1;
-  const hide = () => {
+  const hidePoint = () => {
     if (index < 0) return false;
     index = -1;
     tooltip.hidden = true;
     crosshair.toggleAttribute('hidden', true);
     return true;
+  };
+  const notes = bindResearchNoteMarkers(svg.parentElement, chart.notes, { onEdit: onNoteEdit, onShow: hidePoint });
+  const hide = () => {
+    const hadNote = notes.hide();
+    return hidePoint() || hadNote;
   };
   const show = (position) => {
     index = Math.max(0, Math.min(chart.rows.length - 1, position));
@@ -168,22 +175,30 @@ export function bindChartbookChart(container, chart) {
       ${chart.comparisons.filter(({ key, shown }) => shown && positive(row[key])).map(({ key, label }) => `<span>${safe(label)} ${money(row[key])} rebased</span>`).join('')}`
       : '<span>No usable price for this session</span>'}`;
   };
-  svg.addEventListener('pointermove', (event) => {
+  const pointer = (event) => {
+    if (event.target.closest?.('[data-research-note-marker]')) return;
     const bounds = svg.getBoundingClientRect();
     if (!bounds.width) return;
     const position = (chartWidth * (event.clientX - bounds.left) / bounds.width - plot.left) / (plot.right - plot.left);
     show(Math.floor(position * chart.rows.length));
-  });
-  svg.addEventListener('pointerleave', hide);
-  svg.addEventListener('blur', hide);
-  svg.addEventListener('keydown', (event) => {
-    if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+  };
+  const keyboard = (event) => {
+    if (event.target !== svg || !['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
     if (event.key === 'Home') show(0);
     else if (event.key === 'End' || index < 0) show(chart.rows.length - 1);
     else show(index + (event.key === 'ArrowUp' ? 1 : -1));
-  });
-  return hide;
+  };
+  const handlers = [['pointermove', pointer], ['pointerleave', hidePoint], ['blur', hidePoint], ['keydown', keyboard]];
+  for (const [type, listener] of handlers) svg.addEventListener(type, listener);
+  function cleanup() {
+    hide();
+    notes();
+    for (const [type, listener] of handlers) svg.removeEventListener(type, listener);
+    signal?.removeEventListener('abort', cleanup);
+  }
+  signal?.addEventListener('abort', cleanup, { once: true });
+  return Object.assign(hide, { cleanup });
 }
 
 export function chartbookStats(row) {

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { gunzipSync, gzipSync } from 'node:zlib';
+import { BREADTH_METRICS } from './breadth.mjs';
 import { CALCULATION_VERSION, getWorkspace, isoDate, listWorkspace, normalizeSymbol, storeWorkspace } from './database.mjs';
 import { expectedSessions } from './calendar.mjs';
 import { readMaterializedHistory } from './materialization.mjs';
@@ -8,9 +9,13 @@ import { hasPreparedSnapshot, readPreparedSnapshot } from './prepared-snapshots.
 import { rankBy } from './ranking.mjs';
 
 const bookKind = 'chartbook';
+const marketBookKind = 'market-chartbook';
 const noteKind = 'chartbook-note';
 const maxChartSessions = 1260;
 const chartWarmup = 50;
+const marketWarmup = 9;
+const monitorBreadth = ['up_13pct_34d', 'down_13pct_34d'];
+const marketViews = ['combined', 'market', 'industries'];
 export const chartBookIndustryJob = 'chartbook-industry';
 const builtins = [
   ['new-high-20d', 'New 20-session highs', 'new_high_20d'],
@@ -197,6 +202,68 @@ function chartSessions(config, count) {
   return config.earliestDate && config.date ? expectedSessions(config.earliestDate, config.date).slice(-count) : [];
 }
 
+function chartLookback(value) {
+  const lookback = value == null ? 126 : Number(value);
+  if (!Number.isInteger(lookback) || lookback < 1 || lookback > maxChartSessions) throw bad('ChartBook lookback must be 1–1,260 sessions');
+  return lookback;
+}
+
+function marketDeck(value) {
+  if (!isObject(value) || !marketViews.includes(value.view)) throw bad('Choose a Market and Industry ChartBook view');
+  const { industryIds = null } = value;
+  if (industryIds != null && (!Array.isArray(industryIds) || industryIds.length > 1000 || industryIds.some((id) => !goodId(id)))) {
+    throw bad('Choose valid industry groups for this ChartBook');
+  }
+  return { view: value.view, industryIds: industryIds == null ? null : [...new Set(industryIds)] };
+}
+
+function compactBreadth(snapshot, standardKeys) {
+  if (!snapshot) return {};
+  return Object.fromEntries(standardKeys.flatMap((key) => {
+    const metric = snapshot.breadth?.[key];
+    return metric ? [[key, [metric.value, metric.numerator, metric.denominator]]] : [];
+  }));
+}
+
+function visitStoredHistory(db, engine, config, sessions, visit) {
+  let prepared = 0;
+  for (let start = 0; start < sessions.length; start += 63) {
+    const span = sessions.slice(start, start + 63);
+    const { rows } = readMaterializedHistory(db, engine, config, { from: span[0], to: span.at(-1), limit: span.length });
+    for (const row of rows) visit(row);
+    prepared += rows.length;
+  }
+  return prepared === sessions.length;
+}
+
+function storedMarketHistory(db, engine, config, lookback) {
+  const sessions = chartSessions(config, lookback + marketWarmup);
+  const monitor = engine.context({ ...analysisContext(config), breadthKeys: [...new Set([...config.breadthKeys, ...monitorBreadth])] });
+  const keys = ['adSpread', ...BREADTH_METRICS.map(({ key }) => key)];
+  const observations = new Map();
+  const project = (snapshot, hasMonitor = false) => {
+    if (observations.has(snapshot.date)) return;
+    const a = snapshot.aggregates || {};
+    observations.set(snapshot.date, { date: snapshot.date, state: 'prepared', coverage: snapshot.coverage?.state,
+      traded: snapshot.coverage?.traded ?? null, listed: snapshot.coverage?.listed ?? null,
+      breadth: compactBreadth(snapshot, hasMonitor ? [...keys, ...monitorBreadth] : keys),
+      volume: {
+        upDollar: a.dollarVolumeObservations > 0 ? a.upDollar : null, downDollar: a.dollarVolumeObservations > 0 ? a.downDollar : null,
+        upVolume: a.volumeObservations > 0 ? a.upVolume : null, downVolume: a.volumeObservations > 0 ? a.downVolume : null,
+        dollarVolumeObservations: a.dollarVolumeObservations ?? null, volumeObservations: a.volumeObservations ?? null,
+      } });
+  };
+  const monitorDates = new Set();
+  visitStoredHistory(db, engine, monitor, sessions, (snapshot) => { monitorDates.add(snapshot.date); project(snapshot, true); });
+  if (observations.size < sessions.length) visitStoredHistory(db, engine, config, sessions, project);
+  const rows = sessions.map((date) => observations.get(date) || { date, state: 'unprepared' });
+  const visible = rows.slice(-lookback);
+  const prepared = visible.filter(({ state }) => state === 'prepared').length;
+  return { date: config.date, dataVersion: config.dataVersion, context: analysisContext(config), rows, lookback,
+    state: !prepared ? 'unprepared' : prepared === visible.length ? 'ready' : 'partial',
+    prepared, expected: visible.length, monitorPrepared: visible.reduce((total, row) => total + Number(monitorDates.has(row.date)), 0) };
+}
+
 function usableBar(bar) {
   return !!bar?.traded && !bar.missing && !bar.priceQuarantined && !bar.unverifiedSplit && finite(bar.close) && bar.close > 0;
 }
@@ -219,17 +286,19 @@ function comparableCurve(sessions, readings) {
 
 function datedIndustries(db, engine, config, sessions) {
   const result = new Map();
-  if (sessions.length < 2) return result;
+  if (sessions.length < 2) return { result, complete: true };
   const available = db.prepare('SELECT 1 FROM classifications WHERE system=? AND version<=? AND effective_from<? AND known_at<? LIMIT 1')
     .get(config.classification, config.dataVersion, config.date, config.date);
-  if (!available) return result;
-  const { rows } = readMaterializedHistory(db, engine, config, { from: sessions[0], to: sessions.at(-1), limit: sessions.length });
-  for (const { date, groups } of rows) for (const group of groups ?? []) {
-    if (group.level !== 'industry' || !finite(group.dailyReturn)) continue;
-    if (!result.has(group.id)) result.set(group.id, new Map());
-    result.get(group.id).set(date, { return: group.dailyReturn, expected: group.count });
-  }
-  return result;
+  if (!available) return { result, complete: false };
+  const complete = visitStoredHistory(db, engine, config, sessions, ({ date, groups }) => {
+    for (const group of groups ?? []) {
+      if (group.level !== 'industry' || !finite(group.dailyReturn)) continue;
+      if (!result.has(group.id)) result.set(group.id, new Map());
+      result.get(group.id).set(date, { return: group.dailyReturn, expected: group.count,
+        observations: group.counts?.dailyReturn ?? null });
+    }
+  });
+  return { result, complete };
 }
 
 function curveState(rows) {
@@ -324,9 +393,11 @@ export function scheduleChartBookIndustries(db, engine, base, enqueueJob) {
   return enqueued;
 }
 
-export function createChartBook(db, engine, { readSnapshot, pending, resolveScreen, enqueue } = {}) {
+export function createChartBook(db, engine, { readSnapshot, pending, resolveScreen, readHealth, enqueue } = {}) {
   const historyCache = new Map();
+  const benchmarkCache = new Map();
   const fullSnapshots = new Map();
+  const industryCatalogs = new Map();
   const reader = readSnapshot ?? ((config, flags) => readChartBookSnapshot(db, engine, config, flags));
   const pendingFor = pending ?? (() => ({ preparationState: 'unregistered' }));
   const snapshotFor = (config, flags = {}) => {
@@ -444,7 +515,8 @@ export function createChartBook(db, engine, { readSnapshot, pending, resolveScre
     const key = JSON.stringify([analysisContext(config), sessions[0], sessions.at(-1)]);
     let dated = historyCache.get(key);
     if (!dated || Date.now() >= dated.expires) {
-      dated = { data: datedIndustries(db, engine, config, sessions), expires: Date.now() + 15_000 };
+      const { result, complete } = datedIndustries(db, engine, config, sessions);
+      dated = { data: result, expires: complete ? Infinity : Date.now() + 15_000 };
       historyCache.set(key, dated);
       if (historyCache.size > 3) historyCache.delete(historyCache.keys().next().value);
     }
@@ -468,6 +540,71 @@ export function createChartBook(db, engine, { readSnapshot, pending, resolveScre
       canPrepare: !!eligible && !preparing?.pending,
       reason: eligible ? 'Dated industry returns are unavailable. Prepare the current-membership proxy for this session.'
         : 'Dated industry returns are unavailable for the selected historical context.' };
+  }
+
+  function marketIndustries(config) {
+    const key = JSON.stringify(analysisContext(config));
+    if (industryCatalogs.has(key)) return industryCatalogs.get(key);
+    const snapshot = snapshotFor(config, { securityIds: [] }) ?? snapshotFor(config, { securityIds: [], velocity: true });
+    if (!snapshot) return { state: 'unprepared', industries: [], preparation: pendingFor(config) };
+    const groups = snapshot.groups.filter(({ level }) => level === 'industry').sort((left, right) =>
+      (left.rank ?? Infinity) - (right.rank ?? Infinity) || (right.medianRS ?? -Infinity) - (left.medianRS ?? -Infinity) ||
+      left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+    const catalog = { state: 'ready', industries: groups };
+    industryCatalogs.set(key, catalog);
+    if (industryCatalogs.size > 3) industryCatalogs.delete(industryCatalogs.keys().next().value);
+    return catalog;
+  }
+
+  function marketIndustry(config, group, lookback) {
+    const sessions = chartSessions(config, lookback + chartWarmup);
+    const key = JSON.stringify([analysisContext(config), sessions[0], sessions.at(-1)]);
+    let cached = benchmarkCache.get(key);
+    if (!cached || Date.now() >= cached.expires) {
+      const result = readBenchmark(db, config, readableIdentity(db, config), sessions, lookback + chartWarmup);
+      cached = { result, expires: result.state === 'ready' ? Infinity : Date.now() + 15_000 };
+      benchmarkCache.set(key, cached);
+      if (benchmarkCache.size > 3) benchmarkCache.delete(benchmarkCache.keys().next().value);
+    }
+    return { date: config.date, dataVersion: config.dataVersion, context: analysisContext(config), lookback, sessions,
+      industry: industryComparison(config, group, sessions), benchmark: cached.result };
+  }
+
+  function marketRoute({ method, action, sub, query, body, resolvePoint }) {
+    if (action === 'decks' && ['POST', 'PUT', 'DELETE'].includes(method)) {
+      const saved = sub && getWorkspace(db, marketBookKind, sub);
+      if (method !== 'POST' && !saved) throw bad('Market ChartBook not found', 404);
+      if (method === 'DELETE') return { data: storeWorkspace(db, marketBookKind, saved, sub, true) };
+      if (method === 'POST' && sub) throw bad('Market ChartBook creation does not take a deck ID');
+      const definition = marketDeck(body.definition);
+      return { data: storeWorkspace(db, marketBookKind, { name: body.name, definition }, saved?.id), status: saved ? 200 : 201 };
+    }
+    const point = resolvePoint(chosenContext(method === 'GET' ? query : body.context));
+    if (!action && method === 'GET') {
+      const { industries, ...status } = marketIndustries(point);
+      return { data: { date: point.date, dataVersion: point.dataVersion, context: analysisContext(point), ...status,
+        industries: industries.map(({ id, name, parent, rank, medianRS, count }) => ({ id, name, parent, rank, medianRS, count })),
+        metrics: BREADTH_METRICS, decks: listWorkspace(db, marketBookKind) } };
+    }
+    if (action === 'history' && !sub && method === 'GET') return { data: storedMarketHistory(db, engine, point, chartLookback(query.lookback)) };
+    if (action === 'health' && !sub && method === 'GET') {
+      const lookback = chartLookback(query.lookback);
+      const health = readHealth?.(point, query, lookback) ?? { rows: [] };
+      const sessions = chartSessions(point, lookback);
+      const archived = new Map(health.rows.map((row) => [row.date, row]));
+      const state = !archived.size ? 'unprepared' : sessions.length === archived.size ? 'ready' : 'partial';
+      return { data: { ...health, date: point.date, dataVersion: point.dataVersion, state,
+        rows: sessions.map((date) => archived.get(date) ?? { date, score: null, state: 'unprepared' }) } };
+    }
+    if (action === 'industries' && sub && method === 'GET') {
+      const { industries, state, preparation } = marketIndustries(point);
+      if (state === 'unprepared') return { data: { date: point.date, dataVersion: point.dataVersion, state, preparation } };
+      const group = industries.find(({ id }) => id === sub);
+      if (!group) throw bad('Industry is unavailable in this dated classification', 404);
+      return { data: marketIndustry(point, group, chartLookback(query.lookback)) };
+    }
+    if (action === 'prepare' && !sub && method === 'POST') return { data: prepare(point, true), status: 202 };
+    throw bad('Market ChartBook route not found', 404);
   }
 
   function stockCard(config, raw, lookback) {
@@ -504,6 +641,7 @@ export function createChartBook(db, engine, { readSnapshot, pending, resolveScre
 
   return async function route({ method, item, action, sub, query, body, resolvePoint }) {
     if (!item && method === 'GET') return { data: { books: listWorkspace(db, bookKind), ...definedSources(db) } };
+    if (item === 'market') return marketRoute({ method, action, sub, query, body, resolvePoint });
     if (item === 'notes' && action && ['GET', 'PUT'].includes(method)) {
       const date = query.date;
       if (!isoDate(date)) throw bad('A stock note needs its pinned YYYY-MM-DD trading session');
@@ -543,9 +681,7 @@ export function createChartBook(db, engine, { readSnapshot, pending, resolveScre
     }
     if ((book || transient) && action === 'stocks' && sub && method === 'GET') {
       const point = resolvePoint({ ...book?.definition.context, ...chosenContext(query) });
-      const lookback = query.lookback == null ? 126 : Number(query.lookback);
-      if (!Number.isInteger(lookback) || lookback < 1 || lookback > maxChartSessions) throw bad('ChartBook lookback must be 1–1,260 sessions');
-      return { data: stockCard(point, sub, lookback) };
+      return { data: stockCard(point, sub, chartLookback(query.lookback)) };
     }
     if ((book || transient) && action === 'prepare' && method === 'POST') {
       return { data: prepare(resolvePoint({ ...book?.definition.context, ...chosenContext(body.context) }), true), status: 202 };

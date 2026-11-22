@@ -1,0 +1,85 @@
+.research-note-marker {
+  cursor: pointer;
+  outline: none;
+}
+.research-note-marker rect {
+  fill: #172c2b;
+  stroke: #69c7b5;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.research-note-marker text {
+  fill: #d0f3ea;
+  font: 700 9px ui-monospace, monospace;
+  pointer-events: none;
+}
+.research-note-marker:hover rect,
+.research-note-marker:focus-visible rect {
+  fill: #286051;
+  stroke: #cbfff1;
+  stroke-width: 2;
+}
+.research-note-tooltip {
+  position: fixed;
+  z-index: 20;
+  width: min(340px, calc(100vw - 16px));
+  max-height: min(50dvh, 340px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #3c4d57);
+  border-radius: 7px;
+  background: var(--surface-raised, #142126);
+  color: var(--text, #e4efed);
+  box-shadow: 0 4px 16px #0008;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.research-note-tooltip article {
+  border-top: 1px solid var(--subtle-border);
+  margin-top: 7px;
+  padding-top: 7px;
+}
+.research-note-tooltip .button {
+  margin-top: 7px;
+}
+.research-note-audit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.research-note-copy {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 5px 0 0;
+}
+[data-research-note-editor] textarea {
+  min-height: 160px;
+}
+[data-note-editor-latest] {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.research-note-date {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.research-note-history-entry {
+  border-top: 1px solid var(--subtle-border);
+  padding: 10px 0;
+}
+.research-note-history-entry header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}

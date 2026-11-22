@@ -10,7 +10,7 @@
           "heading": "What the overview shows",
           "paragraphs": [
             "The overview brings together benchmark context, advancing and declining participation, breadth history, leading securities, daily movers, and the selected market-health model. Market Reading cards report their underlying observations independently of the composite health score; a missing or withheld score does not erase those facts. Daily movers compare with the prior close and show the corresponding industry when available. A benchmark gain alone does not imply broad participation.",
-            "The movers panel has three views: Daily movers are strictly above +10% or below −10% versus the prior close; exactly +10% and −10% are excluded. The other views show 20-trading-session highs/lows and 52-week highs/lows (252 sessions). A preview shows up to five tickers and the true qualifying count; Full list keeps the selected date and data version. Ticker and available industry names link to their detail views.",
+        "The movers panel has three views: Daily movers are strictly above +10% or below −10% versus the prior close; exactly +10% and −10% are excluded. The other views show 20-trading-session highs/lows and 52-week highs/lows (252 sessions). The preview shows 25 rows per page and the true qualifying count; sticky headers stay visible while the list scrolls, and pagination reaches the full result. Full list keeps the selected date and data version. Ticker and available industry names link to their detail views.",
             "Daily participation values are percentages of comparable stocks meeting each move threshold; counts are available in the tooltip or contributor drawer. The comparison matrix and sector/industry heatmaps mix measures with different units: returns and participation are percentages, RS is a percentile/rank measure, and counts are securities. Read the metric label and unit before comparing colors. In the RS-versus-velocity map, velocity is the change in RS percentile points; missing velocity is displayed at the neutral position, not treated as a measured zero change.",
             "Breadth percentages use the comparable traded securities for that metric and session. Prices that are missing, invalid, quarantined, unchanged where a move is required, or too short for a lookback can be excluded. Use the numerator, denominator, and coverage status in the interface to understand what a percentage describes. The data-quality page explains missing or excluded inputs."
           ]
@@ -355,7 +355,7 @@
           "heading": "What is on the ticker page",
           "paragraphs": [
             "Ticker detail is organized into Last session, Price & trend, Volume & participation, Liquidity & fundamentals, and All metrics. Changing sections filters the already loaded view and does not request a new calculation. Period tables align moving-average and volume measures by session window so comparisons stay on the same row.",
-            "The price chart shows split-adjusted OHLCV history and can export the plotted data as CSV. Use the TradingView link to open the matching security chart in a separate research tool. Float turnover requires dated public-float observations; when float or another source field is unavailable, the value remains blank rather than being estimated.",
+        "The price chart shows split-adjusted OHLCV history and can export the plotted data as CSV. Dated N markers open research notes for the security; created and updated timestamps are shown in UTC. Weekly chart cadence groups note dates by week ending, while opening a marker preserves each note's exact session date. Use the TradingView link to open the matching security chart in a separate research tool. Float turnover requires dated public-float observations; when float or another source field is unavailable, the value remains blank rather than being estimated.",
             "Metrics are scoped to the selected date, model, benchmark, price basis, universe, and data/calculation revision. The ticker's loaded-history high is limited to the history actually present for that security; it is not necessarily its all-time high. Corporate actions and unresolved source-quality intervals can change which measures are usable."
           ]
         },
@@ -428,7 +428,15 @@
           "steps": [
             "Create a book, then select built-in lists, saved screens, manual watchlists, or manual tickers/security IDs. ChartBook deduplicates by permanent security ID and shows a badge for every source that includes each stock.",
             "Review the selected session, data revision, source badges, and source status. Choose a default manual watchlist if you want B or Bookmark to save the current stock there.",
-            "Move between stocks with Next/Previous or the keyboard. Save a note for the current stock and date; notes and watchlist bookmarks persist."
+            "Move between stocks with Next/Previous or the keyboard. Save a note for the current stock and date; notes and watchlist bookmarks persist. Notes show created and updated timestamps in UTC. Existing Market Journal note records allow up to 40,000 characters; ordinary research notes allow up to 20,000 characters."
+          ]
+        },
+        {
+          "heading": "Market & Industries review",
+          "steps": [
+            "In ChartBook, open Market & Industries and choose Combined, Market, or Industries. Select a card or group to inspect its time series for the pinned date and context.",
+            "The default view is six months of daily readings. Daily 4% Movers compares up/down participation; the 5- and 10-session ratio cards compare sums of daily up-4% and down-4% shares, with each session weighted equally. Industry comparisons can overlay SPY on a shared rebased scale when the required history is available.",
+            "Focus the chart/content area before using Space to advance or Shift+Space to go back; a focused button or tab uses Space for its normal activation. V selects a longer range, M selects three months, and N opens the dated note editor. Escape closes the editor without saving the note."
           ]
         },
         {
@@ -439,17 +447,17 @@
             { "term": "SPY and Industry overlays", "text": "Comparison curves are rebased to the stock close at a shared or first usable anchor so they can be shown on the stock-price scale. They are not raw benchmark or industry prices. Missing or quarantined sessions remain gaps." }
           ],
           "paragraphs": [
-            "Toggle 20-session and 50-session moving averages, SPY, Industry, and the ±4% move strip. Point inspection shows the session date, available OHLCV, stock close/return, and rebased comparison values. The status below the chart identifies the comparison method and unavailable inputs.",
+            "Toggle the subtle-by-default 20-session and 50-session moving averages, SPY, Industry, and the ±4% move strip. Point inspection shows the session date, available OHLCV, stock close/return, and rebased comparison values. The status below the chart identifies the comparison method and unavailable inputs.",
             "Dated industry membership is used when available. A current-member equal-weight industry proxy can be prepared for the latest reconstructed session and applied retrospectively; it does not represent historical constituents. Historical industry curves can be unavailable when dated group membership is missing."
           ]
         },
         {
           "heading": "Keyboard and safe typing",
           "definitions": [
-            { "term": "ChartBook shortcuts", "text": "Space: next stock; Shift+Space or Left Arrow: previous; B: bookmark; V: longer range; M: 3M; N: note; Escape: dismiss the chart point display. Focus the chart and use Up/Down to inspect sessions or Home/End to jump to the first/last plotted point." }
+            { "term": "ChartBook shortcuts", "text": "Space: next stock/card when the chart or content area is focused; Shift+Space or Left Arrow: previous. A focused button or tab uses Space for its normal action. B: bookmark; V: longer range; M: 3M; N: open the dated note editor; Escape closes that editor without saving, or dismisses a chart point display when no editor is open. Focus the chart and use Up/Down to inspect sessions or Home/End to jump to the first/last plotted point." }
           ],
           "paragraphs": [
-            "Review shortcuts are disabled while a dialog is open or focus is in an input, text area, select, or editable text. Typing a note therefore does not navigate or bookmark stocks."
+            "Review shortcuts are disabled while a dialog is open or focus is in an input, text area, select, or editable text. Typing a note therefore does not navigate or bookmark stocks. Escape closes the editor without committing a note; use Save note to write it to the selected session."
           ]
         }
       ],

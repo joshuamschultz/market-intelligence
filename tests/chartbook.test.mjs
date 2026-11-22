@@ -6,7 +6,7 @@ import test from 'node:test';
 import { setTimeout } from 'node:timers/promises';
 import { expectedSessions } from '../backend/calendar.mjs';
 import { chartBookIndustryJob } from '../backend/chartbook.mjs';
-import { importDataset, openDatabase, storeWorkspace } from '../backend/database.mjs';
+import { dataVersion, importDataset, openDatabase, storeWorkspace } from '../backend/database.mjs';
 import { materializeHistory } from '../backend/materialization.mjs';
 import { writePreparedDetail } from '../backend/prepared-details.mjs';
 import { writePreparedSnapshot } from '../backend/prepared-snapshots.mjs';
@@ -103,6 +103,13 @@ test('saved sources resolve in stable order with complete pinned, deduplicated m
   assert.equal(note.body.securityId, 'company-a');
   assert.equal(note.body.version, 1);
   assert.deepEqual((await f.call('PUT', noteRoute, { markdown: note.body.markdown })).body, note.body);
+  const researchRoute = `research-notes?subjectType=stock&subjectId=company-a&date=${f.historical}&dataVersion=${f.context.dataVersion}`;
+  const allNotes = await f.call('GET', researchRoute);
+  assert.deepEqual(allNotes.body.notes.map(({ markdown }) => markdown), [note.body.markdown]);
+  const updatedNote = await f.call('PUT', researchRoute, { subjectType: 'stock', subjectId: 'company-a',
+    date: f.historical, expectedVersion: 1, markdown: 'Edited through shared notes' });
+  assert.equal(updatedNote.body.version, 2);
+  assert.equal(dataVersion(f.db), f.context.dataVersion);
   const listRoute = `watchlists/${watch.id}/members`;
   const firstAdd = await f.call('POST', listRoute, { add: ['company-b'] });
   const repeated = await f.call('POST', listRoute, { add: ['company-b'] });
@@ -112,7 +119,7 @@ test('saved sources resolve in stable order with complete pinned, deduplicated m
   const reopened = openDatabase(f.path);
   t.after(() => reopened.close());
   const api = createService({ db: reopened, workers: false, preparedOnly: true });
-  assert.equal((await api.dispatch({ url: '/api/v1/' + noteRoute })).body.markdown, note.body.markdown);
+  assert.equal((await api.dispatch({ url: '/api/v1/' + noteRoute })).body.markdown, updatedNote.body.markdown);
   assert.equal((await api.dispatch({ url: '/api/v1/chartbooks' })).body.books[0].definition.defaultWatchlistId, watch.id);
 });
 

@@ -2,6 +2,7 @@ import { chartRanges, rangeSegment } from './chart-ranges.js';
 import {
   bindChartbookChart, buildChartbookPlot, chartbookDefaultRange, chartbookLayers, chartbookShortcut, chartbookStats, renderChartbookChart,
 } from './chartbook-ui.js';
+import { loadResearchNotes, noteSubject, openResearchNoteEditor } from './research-notes.js';
 import { action, count, dateLabel, empty, field, icon, notice, numeric, option, pathPart, pending, rate, safe, tradingViewLink } from './ui.js';
 
 const cacheLimit = 9;
@@ -146,9 +147,16 @@ function actualRange(rows, sessions, bundle) {
   return `${count(priced)} priced of ${count(sessions)} requested sessions · ${dateLabel(first)} – ${dateLabel(last)}${limited}`;
 }
 
-function reviewShell(catalog, book) {
+function reviewModes(env, active, context = env.snapshotContext || {}) {
+  const pinned = Object.fromEntries(routeContextKeys.filter((key) => context[key] != null).map((key) => [key, context[key]]));
+  return `<nav class="actions chartbook-mode-tabs" aria-label="ChartBook section">${[
+    ['stocks', 'Stocks'], ['market', 'Market &amp; Industries'],
+  ].map(([key, label]) => `<a class="button" href="${safe(env.routeUrl('chartbook', { ...pinned, mode: key === 'market' ? key : null }))}"${active === key ? ' aria-current="page"' : ''}>${label}</a>`).join('')}</nav>`;
+}
+
+function reviewShell(catalog, book, tabs) {
   return `<section class="chartbook-workspace" data-chartbook>
-    <header class="chartbook-toolbar"><h1>ChartBook</h1><div class="actions">
+    <header class="chartbook-toolbar"><h1>ChartBook</h1>${tabs}<div class="actions">
       ${catalog.books?.length ? `<label class="chartbook-book-picker"><span class="sr-only">Saved ChartBook</span><select data-change="chartbook-book" aria-label="Saved ChartBook">${catalog.books.map(({ id, name }) => option(id, name, book?.id)).join('')}</select></label>` : ''}
       ${book ? action('Edit book', 'chartbook-edit', 'edit') : ''}${action('New book', 'chartbook-new', 'plus')}
     </div></header><div data-chartbook-view></div></section>`;
@@ -156,6 +164,10 @@ function reviewShell(catalog, book) {
 
 export async function render(env) {
   const { main, state, signal, params } = env;
+  if (params.mode === 'market') {
+    const { renderMarketReview } = await import('./market-review.js');
+    return renderMarketReview(env, (context) => reviewModes(env, 'market', context));
+  }
   const catalog = await env.api('chartbooks', { signal, plain: true });
   if (!env.isActive()) return;
   const book = (catalog.books || []).find(({ id }) => id === (params.book || state.bookId)) || catalog.books?.[0];
@@ -163,8 +175,6 @@ export async function render(env) {
   state.bookId = book?.id;
   if (!sameBook || !state.range) state.range = chartbookDefaultRange;
   state.layers ||= Object.fromEntries(chartbookLayers.map(([key]) => [key, true]));
-  state.noteDrafts ||= new Map();
-  state.notes ||= new Map();
   state.bookmarks ||= new Set();
   const layers = state.layers;
   const actions = {
@@ -173,7 +183,7 @@ export async function render(env) {
     'change:chartbook-book': (id) => env.go('chartbook', { book: id, symbol: null }),
   };
   env.setActions(actions);
-  main.innerHTML = reviewShell(catalog, book);
+  main.innerHTML = reviewShell(catalog, book, reviewModes(env, 'stocks'));
   const root = main.querySelector('[data-chartbook]');
   const view = root.querySelector('[data-chartbook-view]');
   if (!book) {
@@ -188,6 +198,7 @@ export async function render(env) {
   const rows = review.rows || [];
   const reviewContext = { ...env.snapshotContext, ...review.context, date: review.date, dataVersion: review.dataVersion };
   const context = Object.fromEntries(routeContextKeys.filter((key) => reviewContext[key] != null).map((key) => [key, reviewContext[key]]));
+  root.querySelector('.chartbook-mode-tabs').outerHTML = reviewModes(env, 'stocks', context);
   const sourceIssues = (review.sources || []).filter((source) => source.state !== 'ready' || source.unavailable?.length);
   const showSources = action(sourceIssues.length ? `Sources · ${count(sourceIssues.length)} need attention` : 'Sources', 'chartbook-sources', 'layers');
   Object.assign(actions, { 'chartbook-sources': () => sourceStatus(env, review), 'chartbook-retry': () => env.render() });
@@ -202,6 +213,7 @@ export async function render(env) {
   const wanted = params.symbol || (sameBook ? state.securityId : null);
   let index = Math.max(0, rows.findIndex((row) => row.securityId === wanted || row.symbol === wanted));
   let bundle = null;
+  let chartNotes = [];
   let requestId = 0;
   let dismissPoint = () => false;
   let preparingIndustry = false;
@@ -217,8 +229,8 @@ export async function render(env) {
   }
   const active = () => env.isActive() && root.isConnected;
   const current = () => rows[index];
-  const viewNote = () => state.notes.get(storeKey(current().securityId, context.date)) || bundle?.note;
-  const closeTooltip = () => { dismissPoint(); dismissPoint = () => false; };
+  const viewNote = () => chartNotes.find(({ date }) => date === context.date) || bundle?.note;
+  const closeTooltip = () => { dismissPoint(); dismissPoint.cleanup?.(); dismissPoint = () => false; };
   const compareUniverse = env.config.universes?.find(({ id }) => id === context.universe)?.name || context.universe;
   view.innerHTML = `<div class="chartbook-review">
     <div class="chartbook-current" data-chartbook-current aria-live="polite"></div>
@@ -267,7 +279,7 @@ export async function render(env) {
     }
     const preparation = bundle.chartPreparation;
     const data = buildChartbookPlot(bundle, state.range, layers);
-    const chart = renderChartbookChart(data, layers, row.symbol);
+    const chart = renderChartbookChart(data, layers, row.symbol, chartNotes);
     if (!chart.html) {
       const ready = !preparation || preparation.state === 'ready';
       chartTarget.innerHTML = empty(ready ? 'No usable price bars' : 'Price chart awaiting preparation',
@@ -275,7 +287,7 @@ export async function render(env) {
         'chart', action('Try again', 'chartbook-retry-price', 'refresh'));
     } else {
       chartTarget.innerHTML = chart.html;
-      dismissPoint = bindChartbookChart(chartTarget, chart);
+      dismissPoint = bindChartbookChart(chartTarget, chart, { onNoteEdit: editNote, signal });
     }
     const priority = layers.industry && bundle.industry?.state === 'pending' ? action('Check status', 'chartbook-retry-price', 'refresh')
       : layers.industry && bundle.industry?.canPrepare ? action('Prepare industry proxy', 'chartbook-prepare-industry', 'refresh', { disabled: preparingIndustry }) : '';
@@ -342,6 +354,15 @@ export async function render(env) {
       paintSecurity();
       paintPlot();
       if (!bundle.chartPreparation?.state || bundle.chartPreparation.state === 'ready') prefetch();
+      try {
+        const notes = await stockNotes(row, range, result);
+        if (!active() || run !== requestId) return;
+        chartNotes = notes;
+        paintSecurity();
+        if (chartNotes.length) paintPlot();
+      } catch (error) {
+        if (active() && run === requestId && error.name !== 'AbortError') env.toast('Chart notes unavailable');
+      }
     } catch (error) {
       if (active() && run === requestId && error.name !== 'AbortError') {
         chartTarget.innerHTML = notice('Price chart unavailable', error.message, action('Retry', 'chartbook-retry-price', 'refresh'), true);
@@ -357,6 +378,7 @@ export async function render(env) {
     if (next < 0 || next >= rows.length) return;
     index = next;
     bundle = null;
+    chartNotes = [];
     state.securityId = current().securityId;
     env.replaceParams?.({ book: book.id, symbol: state.securityId });
     return loadCurrent();
@@ -388,48 +410,26 @@ export async function render(env) {
     }
   }
 
-  async function editNote() {
+  function stockNotes(row, range, data) {
+    const from = data?.chartBars?.slice(-range)[0]?.date ?? context.date;
+    return loadResearchNotes(env, noteSubject('stock', row.securityId, context), { from, to: context.date, signal });
+  }
+
+  function editNote(existing) {
     const row = current();
-    const key = storeKey(row.securityId, context.date);
-    const path = `chartbooks/notes/${pathPart(row.securityId)}`;
-    const shown = viewNote();
-    const body = env.showDialog(env.modal, `${row.symbol} note`, `<form class="stack chartbook-editor">
-      ${field('Note', `<textarea name="note" rows="8" maxlength="20000" autofocus>${safe(state.noteDrafts.get(key) ?? shown?.markdown ?? '')}</textarea>`)}
-      <p class="form-error" role="alert" hidden></p><div class="actions"><button type="submit" class="button primary">${icon('check')} Save note</button>
-      <button type="button" class="button" data-action="close-dialog">Cancel</button></div></form>`, dateLabel(context.date));
-    const input = body.querySelector('[name="note"]');
-    const submit = body.querySelector('[type="submit"]');
-    input.oninput = () => state.noteDrafts.set(key, input.value);
-    body.onsubmit = async (event) => {
-      event.preventDefault();
-      submit.disabled = true;
-      try {
-        const note = await env.api(path, { method: 'PUT', signal, params: context, body: { markdown: input.value } });
-        state.notes.set(key, note);
-        state.noteDrafts.delete(key);
-        if (!active()) return;
-        if (body.isConnected && env.modal.open) env.modal.close();
-        paintSecurity();
-        env.toast(`Saved ${row.symbol} note`);
-      } catch (error) {
-        if (error.name !== 'AbortError') showFormError(body, error);
-      } finally {
-        submit.disabled = false;
-      }
-    };
-    if (shown == null && !state.noteDrafts.has(key)) {
-      submit.disabled = true;
-      try {
-        const note = await env.api(path, { signal, params: context });
-        if (!body.isConnected || !env.modal.open) return;
-        if (note) state.notes.set(key, note);
-        if (!state.noteDrafts.has(key)) input.value = note?.markdown || '';
-      } catch (error) {
-        if (error.name !== 'AbortError' && error.status !== 404) showFormError(body, error);
-      } finally {
-        submit.disabled = false;
-      }
-    }
+    const note = existing?.date ? existing : viewNote();
+    openResearchNoteEditor(env, { subject: noteSubject('stock', row.securityId, context), date: note?.date || context.date,
+      note, onSave: async () => {
+        try {
+          const notes = await stockNotes(row, state.range, bundle);
+          if (!active() || current().securityId !== row.securityId) return;
+          chartNotes = notes;
+          paintSecurity();
+          paintPlot();
+        } catch (error) {
+          if (active() && error.name !== 'AbortError') env.toast('The note was saved. Chart markers could not be refreshed.');
+        }
+      } });
   }
 
   function refreshPrice() {
@@ -501,6 +501,7 @@ export async function render(env) {
     owner.removeEventListener('keydown', handleKey);
     owner.removeEventListener('warehouse:jobs', followIndustry);
     for (const key of cache.keys()) evict(key);
+    closeTooltip();
   }, { once: true });
   state.securityId = current().securityId;
   env.replaceParams?.({ book: book.id, symbol: state.securityId });

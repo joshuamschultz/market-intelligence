@@ -1,6 +1,7 @@
-import { chart, exportChart } from './charts.js';
+import { chart, disposeChartNoteBindings, exportChart } from './charts.js';
 import { rangeLimit, rangeSegment } from './chart-ranges.js';
 import { stockQualityPanel } from './data-quality.js';
+import { mountResearchNoteHistory, noteSubject, openResearchNoteEditor } from './research-notes.js';
 import { renderStockMovingAverages, renderStockVolumeWindows, stockMetricValue, stockSectionTabs, stockSections, stockVolumePeriods } from './stock-sections.js';
 import { describePricePoint, plottableBar, stockScreenMatches, toWeekly } from './stocks.js';
 import {
@@ -156,7 +157,7 @@ function productNotice(product, subject) {
   return notice(`${subject} unavailable`, reason, action('Prepare price and risk', 'prepare-ticker-detail', 'refresh'), !!product.error);
 }
 
-function chartPanel(row, bars, range, cadence) {
+function chartPanel(row, bars, range, cadence, noteOptions = {}) {
   const product = row.detailPreparation?.chart;
   const controls = rangeSegment('stock-range-local', range) + segment('stock-cadence-local', cadences, cadence);
   if (product && product.state !== 'ready') return panelHead('Price and volume', '', controls) + productNotice(product, 'Price history');
@@ -165,12 +166,18 @@ function chartPanel(row, bars, range, cadence) {
       'The selected point-in-time revision has no usable prices in this window.');
   }
   const visible = bars.slice(-range);
-  const plot = cadence === 'weekly' ? toWeekly(visible) : visible;
+  let nextSession = 0;
+  const plot = cadence === 'weekly' ? toWeekly(visible).map((week) => {
+    const noteDates = [];
+    while (visible[nextSession]?.date <= week.date) noteDates.push(visible[nextSession++].date);
+    return { ...week, noteDates };
+  }) : visible;
   const tools = controls + (visible.some((bar) => numeric(bar.close)) ? iconButton('Export plotted prices CSV', 'stock-export-local', 'download') : '');
   return panelHead('Price and volume', `${count(visible.length)} market sessions through ${dateLabel(row.date)} · Split-adjusted prices`, tools) +
     chart(plot, [{ key: 'close', label: 'Close', format: money }], {
       label: `${row.symbol} ${cadence} candlestick chart`, candles: true, volume: true, width: 900, height: 305,
       exportFields: ['open', 'high', 'low', 'close', 'volume'], describePoint: describePricePoint,
+      ...noteOptions,
     });
 }
 
@@ -194,8 +201,12 @@ export async function render(env) {
   let rankingRange = 252;
   let priceRun = 0;
   let selectedSection = 'session';
+  let notesCleanup;
 
   function display(data) {
+    notesCleanup?.();
+    notesCleanup = null;
+    disposeChartNoteBindings(main);
     const info = data.materialization;
     if (data.pendingOnly || !data.symbol) {
       main.innerHTML = heading(data.symbol || symbol, contextDate || dateLabel(data.date)) +
@@ -225,6 +236,9 @@ export async function render(env) {
     const obvChanges = stockVolumePeriods.filter((period) => period === 20 || numeric(row[`obv_slope_${period}d`]))
       .map((period) => `obv_slope_${period}d`);
     const plotRow = { ...row, date };
+    const subject = row.securityId && noteSubject('stock', row.securityId, current);
+    const noteOptions = { notes: [], noteSignal: signal,
+      onNoteEdit: (note) => openResearchNoteEditor(env, { subject, date: note.date, note }) };
     const section = (scope, content) => `<div data-stock-section="${scope}"${sectionVisible(selectedSection, scope) ? '' : ' hidden'}>${content}</div>`;
 
     main.innerHTML = `<div id="ticker-dashboard">
@@ -242,6 +256,7 @@ export async function render(env) {
           'dailyMove', 'gap', 'intraday_return', 'volume', 'dollar_volume', 'rvol_20d', 'new_high_20d', 'highVolumeMove',
         ], row))}`)}
         ${section('session price', `<section class="panel panel-body" id="stock-price-panel">${chartPanel(plotRow, bars, range, cadence)}</section>`)}
+        ${subject ? '<section class="panel panel-body" id="stock-research-notes"></section>' : ''}
         ${section('price', renderStockMovingAverages(row))}
         ${section('price', metricPanel('Trend and participation signals', metrics([
           'ma_aligned', 'ma_50_above_200', 'ma_rising_50', 'ma_rising_200', 'traded', 'nearHigh', 'topDecile',
@@ -282,6 +297,30 @@ export async function render(env) {
 
     const price = main.querySelector('#stock-price-panel');
     const security = `stocks/${pathPart(row.securityId || symbol)}`;
+    function replacePrice(markup) {
+      disposeChartNoteBindings(price);
+      price.innerHTML = markup;
+    }
+    function paintPrice() {
+      replacePrice(chartPanel(plotRow, bars, range, cadence, noteOptions));
+    }
+    if (subject) notesCleanup = mountResearchNoteHistory(main.querySelector('#stock-research-notes'), env, subject, {
+      from: [row.listingDate, row.earliestDate].filter(Boolean).sort().at(-1),
+      to: [row.delistingDate, date].filter(Boolean).sort()[0],
+      onChange(notes) {
+        const hadNotes = noteOptions.notes.length;
+        noteOptions.notes = notes;
+        if ((!hadNotes && !notes.length) || !active() || !price.querySelector('[data-chart]')) return;
+        const focused = price.ownerDocument.activeElement;
+        const controls = [...price.querySelectorAll('button[data-action]')];
+        const index = controls.indexOf(focused);
+        const marker = focused?.dataset?.researchNoteMarker;
+        paintPrice();
+        if (index !== -1) price.querySelectorAll('button[data-action]')[index]?.focus();
+        if (marker) [...price.querySelectorAll('[data-research-note-marker]')]
+          .find((node) => node.dataset.researchNoteMarker === marker)?.focus();
+      },
+    });
     async function followProduct(job) {
       const run = priceRun;
       const productsInFlight = row.detailPreparation;
@@ -290,12 +329,17 @@ export async function render(env) {
       if (!status) return;
       try {
         const result = await env.publishedSeries(path, { ...options, initialResponse: { ...data, materialization: job } }, (_, progress) => {
-          if (active() && status.isConnected && run === priceRun) status.innerHTML = warming(progress, subject);
+          if (active() && status.isConnected && run === priceRun) {
+            if (status === price) replacePrice(warming(progress, subject));
+            else status.innerHTML = warming(progress, subject);
+          }
         });
         if (active() && status.isConnected && run === priceRun) display(result);
       } catch (error) {
         if (active() && status.isConnected && run === priceRun && error.name !== 'AbortError') {
-          status.innerHTML = notice(`${subject} unavailable`, error.message, action('Prepare price and risk', 'prepare-ticker-detail', 'refresh'), true);
+          const markup = notice(`${subject} unavailable`, error.message, action('Prepare price and risk', 'prepare-ticker-detail', 'refresh'), true);
+          if (status === price) replacePrice(markup);
+          else status.innerHTML = markup;
         }
       }
     }
@@ -306,7 +350,7 @@ export async function render(env) {
         if (range > options.params.lookback) {
           const requested = range;
           const controls = rangeSegment('stock-range-local', range) + segment('stock-cadence-local', cadences, cadence);
-          price.innerHTML = panelHead('Price and volume', '', controls) + pending('Loading prices for this range…');
+          replacePrice(panelHead('Price and volume', '', controls) + pending('Loading prices for this range…'));
           try {
             const result = await env.api(security, { params: { ...current, lookback: requested }, signal });
             if (!active() || !price.isConnected || run !== priceRun) return;
@@ -320,14 +364,14 @@ export async function render(env) {
             for (const tab of opened) main.querySelector(`[data-action="stock-tab-local"][data-value="${tab}"]`).closest('details').open = true;
           } catch (error) {
             if (!active() || !price.isConnected || run !== priceRun || error.name === 'AbortError') return;
-            price.innerHTML = panelHead('Price and volume', '', controls) + notice('Price window unavailable', error.message, '', true);
+            replacePrice(panelHead('Price and volume', '', controls) + notice('Price window unavailable', error.message, '', true));
           }
           main.querySelector(`#stock-price-panel [data-action="${key}"][aria-pressed="true"]`)?.focus();
           return;
         }
       }
       else cadence = value;
-      price.innerHTML = chartPanel(plotRow, bars, range, cadence);
+      paintPrice();
       price.querySelector(`[data-action="${key}"][aria-pressed="true"]`)?.focus();
     }
     env.setActions({

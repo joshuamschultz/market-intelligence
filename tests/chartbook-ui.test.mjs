@@ -57,6 +57,42 @@ test('ChartBook shortcuts ignore repeat, editors, open dialogs, and operating sy
   window.close();
 });
 
+test('ChartBook stock notes appear only on plotted sessions and yield to the note tooltip and cleanup', (t) => {
+  const data = buildChartbookPlot({ chartBars: bars, date: dateAt(57) }, 7, layers);
+  const note = { id: 'dated-note', date: dateAt(53), markdown: 'Watch <em>volume</em>', version: 1,
+    createdAt: '2026-02-27T22:00:00.000Z', updatedAt: '2026-02-27T22:00:00.000Z' };
+  const chart = renderChartbookChart(data, layers, 'TEST', [note, { ...note, date: dateAt(6) }, { ...note, date: dateAt(58) }]);
+  const { window } = new JSDOM(chart.html);
+  t.after(() => window.close());
+  const { document } = window;
+  const marker = document.querySelector('[data-research-note-marker]');
+  assert.equal(document.querySelectorAll('[data-research-note-marker]').length, 1);
+  assert.equal(marker.dataset.researchNoteMarker, note.date);
+  assert.equal(marker.getAttribute('transform'), `translate(${chart.x(data.rows.findIndex((row) => row.date === note.date))} 21)`);
+  const controller = new AbortController();
+  const edits = [];
+  const hide = bindChartbookChart(document.body, chart, { onNoteEdit: (item) => edits.push(item), signal: controller.signal });
+  const svg = document.querySelector('svg');
+  const key = (node, key) => node.dispatchEvent(new window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+  key(svg, 'End');
+  assert.equal(document.querySelector('[data-chartbook-point]').hidden, false);
+  marker.dispatchEvent(new window.MouseEvent('pointerover', { bubbles: true }));
+  assert.equal(document.querySelector('[data-chartbook-point]').hidden, true);
+  const tooltip = () => document.querySelector('.research-note-tooltip');
+  assert.equal(tooltip().querySelector('.research-note-copy').textContent, note.markdown);
+  assert.equal(tooltip().querySelector('em'), null);
+  assert.equal(key(marker, 'Enter'), false);
+  assert.deepEqual(edits, [note]);
+  assert.equal(tooltip(), null);
+  marker.dispatchEvent(new window.MouseEvent('pointerover', { bubbles: true }));
+  controller.abort();
+  assert.equal(tooltip(), null);
+  assert.equal(key(svg, 'End'), true);
+  assert.equal(key(marker, 'Enter'), true);
+  assert.deepEqual(edits, [note]);
+  assert.equal(hide(), false);
+});
+
 test('ChartBook reuses read-ahead, ignores a late ticker response, and aborts work on exit', async () => {
   const { window } = new JSDOM('<main></main><dialog></dialog><dialog></dialog>');
   const controller = new AbortController();
@@ -69,6 +105,7 @@ test('ChartBook reuses read-ahead, ignores a late ticker response, and aborts wo
     isActive: () => !controller.signal.aborted, setActions() {}, routeUrl: () => '#chartbook',
     async api(path, options) {
       if (path === 'chartbooks') return { books: [{ id: 'book', name: 'Test book', definition: {} }] };
+      if (path === 'research-notes') return { notes: [] };
       if (path.endsWith('/review')) return { date: card.date, dataVersion: 7, rows, total: rows.length };
       const id = path.split('/').at(-1);
       calls.push({ id, signal: options.signal });
@@ -122,6 +159,7 @@ test('ChartBook editor retains sort settings and keeps the selected ticker when 
     go(_route, params) { this.params = { ...this.params, ...params }; },
     async api(path, options) {
       if (path === 'chartbooks') return { books: [book] };
+      if (path === 'research-notes') return { notes: [] };
       if (path === 'chartbooks/book' && options.method === 'PUT') {
         book = { ...book, ...options.body };
         return book;

@@ -1,5 +1,6 @@
+import { fork } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, createReadStream, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
+import { closeSync, createReadStream, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync,
   renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -12,10 +13,12 @@ import { CALCULATION_VERSION, dataVersion, isoDate, listWorkspace, marketDay } f
 import { createEngine } from '../backend/engine.mjs';
 import { preparationShardFormat, preparationSourcePin } from '../backend/pipeline-shards.mjs';
 import { preparationHistoryWarmup, preparationWorkspaceScopes } from '../backend/service.mjs';
-import { benchmarkContexts, benchmarkRecipeDigest, dateTiles, hasTable, verifyBoundaryWindow, verifyCalibrationProducts,
-  verifyCoreTile, verifyInstrumentProducts } from './pipeline-verification.mjs';
+import { benchmarkContexts, benchmarkRecipeDigest, dateTiles, expectedBoundaryCoverage, hasTable, verifyBoundaryWindow,
+  verifyCalibrationProducts, verifyCoreTile, verifyInstrumentProducts } from './pipeline-verification.mjs';
 
 const receiptFormat = 'market-preparation-recovery-1';
+const oracleTaskFormat = 'market-boundary-oracle-1';
+const oracleTileTimeoutMs = 60 * 60_000;
 const hash = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const isHash = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const modelKinds = ['universe', 'ranking-model', 'screen', 'theme', 'health-model', 'stock-detail-preparation', 'alert-rule'];
@@ -42,10 +45,10 @@ function assertClosedArchive(path) {
   return { device: String(file.dev), inode: String(file.ino), bytes: Number(file.size), modified: String(file.mtimeNs) };
 }
 
-async function archiveSeal(path) {
+async function archiveSeal(path, signal) {
   const before = assertClosedArchive(path);
   const digest = createHash('sha256');
-  for await (const bytes of createReadStream(path, { highWaterMark: 2 ** 20 })) digest.update(bytes);
+  for await (const bytes of createReadStream(path, { highWaterMark: 2 ** 20, signal })) digest.update(bytes);
   if (!same(before, assertClosedArchive(path))) throw new Error('Archive changed during checksum verification');
   return { bytes: before.bytes, sha256: digest.digest('hex'), identity: before };
 }
@@ -135,6 +138,54 @@ function verificationPlan(reader, source, sourcePath, { version, to, sessions, r
     corePin, warmPin, definitions, workspaceScopeHash, recipeDigest };
 }
 
+function verificationIdentity(plan, { seal, sourceFile, archiveFile, originalElapsedMs, tileSize }) {
+  return { archive: seal, sourceFile, archiveFile, corePin: plan.corePin, warmPin: plan.warmPin,
+    workspaceDefinitions: plan.definitions, workspaceScopeHash: plan.workspaceScopeHash, recipeDigest: plan.recipeDigest,
+    core: plan.core, warmup: plan.warmup, originalElapsedMs, tileSize };
+}
+
+function oraclePhases(plan) {
+  return [
+    { phase: 'core', frames: plan.core.dates, config: plan.recipes.configs, archiveDates: new Set([...plan.prerequisites, ...plan.dates]) },
+    { phase: 'breadth-warmup', frames: plan.warmup.dates, config: plan.warmConfigs, archiveDates: new Set(plan.prerequisites) },
+  ].filter(({ frames }) => frames.length);
+}
+
+export function verifyOracleWorkerTask(task) {
+  const { format, taskId, phase, dates, directory, referenceDate, identity } = task ?? {};
+  if (format !== oracleTaskFormat || !isHash(taskId) || !['core', 'breadth-warmup'].includes(phase) || !Array.isArray(dates) ||
+      !dates.length || dates.length > 8 || dates.some((date, index) => !isoDate(date) || index > 0 && dates[index - 1] >= date) ||
+      typeof directory !== 'string' || !isoDate(referenceDate) || !identity?.corePin || !identity?.core || !identity?.archive?.identity ||
+      !isHash(identity.archive.sha256) || taskId !== hash([identity, phase, dates, referenceDate])) {
+    throw new Error('Invalid boundary oracle task');
+  }
+  const { archive: seal, sourceFile, archiveFile, tileSize, originalElapsedMs } = identity;
+  if (!Number.isSafeInteger(tileSize) || tileSize < 1 || tileSize > 8 || !Number.isSafeInteger(originalElapsedMs) || originalElapsedMs < 1 ||
+      typeof sourceFile !== 'string' || typeof archiveFile !== 'string' || sourceFile === archiveFile ||
+      regularFile(sourceFile) !== sourceFile || regularFile(archiveFile) !== archiveFile ||
+      realpathSync(directory) !== directory || !lstatSync(directory).isDirectory()) throw new Error('Invalid boundary oracle task paths');
+  if (!same(seal.identity, assertClosedArchive(archiveFile))) throw new Error('Archive generation changed before boundary verification');
+  const reader = readonly(archiveFile, true);
+  let source;
+  try {
+    source = readonly(sourceFile);
+    source.exec('BEGIN');
+    const plan = verificationPlan(reader, source, sourceFile, { version: identity.corePin.dataVersion, referenceDate,
+      chunkSize: identity.core.width, minimumSessions: 1 });
+    if (!same(identity, verificationIdentity(plan, { seal, sourceFile, archiveFile, originalElapsedMs, tileSize }))) {
+      throw new Error('Pinned generation changed before boundary verification');
+    }
+    const scope = oraclePhases(plan).find((entry) => entry.phase === phase);
+    if (!scope || !dateTiles(scope.frames, tileSize).some((tile) => same(tile, dates))) throw new Error('Invalid pinned boundary oracle tile');
+    const result = verifyBoundaryWindow(reader, plan.engine, scope.config, dates, scope.archiveDates, { directory, tileSize });
+    if (!same(seal.identity, assertClosedArchive(archiveFile))) throw new Error('Archive generation changed during boundary verification');
+    return { format, taskId, phase, dates, result };
+  } finally {
+    source?.close();
+    reader.close();
+  }
+}
+
 function atomicJson(path, value) {
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
@@ -159,17 +210,18 @@ function receiptStore(directory, identity) {
       throw new Error('Existing receipts belong to a different archive or verification plan');
     }
   } else atomicJson(path, status);
-  return (name, work) => {
-    if (Object.hasOwn(status.completed, name)) {
-      const saved = status.completed[name];
-      if (!saved?.result || saved.digest !== hash([identity, name, saved.result])) throw new Error(`Recovery receipt is invalid for ${name}`);
-      return { result: saved.result, reused: true };
-    }
-    const result = work();
+  function reuse(name) {
+    if (!Object.hasOwn(status.completed, name)) return null;
+    const saved = status.completed[name];
+    if (!saved?.result || saved.digest !== hash([identity, name, saved.result])) throw new Error(`Recovery receipt is invalid for ${name}`);
+    return { result: saved.result, reused: true };
+  }
+  function commit(name, result) {
     status.completed[name] = { result, digest: hash([identity, name, result]) };
     atomicJson(path, status);
     return { result, reused: false };
-  };
+  }
+  return { reuse, commit, checkpoint: (name, work) => reuse(name) ?? commit(name, work()) };
 }
 
 function riskRunId(reader, plan) {
@@ -186,6 +238,102 @@ function riskRunId(reader, plan) {
 
 function addCounts(totals, result) {
   for (const [key, count] of Object.entries(result)) totals[key] = (totals[key] ?? 0) + count;
+}
+
+function runOracleWorker(task, signal) {
+  signal.throwIfAborted();
+  const child = fork(fileURLToPath(new URL('./pipeline-oracle-worker.mjs', import.meta.url)), {
+    env: { TZ: process.env.TZ }, execArgv: ['--max-old-space-size=4096'], stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+  });
+  const label = `${task.phase}:${task.dates[0]}:${task.dates.at(-1)}`;
+  return new Promise((resolve, reject) => {
+    let reply;
+    let failure;
+    let forceStop;
+    const stop = () => {
+      if (forceStop) return;
+      child.kill('SIGTERM');
+      forceStop = setTimeout(() => child.kill('SIGKILL'), 5000).unref();
+    };
+    const fail = (error) => {
+      failure ??= error;
+      stop();
+    };
+    const deadline = setTimeout(() => fail(new Error('Timed out')), oracleTileTimeoutMs).unref();
+    signal.addEventListener('abort', stop, { once: true });
+    child.on('message', (frame) => {
+      if (reply || frame?.format !== task.format || frame.taskId !== task.taskId || frame.phase !== task.phase || !same(frame.dates, task.dates)) {
+        fail(new Error('Invalid or duplicate worker reply'));
+        return;
+      }
+      reply = frame;
+    });
+    child.on('error', fail);
+    child.once('close', (code, killedBy) => {
+      clearTimeout(deadline);
+      clearTimeout(forceStop);
+      signal.removeEventListener('abort', stop);
+      if (signal.aborted) reject(signal.reason);
+      else if (failure || typeof reply?.error === 'string' || code !== 0 || !reply?.result) {
+        reject(new Error(`Boundary oracle worker ${label}: ${failure?.message || reply?.error || `exited with ${killedBy || `code ${code}`} without a valid result`}`));
+      } else resolve(reply.result);
+    });
+    try { child.send(task, (error) => { if (error) fail(error); }); }
+    catch (error) { fail(error); }
+    if (signal.aborted) stop();
+  });
+}
+
+async function verifyBoundaryOracle(reader, plan, identity, receipts, ledger, oracleWorkers, signal, onProgress) {
+  const phases = oraclePhases(plan).map((scope) => ({ ...scope, totals: {}, completed: 0 }));
+  const jobs = phases.flatMap((scope) => dateTiles(scope.frames, identity.tileSize).map((tile) => ({ scope, tile })));
+  const parallel = oracleWorkers > 1;
+  const directory = parallel ? mkdtempSync(join(receipts, '.boundary-oracle-workers-')) : receipts;
+  const controller = new AbortController();
+  const workerSignal = AbortSignal.any([controller.signal, signal]);
+  let next = 0;
+  const run = async () => {
+    try {
+      while (next < jobs.length) {
+        workerSignal.throwIfAborted();
+        const { scope, tile } = jobs[next++];
+        const { phase, config, archiveDates, totals } = scope;
+        const name = `oracle-${phase}:${tile[0]}:${tile.at(-1)}`;
+        const expected = expectedBoundaryCoverage(config, tile, archiveDates);
+        const saved = ledger.reuse(name);
+        let result = saved?.result;
+        if (!saved && parallel) {
+          const referenceDate = plan.observedReferenceDate;
+          const taskId = hash([identity, phase, tile, referenceDate]);
+          result = await runOracleWorker({ format: oracleTaskFormat, taskId, phase, dates: tile, referenceDate, identity, directory }, workerSignal);
+        } else if (!saved) {
+          result = verifyBoundaryWindow(reader, plan.engine, config, tile, archiveDates, { directory, tileSize: identity.tileSize });
+        }
+        workerSignal.throwIfAborted();
+        if (!same(result, expected)) throw new Error(`Independent boundary oracle coverage is invalid for ${name}`);
+        if (!saved) ledger.commit(name, result);
+        addCounts(totals, result);
+        scope.completed += tile.length;
+        onProgress({ phase: `oracle-${phase}`, completed: scope.completed, total: scope.frames.length, through: tile.at(-1), reused: !!saved });
+      }
+    } catch (error) {
+      controller.abort(error);
+      throw error;
+    }
+  };
+  try {
+    const settled = await Promise.allSettled(Array.from({ length: Math.min(oracleWorkers, jobs.length) }, run));
+    const failure = settled.find(({ status }) => status === 'rejected');
+    if (failure) throw workerSignal.reason ?? failure.reason;
+    return phases.map(({ phase, frames, totals }) => {
+      if (totals.sessions !== frames.length || !(totals.leaderContexts > 0) || phase === 'core' && !(totals.velocitySnapshots > 0)) {
+        throw new Error(`Independent ${phase} boundary oracle did not cover its required frames`);
+      }
+      return { phase, ...totals };
+    });
+  } finally {
+    if (parallel) rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 function acceptance(plan, core, instruments, calibration) {
@@ -205,10 +353,13 @@ function acceptance(plan, core, instruments, calibration) {
 }
 
 export async function verifyExistingPipeline({ sourcePath, archivePath, reportPath, receiptsDirectory, originalElapsedMs, version, to,
-  sessions, referenceDate, archiveSha256, chunkSize, tileSize = 8, minimumSessions = 1260, onProgress = () => {} } = {}) {
+  sessions, referenceDate, archiveSha256, chunkSize, tileSize = 8, minimumSessions = 1260, oracleWorkers = 1,
+  signal = new AbortController().signal, onProgress = () => {} } = {}) {
   if (!sourcePath || !archivePath || !reportPath || !receiptsDirectory) throw new Error('Provide --source, --archive, --report and --receipts');
   if (!Number.isSafeInteger(originalElapsedMs) || originalElapsedMs < 1) throw new Error('Provide the recorded --original-elapsed-ms');
-  numberOption(tileSize, 1, 8, 'verification tile size');
+  tileSize = numberOption(tileSize, 1, 8, 'verification tile size');
+  oracleWorkers = numberOption(oracleWorkers, 1, 8, 'oracle workers');
+  signal.throwIfAborted();
   const started = performance.now();
   const sourceFile = regularFile(sourcePath), archiveFile = regularFile(archivePath);
   if (sourceFile === archiveFile) throw new Error('Source and archive must be separate files');
@@ -228,16 +379,16 @@ export async function verifyExistingPipeline({ sourcePath, archivePath, reportPa
     const planArgs = { version, to, sessions, referenceDate, chunkSize, minimumSessions };
     const plan = verificationPlan(reader, source, sourceFile, planArgs);
     onProgress({ phase: 'seal-start' });
-    const seal = await archiveSeal(archiveFile);
+    const seal = await archiveSeal(archiveFile, signal);
     if (archiveSha256 && (!isHash(archiveSha256) || archiveSha256 !== seal.sha256)) throw new Error('Archive SHA-256 does not match the supplied seal');
-    const identity = { archive: seal, sourceFile, archiveFile, corePin: plan.corePin, warmPin: plan.warmPin,
-      workspaceDefinitions: plan.definitions, workspaceScopeHash: plan.workspaceScopeHash, recipeDigest: plan.recipeDigest,
-      core: plan.core, warmup: plan.warmup, originalElapsedMs, tileSize };
-    const checkpoint = receiptStore(receipts, identity);
+    const identity = verificationIdentity(plan, { seal, sourceFile, archiveFile, originalElapsedMs, tileSize });
+    const ledger = receiptStore(receipts, identity);
+    const { checkpoint } = ledger;
     const core = {}, warmup = {};
     function observed(phase, surveyDates, work, totals) {
       let completed = 0;
       for (const tile of dateTiles(surveyDates, tileSize)) {
+        signal.throwIfAborted();
         const receipt = checkpoint(`${phase}:${tile[0]}:${tile.at(-1)}`, () => work(tile));
         addCounts(totals, receipt.result);
         completed += tile.length;
@@ -247,29 +398,17 @@ export async function verifyExistingPipeline({ sourcePath, archivePath, reportPa
     observed('core-products', plan.dates, (tile) => verifyCoreTile(reader, plan.engine, plan.recipes.configs, tile,
       { sampleDates: [plan.dates[0], plan.dates.at(-1)] }), core);
     observed('warmup-breadth', plan.prerequisites, (tile) => verifyCoreTile(reader, plan.engine, plan.warmConfigs, tile), warmup);
+    signal.throwIfAborted();
     const instruments = checkpoint('instruments', () => verifyInstrumentProducts(reader, source, plan.engine, plan.point, plan.dates,
       plan.recipes, { risk: { runId: riskRunId(reader, plan) }, riskFrom: plan.dates[0] })).result;
     onProgress({ phase: 'instruments-complete', securities: instruments.detailProducts });
+    signal.throwIfAborted();
     const calibration = checkpoint('calibration', () => verifyCalibrationProducts(reader, source, plan.engine, plan.point,
       plan.recipes.configs, plan.dates, warmup.history ?? 0)).result;
     onProgress({ phase: 'calibration-complete', healthRows: calibration.health.physicalRows });
-    const archiveDates = new Set([...plan.prerequisites, ...plan.dates]);
-    const boundaryOracle = [];
-    for (const [phase, frames, config, archiveSpan] of [
-      ['core', plan.core.dates, plan.recipes.configs, archiveDates],
-      ['breadth-warmup', plan.warmup.dates, plan.warmConfigs, new Set(plan.prerequisites)],
-    ]) {
-      if (!frames.length) continue;
-      const totals = {};
-      observed(`oracle-${phase}`, frames, (tile) => verifyBoundaryWindow(reader, plan.engine, config, tile, archiveSpan,
-        { directory: receipts, tileSize }), totals);
-      if (totals.sessions !== frames.length || !(totals.leaderContexts > 0) || phase === 'core' && !(totals.velocitySnapshots > 0)) {
-        throw new Error(`Independent ${phase} boundary oracle did not cover its required frames`);
-      }
-      boundaryOracle.push({ phase, ...totals });
-    }
+    const boundaryOracle = await verifyBoundaryOracle(reader, plan, identity, receipts, ledger, oracleWorkers, signal, onProgress);
     onProgress({ phase: 'seal-end' });
-    const final = await archiveSeal(archiveFile);
+    const final = await archiveSeal(archiveFile, signal);
     if (!same(final, seal)) throw new Error('Archive seal changed during recovery');
     const ending = verificationPlan(reader, source, sourceFile, { ...planArgs, referenceDate: plan.observedReferenceDate });
     if (!same(ending.corePin, plan.corePin) || !same(ending.warmPin, plan.warmPin) || ending.workspaceScopeHash !== plan.workspaceScopeHash ||
@@ -282,6 +421,7 @@ export async function verifyExistingPipeline({ sourcePath, archivePath, reportPa
       performance: { measuredColdElapsedMs: originalElapsedMs, targetMs: 600_000, targetMet: originalElapsedMs <= 600_000,
         originalPhaseTimings: null, originalOutcome: 'interrupted-verification', verificationElapsedMs: Math.round(performance.now() - started) },
     };
+    signal.throwIfAborted();
     atomicJson(report, result);
     return result;
   } finally {
@@ -291,26 +431,37 @@ export async function verifyExistingPipeline({ sourcePath, archivePath, reportPa
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  const controller = new AbortController();
+  const interrupt = (name) => controller.abort(new Error(`Interrupted by ${name}.`));
   try {
     const { values } = parseArgs({ options: {
       source: { type: 'string' }, archive: { type: 'string' }, report: { type: 'string' }, receipts: { type: 'string' },
       'original-elapsed-ms': { type: 'string' }, version: { type: 'string' }, to: { type: 'string' }, sessions: { type: 'string' },
       'reference-date': { type: 'string' }, 'archive-sha256': { type: 'string' }, 'chunk-size': { type: 'string' }, 'tile-size': { type: 'string' },
+      'oracle-workers': { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     } });
-    if (values.help) console.log('Usage: node scripts/verify-existing-pipeline.mjs --source FILE --archive FILE --report NEW_FILE --receipts DIRECTORY --original-elapsed-ms MS [--version N --to YYYY-MM-DD --sessions N --reference-date YYYY-MM-DD --chunk-size N --tile-size N --archive-sha256 HEX]');
+    if (values.help) console.log('Usage: node scripts/verify-existing-pipeline.mjs --source FILE --archive FILE --report NEW_FILE --receipts DIRECTORY --original-elapsed-ms MS [--version N --to YYYY-MM-DD --sessions N --reference-date YYYY-MM-DD --chunk-size N --tile-size N --archive-sha256 HEX --oracle-workers 1..8]');
     else {
       const optional = (key, minimum, maximum) => values[key] == null ? undefined : numberOption(values[key], minimum, maximum, key);
+      const oracleWorkers = optional('oracle-workers', 1, 8);
+      if (oracleWorkers > 1) {
+        process.on('SIGTERM', interrupt);
+        process.on('SIGINT', interrupt);
+      }
       const result = await verifyExistingPipeline({ sourcePath: values.source, archivePath: values.archive,
         reportPath: values.report, receiptsDirectory: values.receipts, originalElapsedMs: Number(values['original-elapsed-ms']),
         version: optional('version', 1, Number.MAX_SAFE_INTEGER), to: values.to, sessions: optional('sessions', 1260, 7560),
         referenceDate: values['reference-date'], archiveSha256: values['archive-sha256'], chunkSize: optional('chunk-size', 1, 120),
-        tileSize: optional('tile-size', 1, 8), onProgress: (event) => console.error(JSON.stringify(event)) });
+        tileSize: optional('tile-size', 1, 8), oracleWorkers, signal: controller.signal, onProgress: (event) => console.error(JSON.stringify(event)) });
       console.log(JSON.stringify({ state: result.state, dataVersion: result.dataVersion, calculationVersion: result.calculationVersion,
         archive: result.archive, report: resolve(values.report), performance: result.performance }));
     }
   } catch (error) {
     console.error(error.message);
-    process.exitCode = 1;
+    process.exitCode = controller.signal.aborted ? 130 : 1;
+  } finally {
+    process.removeListener('SIGTERM', interrupt);
+    process.removeListener('SIGINT', interrupt);
   }
 }

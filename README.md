@@ -6,7 +6,7 @@ A local, data-versioned research workspace for U.S. stock leadership, relative s
 
 ## Current status
 
-Immutable R12 / app 0.2.2 is live with calculation `2-be44dec1f429`; check `/api/v1/build` and `data/active-release.json` for the active build. Bounded verification of the previously saved five-year `2-081` output is in progress; it remains unpublished, and the ten-minute target is not met. See [Remaining work](docs/REMAINING-WORK.md) and [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md) for current readiness and validation status.
+Immutable R14 / app 0.2.4 is live with warm calculation `2-be44dec1f429`; check `/api/v1/build` and `data/active-release.json` for the active build. The saved five-year `2-081` computation is being checked by bounded parallel verification; it remains unpublished, and the ten-minute target has not been met. See [Remaining work](docs/REMAINING-WORK.md) and [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md) for current readiness and validation status.
 
 ## From market context to a saved review
 
@@ -15,7 +15,7 @@ Immutable R12 / app 0.2.2 is live with calculation `2-be44dec1f429`; check `/api
 1. **Read participation.** Market Overview compares index context with breadth counts, percentages, leadership, and market-health components. Market Monitor provides fixed and custom move thresholds with date-specific constituent drilldowns.
 2. **Find leaders and changing groups.** Independent return leader lists answer which securities led a period. Model-based RS rankings answer which names rank strongly under the selected model. Industry and theme views compare participation, relative performance, and leadership using the classification and date shown.
 3. **Screen and inspect.** Use nested filters, supported expressions, high/low and volume measures, and history-aware fields. Ticker detail shows available prices, moving averages, volume, relative strength, source status, and null reasons.
-4. **Keep a dated review.** Save reusable rules in Saved Screens, carry selections into watchlists or ChartBook, and attach a private dated note in Market Journal. Historical replay pins the requested date and data revision where available.
+4. **Keep a dated review.** Save reusable rules in Saved Screens, carry selections into watchlists or ChartBook, and attach a dated research note to a security or Market & Industries chart. Notes show creation/update times; weekly chart markers group dates while retaining each session's note. Historical replay pins the requested date and data revision where available.
 
 ![ChartBook saved-list chart review](docs/assets/chartbook.png)
 
@@ -32,6 +32,7 @@ The [research workflow diagram](docs/assets/research-workflow.jpg) and [data-flo
 - **Screener and ticker detail:** nested conditions, multi-sort, computed columns, saved definitions, context-aware high/low filters, price/volume analytics, risk measures, and source-quality details. Missing float and unsupported history remain blank or withheld.
 - **Industry, themes, and historical research:** group comparisons, rotation, breadth, replay, cohorts, event studies, analogs, transitions, and forward-return distributions with sample and availability context.
 - **ChartBook and Market Journal:** combine saved lists into a deduplicated chart review; preserve notes by security and date; optionally use a configured Claude key for Journal generation. When the user requests generation, selected market context is sent to Anthropic; private notes are included only after a separate opt-in. No live Claude generation has been verified here because no key has been supplied.
+- **Market & Industries review:** from ChartBook, compare daily breadth cards and selected industry groups over the default six-month range. Use Space / Shift+Space to move between cards when the chart/content area has focus, V for a longer range, M for three months, and N to open a note. Escape closes the note editor without saving. The Daily 4% Movers card and 5/10-session participation ratios use different summaries; notes remain attached to their dated session.
 - **Local operations:** resumable background jobs, data-quality and readiness views, source-correction provenance, SQLite backups, and optional CSV/Parquet exports.
 
 Calculations use a shared engine and pinned data, context, and calculation versions. Changing the universe, model, benchmark, classification, date, or price basis may change the eligible population or result. Check readiness for the exact requested context before interpreting a chart or list.
@@ -75,7 +76,7 @@ npm run check
 npm test
 ```
 
-A clean checkout passed `npm ci`, `npm run check`, and an isolated empty-warehouse startup smoke test. The earlier source snapshot passed 300/300 tests; the current source-index snapshot passed 316/316 and `npm run check`. All-screen native review and full five-year performance acceptance remain pending. Use the active release manifest and validation log for current build results. Cached page timings do not establish cold-history calculation performance.
+The R14 source-index suite passed 342/342, and 10 assembled UI checks passed; the prior R13 protocol suite (50 checks) and Astra's independent 35 focused checks also passed. Production archive verification, all-screen native review, and full five-year performance acceptance remain pending. Use the active release manifest for current build results. Cached page timings do not establish cold-history calculation performance.
 
 The project uses a Node/browser modular monolith with durable SQLite WAL storage. The `data/` directory contains local databases, raw captures, logs, backups, and derived outputs; it is ignored by Git and should be treated as private workspace state. The browser UI and source warehouse are local, but an explicitly requested Claude generation sends the selected market context to Anthropic. Follow [Operations](docs/OPERATIONS.md) before importing, restoring, or archiving data.
 

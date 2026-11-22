@@ -395,12 +395,33 @@ function previousTopDecile(reader, engine, config, dates, exact) {
   }));
 }
 
+const precedingSessions = (dates) => new Map(dates.map((date) => [date, expectedSessions(shiftDate(date, -12), shiftDate(date, -1)).at(-1)]));
+const boundaryCounts = (dates) => ({ sessions: dates.length, velocitySnapshots: 0, leaderContexts: 0, priorLeaderRosters: 0 });
+
+export function expectedBoundaryCoverage(configurations, sampled, archiveDates) {
+  const previous = precedingSessions(sampled);
+  const counts = boundaryCounts(sampled);
+  for (const date of sampled) {
+    const prior = previous.get(date);
+    let covered = false;
+    for (const { config, rank = true, historyOnly } of configurations) {
+      if (date < config.earliestDate || date > config.date) continue;
+      covered = true;
+      counts.leaderContexts++;
+      if (rank && !historyOnly) counts.velocitySnapshots++;
+      if (archiveDates.has(prior) && prior >= config.earliestDate) counts.priorLeaderRosters++;
+    }
+    if (!covered) throw new Error(`Independent boundary oracle has no eligible context on ${date}`);
+  }
+  return counts;
+}
+
 export function verifyBoundaryWindow(reader, engine, configurations, sampled, archiveDates, { directory, tileSize = 8, codec, exact = true } = {}) {
-  const previous = new Map(sampled.map((date) => [date, expectedSessions(shiftDate(date, -12), shiftDate(date, -1)).at(-1)]));
+  const previous = precedingSessions(sampled);
   const priorDates = [...new Set([...previous.values()].filter((date) => archiveDates.has(date)))].sort();
   const priorOnly = priorDates.filter((date) => !sampled.includes(date));
   const working = mkdtempSync(join(directory, '.boundary-oracle-'));
-  const verified = { sessions: sampled.length, velocitySnapshots: 0, leaderContexts: 0, priorLeaderRosters: 0 };
+  const verified = boundaryCounts(sampled);
   let spool;
   try {
     spool = openDatabase(join(working, 'oracle.sqlite'));

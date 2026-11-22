@@ -1,7 +1,9 @@
 import { csvDownload, dateLabel, empty, number, numeric, safe } from './ui.js';
+import { bindResearchNoteMarkers, loadResearchNoteStyles, renderResearchNoteMarkers } from './research-notes.js';
 
 export const chartColors = ['#58e2c3', '#bae489', '#84a9fa', '#f4c681', '#eaa9e1', '#ff8c94', '#b5b1ef', '#9bdce7'];
 const plots = new Map();
+const noteBindings = new WeakMap();
 let chartId = 0;
 
 function valuesFor(series, rows) {
@@ -121,6 +123,8 @@ function drawChart(view) {
   const showYear = Date.parse(lastDate) - Date.parse(firstDate) >= 31536000000;
   const sameYear = new Date(firstDate).getUTCFullYear() === new Date(lastDate).getUTCFullYear();
   const axisLabels = ticks.map((index) => `<text x="${x(index)}" y="${height - 6}" text-anchor="${index === 0 ? 'start' : index === rows.length - 1 ? 'end' : 'middle'}">${safe(xLabel(rows[index].date, showYear))}</text>`).join('');
+  const notes = renderResearchNoteMarkers(options.notes, { rows, x, y: top + 2 });
+  if (notes) loadResearchNoteStyles(document);
   plots.set(id, { rows, series, content, width, left, right, top, bottom, x, y, active: -1, view,
     candles: options.candles, onPick: options.onPick, describePoint: options.describePoint });
   if (plots.size > 100) {
@@ -141,10 +145,10 @@ function drawChart(view) {
     <span aria-live="polite">${safe(`${dateLabel(firstDate, sameYear)} – ${dateLabel(lastDate, sameYear)}`)}</span></div>` : '';
   return `<div class="chart-frame" id="${id}" data-chart>
     ${scales}
-    <svg class="chart-svg" viewBox="0 0 ${width} ${height}" tabindex="0" role="img" aria-label="${safe(options.label || series.map(({ label }) => label).join(' and '))}. Use arrow keys to inspect sessions." data-plot="${id}">
+    <svg class="chart-svg" viewBox="0 0 ${width} ${height}" tabindex="0" role="${notes ? 'group' : 'img'}" aria-label="${safe(options.label || series.map(({ label }) => label).join(' and '))}. Use arrow keys to inspect sessions." data-plot="${id}">
       <defs><linearGradient id="${id}-gradient" x2="0" y2="1" gradientUnits="objectBoundingBox"><stop stop-color="${series[0].color}" stop-opacity=".18"/><stop offset="1" stop-color="${series[0].color}" stop-opacity=".015"/></linearGradient></defs>
       <g fill="#98aab3" font-size="10.5" font-family="monospace">${grid}${axisLabels}</g>${candles}${lines}${volume}
-      <g class="chart-crosshair" hidden></g>
+      <g class="chart-crosshair" hidden></g>${notes}
     </svg>
     <div class="chart-tooltip" hidden></div><div class="legend chart-legend">${legend}${options.volume ? '<span class="legend-item"><i class="legend-mark" style="--series-color:#5d8278"></i>Share volume</span>' : ''}</div>${controls}
   </div>`;
@@ -154,6 +158,7 @@ function replaceChart(frame, view, focusSelector) {
   const markup = drawChart(view);
   const parent = frame.parentElement;
   const index = [...parent.children].indexOf(frame);
+  disposeChartNoteBindings(frame);
   plots.delete(frame.id);
   frame.outerHTML = markup;
   const replacement = parent.children[index];
@@ -212,6 +217,27 @@ function hidePoint(node) {
   node.querySelector('.chart-crosshair').setAttribute('hidden', '');
 }
 
+export function disposeChartNoteBindings(container) {
+  const frames = container.matches('[data-chart]') ? [container] : container.querySelectorAll('[data-chart]');
+  for (const frame of frames) {
+    noteBindings.get(frame)?.();
+    noteBindings.delete(frame);
+  }
+}
+
+function ensureNoteBindings(event) {
+  const marker = event.target.closest?.('[data-research-note-marker]');
+  const node = marker?.closest('[data-plot]');
+  const frame = node?.parentElement;
+  if (!frame || noteBindings.has(frame)) return;
+  const options = plots.get(node.dataset.plot)?.view.options;
+  if (!options?.notes?.length) return;
+  noteBindings.set(frame, bindResearchNoteMarkers(frame, options.notes, {
+    signal: options.noteSignal, onEdit: options.onNoteEdit, onShow: () => hidePoint(node),
+  }));
+}
+for (const type of ['pointerover', 'focusin', 'keydown', 'click']) document.addEventListener(type, ensureNoteBindings, true);
+
 document.addEventListener('pointermove', (event) => {
   const node = event.target.closest('[data-plot]');
   const plot = plots.get(node?.dataset.plot);
@@ -220,6 +246,7 @@ document.addEventListener('pointermove', (event) => {
     if (previous && !previous.parentElement.contains(document.activeElement)) hidePoint(previous.parentElement.querySelector('[data-plot]'));
     return;
   }
+  if (event.target.closest('[data-research-note-marker]')) return;
   const { left, width } = node.getBoundingClientRect();
   const x = (event.clientX - left) * plot.width / width;
   const index = Math.round((x - plot.left) / (plot.right - plot.left) * (plot.rows.length - 1));
@@ -229,6 +256,7 @@ document.addEventListener('focusout', (event) => {
   if (event.target.matches('[data-plot]')) hidePoint(event.target);
 });
 document.addEventListener('keydown', (event) => {
+  if (event.target.closest?.('[data-research-note-marker]')) return;
   const node = event.target.closest('[data-plot]');
   const plot = plots.get(node?.dataset.plot);
   if (!plot) return;
@@ -245,6 +273,7 @@ document.addEventListener('keydown', (event) => {
   }
 });
 document.addEventListener('click', (event) => {
+  if (event.target.closest?.('[data-research-note-marker]')) return;
   const scale = event.target.closest('[data-chart-scale]');
   if (scale) {
     const frame = scale.closest('[data-chart]');
