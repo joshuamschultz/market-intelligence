@@ -2,7 +2,7 @@
 
 This checklist describes what remains for the current local single-user release. It separates software/release work from unfinished calculation, evidence, and source coverage. A completed screen or passing test does not establish complete provider history or a full-corpus performance result.
 
-See the [requirements tracker](REQUIREMENTS.md) for feature-level status and the [PRD](../PRD.md) for the original scope.
+See the [requirements tracker](REQUIREMENTS.md) for feature-level status.
 
 ## Current verified baseline
 

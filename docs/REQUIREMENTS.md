@@ -1,6 +1,6 @@
 # Requirements checklist
 
-Source: `PRD.md` v1.0 (November 21, 2026), plus the user's delivery instructions to keep a usable preview running, refresh application versions every 15–30 minutes, and load actual EODHD provider data into the database. This checklist separates implemented software workflows from provider-data completeness. `[x]` means the software capability is implemented and supported by current evidence; it does not certify every symbol/date/data field. `[ ]` means the full stated requirement remains open. Data limitations are called out inline and in the status table.
+Source: the original product requirements document v1.0 (November 21, 2026; removed from the repository after the build, available in Git history), plus the user's delivery instructions to keep a usable preview running, refresh application versions every 15–30 minutes, and load actual EODHD provider data into the database. This checklist separates implemented software workflows from provider-data completeness. `[x]` means the software capability is implemented and supported by current evidence; it does not certify every symbol/date/data field. `[ ]` means the full stated requirement remains open. Data limitations are called out inline and in the status table.
 
 ## Product scope and priorities
 
