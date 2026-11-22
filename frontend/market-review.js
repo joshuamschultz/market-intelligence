@@ -2,12 +2,15 @@ import { chart, chartColors, disposeChartNoteBindings } from './charts.js';
 import { chartRanges, rangeSegment } from './chart-ranges.js';
 import { chartbookDefaultRange, chartbookShortcut } from './chartbook-ui.js';
 import { loadResearchNotes, noteSubject, openResearchNoteEditor } from './research-notes.js';
-import { action, compact, count, dateLabel, empty, field, icon, notice, number, numeric, option, pathPart, pending, percent, ratio, safe, segment } from './ui.js';
+import { setTickerPreviewContext } from './ticker-preview.js';
+import { action, compact, count, dateLabel, empty, field, icon, notice, number, numeric, option, pagination, pathPart, pending, percent, ratio, safe, segment, table } from './ui.js';
 
 const ranges = chartRanges.map(([value]) => value);
 const scopes = [['combined', 'Combined'], ['market', 'Market'], ['industries', 'Industries']];
 const contextKeys = ['date', 'dataVersion', 'universe', 'universeVersion', 'model', 'modelVersion', 'basis', 'benchmark',
   'classification', 'reference', 'observedReferenceDate', 'healthModel'];
+const memberColumns = ['symbol', 'name', 'close', 'return_1d', 'rsPercentile', 'velocity4w'];
+const membersPerPage = 30;
 const mint = '#58e2c3', red = '#ff8c94', blue = '#84a9fa';
 const pairing = (key, title, up, down, description) => ({ key, title, description, kind: 'breadth',
   series: [{ key: up, label: up.startsWith('new_high') ? 'New highs' : 'Up', color: mint },
@@ -149,6 +152,106 @@ function frameCaption(rows, keys, requested) {
     : `No prepared readings in the ${count(requested)}-session range`;
 }
 
+function constituentDrawer(env, context, calculationVersion, activeCard) {
+  const { detail } = env;
+  let drawer;
+
+  function close(dismiss = true) {
+    if (!drawer) return;
+    const { body, request, onClose, onReplace } = drawer;
+    drawer = null;
+    request?.abort();
+    detail.removeEventListener('close', onClose);
+    detail.removeEventListener('workspace:dialog-change', onReplace);
+    body.replaceChildren();
+    if (dismiss && detail.open && detail.contains(body)) detail.close();
+  }
+
+  async function load(item, focusResults = false) {
+    const { card, body, results, status, clear } = item;
+    item.request?.abort();
+    const request = item.request = new AbortController();
+    const current = () => drawer === item && item.request === request && !request.signal.aborted &&
+      detail.open && body.isConnected && activeCard(card);
+    const retry = action('Retry', 'market-review-members-retry', 'refresh');
+    status.textContent = '';
+    clear.hidden = !item.search;
+    results.innerHTML = pending('Loading constituent rankings…');
+    try {
+      const result = await env.api(`industries/${pathPart(card.group.id)}/members`, { plain: true, signal: request.signal,
+        params: { ...context, page: item.page, perPage: membersPerPage, ...(item.search && { search: item.search }) } });
+      if (!current()) return;
+      if (result.pendingOnly) {
+        results.innerHTML = notice('Constituent rankings unavailable', 'Member rankings are awaiting preparation for this session and revision.', retry);
+      } else {
+        if (result.date !== context.date || result.dataVersion != null && Number(result.dataVersion) !== Number(context.dataVersion) ||
+          !Array.isArray(result.rows) || !Number.isSafeInteger(result.total)) throw new Error('Member rankings did not match this analysis session.');
+        if (result.rows.length) {
+          results.innerHTML = table(result.rows, memberColumns, { label: `${card.title} constituents`, cells: {
+            symbol: (row) => `<a class="stock-link mono" href="${safe(env.routeUrl('stock', { ...context, symbol: row.securityId || row.symbol }))}">${safe(row.symbol || row.securityId)}</a>`,
+          } }) + pagination(result, 'market-review-members-page');
+          status.textContent = `${count(result.total)} ${item.search ? 'matching' : 'constituent'} stocks · Page ${count(result.page)}`;
+        } else {
+          results.innerHTML = item.search ? empty('No matching stocks', 'Try a different ticker or company name.', 'search')
+            : empty('No constituent stocks', 'There are no traded members for this industry in the selected analysis session.', 'layers');
+        }
+      }
+    } catch (error) {
+      if (!current() || error.name === 'AbortError') return;
+      results.innerHTML = notice('Could not load constituent rankings', error.message, retry, true);
+    } finally {
+      if (current()) {
+        item.request = null;
+        if (focusResults && !detail.contains(body.ownerDocument.activeElement))
+          (results.querySelector('.table-scroll, [data-action="market-review-members-retry"]') || item.input).focus({ preventScroll: true });
+      }
+    }
+  }
+
+  function open(card, opener) {
+    if (card?.kind !== 'industry' || !context.date || !detail || detail.open || !activeCard(card)) return;
+    close(false);
+    const body = env.showDialog(detail, `${card.title} · Stocks`, `<div class="market-review-members">
+      <form class="market-review-members-search" role="search" aria-label="Search industry stocks">
+        ${field('Ticker or company', '<input type="search" name="search" maxlength="100" autocomplete="off">')}
+        <button class="button" type="submit">Search</button>
+        <button class="button ghost" type="button" data-review-members-clear hidden>Clear search</button>
+      </form>
+      <p class="muted market-review-members-hint">Sorted by RS rank. Hover or focus a ticker for a 3M chart, or select it for full stats.</p>
+      <p class="sr-only" role="status" data-review-members-status></p>
+      <div data-review-members-results></div></div>`, `Session ${dateLabel(context.date)} · r${context.dataVersion}`, opener);
+    setTickerPreviewContext(body, { ...context, ...(calculationVersion && { calculationVersion }) });
+    const form = body.querySelector('form');
+    const input = form.elements.namedItem('search');
+    const item = drawer = { card, body, input, page: 1, search: '', clear: body.querySelector('[data-review-members-clear]'),
+      results: body.querySelector('[data-review-members-results]'), status: body.querySelector('[data-review-members-status]'),
+      onClose: () => { if (!detail.open && drawer === item) close(false); },
+      onReplace: () => { if (drawer === item) close(false); } };
+    detail.addEventListener('close', item.onClose);
+    detail.addEventListener('workspace:dialog-change', item.onReplace);
+    function search(next) {
+      if (drawer !== item || !detail.open || !activeCard(card) || (next === item.search && item.page === 1)) return;
+      item.search = next;
+      item.page = 1;
+      return load(item);
+    }
+    form.addEventListener('submit', (event) => { event.preventDefault(); search(input.value.trim()); });
+    item.clear.addEventListener('click', () => { input.value = ''; input.focus({ preventScroll: true }); search(''); });
+    return load(item);
+  }
+
+  return {
+    open, close,
+    page(value) {
+      const page = Number(value);
+      if (!drawer || !detail.open || !Number.isSafeInteger(page) || page < 1 || page === drawer.page) return;
+      drawer.page = page;
+      return load(drawer, true);
+    },
+    retry() { if (drawer && detail.open) return load(drawer, true); },
+  };
+}
+
 export async function renderMarketReview(env, tabs) {
   const { main, signal, params, state } = env;
   const document = main.ownerDocument;
@@ -174,6 +277,7 @@ export async function renderMarketReview(env, tabs) {
   let deck, current = null, index, frame, notes, noteError, loadNumber = 0, noteRead = 0;
   let range = ranges.includes(state.marketReviewRange) ? state.marketReviewRange : chartbookDefaultRange;
   let preparing = false;
+  const constituents = constituentDrawer(env, context, catalog.context?.calculationVersion, (card) => active() && current === card);
   const visibleDeck = () => [...(scope !== 'industries' ? marketCards : []), ...(scope !== 'market' ? industries : [])];
   function selectDeck(wanted) {
     deck = visibleDeck();
@@ -258,11 +362,13 @@ export async function renderMarketReview(env, tabs) {
     }
     const body = view.querySelector('[data-review-card]');
     const { title, kind, group } = current;
-    const intro = group ? [group.parent, numeric(group.rank) && `Rank ${count(group.rank)}`, numeric(group.count) && `${count(group.count)} stocks`].filter(Boolean).join(' · ') : '';
+    const intro = group ? [group.parent, numeric(group.rank) && `Rank ${count(group.rank)}`].filter(Boolean).join(' · ') : '';
+    const members = kind === 'industry' && catalog.date ? `<button class="button market-review-stocks" type="button" data-action="market-review-members"
+      aria-haspopup="dialog" aria-controls="detail">${icon('layers')}Stocks${numeric(group.count) ? ` (${count(group.count)})` : ''}</button>` : '';
     const toolbar = `<div class="chartbook-toolbar"><div><h2>${safe(title)}</h2>${intro ? `<p class="muted">${safe(intro)}</p>` : ''}</div>
       <div class="actions">${action('Previous', 'market-review-prev', 'chevron-left', { disabled: index === 0 })}
       ${action('Next', 'market-review-next', 'chevron-right', { disabled: index === deck.length - 1 })}
-      ${action('Note', 'market-review-note', 'edit', { disabled: !catalog.date })}</div></div>
+      ${members}${action('Note', 'market-review-note', 'edit', { disabled: !catalog.date })}</div></div>
       <div class="market-review-range">${rangeSegment('market-review-range', range)}<span class="muted">${count(index + 1)} / ${count(deck.length)} · ${safe(dateLabel(catalog.date))} · r${safe(catalog.dataVersion)}</span></div>`;
     if (!frame) { body.innerHTML = toolbar + pending('Reading prepared chart history…'); return; }
     if (frame.error) {
@@ -280,7 +386,7 @@ export async function renderMarketReview(env, tabs) {
       ? action('Prepare current-membership proxies', 'market-review-prepare', 'refresh', { disabled: preparing }) : '';
     const secLink = kind === 'industry' && !hasReadings && context.classification === 'nasdaq' &&
       env.config.classificationSystems?.includes('sec-sic')
-      ? `<a class="button" href="${safe(env.routeUrl('chartbook', { ...context, classification: 'sec-sic', reference: 'as-of',
+      ? `<a class="button" href="${safe(env.routeUrl('chartbook', { ...context, classification: 'sec-sic', reference: 'as-of', observedReferenceDate: null,
         mode: 'market', reviewView: 'industries' }))}">Use filing-dated SEC industries</a>` : '';
     const description = [frame.description, infiniteRatio?.length && infiniteRatio.join(' · '), kind === 'industry' && anchor && `Rebased to 100 on ${dateLabel(anchor)}`,
       kind === 'industry' && !frame.compare && 'SPY comparison unavailable', source?.reason].filter(Boolean).join(' · ');
@@ -340,6 +446,7 @@ export async function renderMarketReview(env, tabs) {
 
   function move(offset) {
     if (!deck[index + offset]) return;
+    constituents.close();
     index += offset;
     current = deck[index];
     env.replaceParams?.({ card: current.key });
@@ -393,6 +500,8 @@ export async function renderMarketReview(env, tabs) {
     <section class="panel panel-body" data-review-card></section>`;
   const actions = {
     'market-review-next': () => move(1), 'market-review-prev': () => move(-1),
+    'market-review-members': (_value, opener) => constituents.open(current, opener),
+    'market-review-members-page': constituents.page, 'market-review-members-retry': constituents.retry,
     'market-review-range': (value) => changeRange(Number(value)), 'market-review-note': () => editNote(),
     'market-review-retry-notes': () => current && frame?.rows && refreshNotes(current, frame.rows),
     'market-review-reload': () => current ? load(true) : env.render(),
@@ -400,6 +509,7 @@ export async function renderMarketReview(env, tabs) {
     'change:market-review-deck': (id) => env.go('chartbook', { ...context, mode: 'market', deck: id || null, reviewView: null, card: null }),
     'market-review-view': (value) => {
       if (!scopes.some(([id]) => id === value) || value === scope) return;
+      constituents.close();
       scope = value;
       selectDeck(current?.key);
       env.replaceParams?.({ reviewView: scope, card: current?.key ?? null });
@@ -436,6 +546,7 @@ export async function renderMarketReview(env, tabs) {
   document.addEventListener('keydown', keydown);
   signal?.addEventListener('abort', () => {
     document.removeEventListener('keydown', keydown);
+    constituents.close();
     for (const controller of controllers) controller.abort();
     disposeChartNoteBindings(view);
   }, { once: true });

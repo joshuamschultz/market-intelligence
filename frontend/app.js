@@ -61,8 +61,10 @@ let nextBuildVersion;
 let checkRunning = false;
 let returningToLatest = false;
 const routePreparations = new Map();
-const contextKeys = ['universe', 'date', 'model', 'benchmark', 'basis', 'classification', 'universeVersion', 'modelVersion', 'dataVersion', 'healthModel', 'reference'];
-const recipeKeys = ['universe', 'universeVersion', 'model', 'modelVersion', 'benchmark', 'basis', 'classification', 'reference'];
+const contextKeys = ['universe', 'date', 'model', 'benchmark', 'basis', 'classification', 'universeVersion', 'modelVersion', 'dataVersion',
+  'healthModel', 'reference', 'observedReferenceDate'];
+const recipeKeys = ['universe', 'universeVersion', 'model', 'modelVersion', 'benchmark', 'basis', 'classification', 'reference', 'observedReferenceDate'];
+const referenceScopeKeys = ['date', 'dataVersion', 'basis', 'classification', 'reference'];
 
 for (const element of document.querySelectorAll('[data-icon]')) element.insertAdjacentHTML('afterbegin', icon(element.dataset.icon));
 
@@ -98,8 +100,15 @@ function currentContext(selection = route) {
   }));
 }
 
+function clearsReferenceDate(context, patch) {
+  return !Object.hasOwn(patch, 'observedReferenceDate') && referenceScopeKeys.some((key) =>
+    Object.hasOwn(patch, key) && String(patch[key] ?? '') !== String(context[key] ?? ''));
+}
+
 function routeUrl(page, patch = {}, includeParams = false) {
-  const options = includeParams ? { ...currentContext(), ...route.state, ...patch } : { ...currentContext(), ...patch };
+  const context = currentContext();
+  const options = includeParams ? { ...context, ...route.state, ...patch } : { ...context, ...patch };
+  if (clearsReferenceDate(context, patch)) delete options.observedReferenceDate;
   for (const key of ['classification','reference','benchmark']) {
     if (!route.state[key] && !Object.hasOwn(patch,key)) delete options[key];
     if (options[key] === 'auto') delete options[key];
@@ -238,8 +247,9 @@ function listAnalysisStatus(status, options) {
   const ready = status?.latestAnalysis;
   return ready && { ...status, latestDate: ready.date, dataVersion: ready.dataVersion, appliedAt: undefined };
 }
+const contextPinned = ({ state } = route) => Boolean(state.date || state.dataVersion || state.observedReferenceDate);
 function preparedAnalysisStatus(status, { allowPinned = false, selection = route } = {}) {
-  if (!status?.preparation?.total || !allowPinned && (selection.state.date || selection.state.dataVersion)) return null;
+  if (!status?.preparation?.total || !allowPinned && contextPinned(selection)) return null;
   const point = currentPreparationPoint(status, selection);
   return point?.stages?.current === 'complete' && point.stages.recent === 'complete'
     ? { ...status, latestDate: point.date, dataVersion: status.preparation.dataVersion, appliedAt: undefined } : null;
@@ -247,7 +257,7 @@ function preparedAnalysisStatus(status, { allowPinned = false, selection = route
 function currentPreparationPoint(status, selection = route) {
   const context = currentContext(selection);
   return status?.preparation?.contexts?.find((item) => item.date === status.latestDate &&
-    recipeKeys.every((key) => item[key] == null || String(item[key]) === String(context[key])));
+    recipeKeys.every((key) => (key === 'observedReferenceDate' ? context[key] == null : item[key] == null) || String(item[key]) === String(context[key])));
 }
 const historicalBackfill = (job) => ['recent', 'history'].includes(job?.phase || job?.payload?.phase);
 function dataUpdateCandidate() {
@@ -262,7 +272,7 @@ function dataUpdateCandidate() {
   const displayedVersion = Number(current.dataVersion);
   const revision = Number(next?.dataVersion);
   if (!next?.latestDate || !Number.isInteger(revision) || revision < displayedVersion || next.latestDate < displayedDate) return null;
-  return revision > displayedVersion || !route.state.date && !route.state.dataVersion && next.latestDate > displayedDate ? next : null;
+  return revision > displayedVersion || !contextPinned() && next.latestDate > displayedDate ? next : null;
 }
 function newerAnalysis(next, current) {
   if (!next?.latestDate) return false;
@@ -273,7 +283,7 @@ function newerAnalysis(next, current) {
     (nextVersion > currentVersion || next.latestDate > (current.latestDate || ''));
 }
 function currentListRoute() {
-  return listViews.has(route.page) && !route.state.date && !route.state.dataVersion;
+  return listViews.has(route.page) && !contextPinned();
 }
 function canRefreshList() {
   if (!currentListRoute()) return false;
@@ -400,7 +410,7 @@ function updateContextIndicators() {
 
 function registerContext(selection, { retry = false } = {}) {
   const context = currentContext(selection);
-  const followLatest = !context.date && !context.dataVersion;
+  const followLatest = !contextPinned(selection);
   const key = JSON.stringify([...recipeKeys, 'date', 'dataVersion'].map((field) => String(context[field] ?? '')));
   const existing = registrations.get(key);
   if (existing?.pending || (!retry && existing)) return existing.promise;
@@ -473,7 +483,7 @@ function contextControls() {
   contextBar.innerHTML = contextOptions(config.universes || [], 'universe', 'Universe', undefined, universeDefinition(context.universe)) +
     `<button type="button" class="button" data-action="universe-counts" aria-haspopup="dialog" aria-controls="detail">${icon('layers')}Universe counts</button>` +
     `<label class="context-field"><span>As of</span><input type="date" aria-label="As-of date" data-change="context" data-value="date"${attr('value', context.date || analysisStatus?.latestDate || config.status?.latestDate)} max="${safe(config.status?.latestDate || '')}"></label>
-    ${context.date || context.dataVersion ? iconButton('Return to latest session', 'current', 'clock') : ''}` +
+    ${contextPinned() ? iconButton('Return to latest session', 'current', 'clock') : ''}` +
     contextOptions(config.models || [], 'model', 'RS model') +
     contextOptions(['auto', ...(config.benchmarks || [])], 'benchmark', 'Benchmark', (item) =>
       item.id === 'auto' ? `Auto · ${context.benchmark}` : config.availableBenchmarks?.includes(item.id) ? item.name : `${item.name} (unavailable)`) +
@@ -641,6 +651,7 @@ function makeEnvironment(signal) {
     replaceParams(patch) {
       if (localRoute !== route || signal?.aborted) return;
       history.replaceState(null, '', routeUrl(localRoute.page, patch, true));
+      if (clearsReferenceDate(currentContext(localRoute), patch)) delete localRoute.state.observedReferenceDate;
       for (const [key, value] of Object.entries(patch)) {
         if (value == null || value === '') delete localRoute.state[key];
         else localRoute.state[key] = String(value);
@@ -991,7 +1002,7 @@ async function returnToLatest() {
     if (route !== original) return;
     if (!fresh) return toast('The latest session could not be checked. Try again.');
     const screen = fresh.screens.find(({ id }) => id === original.state.screen);
-    const patch = { date: null, dataVersion: null,
+    const patch = { date: null, dataVersion: null, observedReferenceDate: null,
       ...(screen && savedScreenRoute(screen.definition).date ? { screen: null } : {}) };
     const selection = routeFromUrl(routeUrl(route.page, patch, true));
     const ready = listAnalysisStatus(fresh.status, { selection }) ||
@@ -1146,7 +1157,7 @@ async function checkBuild(force = false) {
       (!plan?.total || planReady);
     const published = Number(latest?.latestAnalysis?.dataVersion ?? latest?.latestPublication?.data_version) > Number(analysisStatus?.dataVersion);
     const batchDue = analysisStatus && now - analysisStatus.appliedAt >= batchRefreshMs;
-    if (newData && canRefresh && !route.state.date && !route.state.dataVersion && idleFor >= 120000 && (published || batchDue)) {
+    if (newData && canRefresh && !contextPinned() && idleFor >= 120000 && (published || batchDue)) {
       const previousRoute = route;
       const loaded = await reloadConfig();
       if (loaded && route === previousRoute && !activeDialog() && !hasFormDraft() &&

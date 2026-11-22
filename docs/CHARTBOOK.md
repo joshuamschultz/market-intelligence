@@ -21,6 +21,12 @@ Industry comparison uses dated group returns when those records exist. A current
 
 The point display shows the selected session's date, close, daily return, OHLC and volume when available, and rebased comparison values. It is keyboard accessible: focus the chart, then use Up/Down to inspect adjacent sessions or Home/End to jump to the first/last plotted session. Escape dismisses the point display.
 
+## Industry constituents
+
+Source package 0.3.2 adds a **Stocks (count)** button to industry cards in the Market & Industry ChartBook's Combined and Industries views. The count is the group's traded constituents at the selected review session. Open it to search by ticker or company; results are server-paged in 30-row pages, sorted by RS rank, and show ticker, company, close, daily return, RS percentile, and 4-week stock RS velocity. Check `/api/v1/build` to confirm the feature is in the active release.
+
+Hover or keyboard-focus a ticker to see its prepared 3-month (63-session) daily candle preview. Select the ticker to open the full stock dashboard, including its available stats, pinned to the ChartBook's session and data revision. Escape or clicking outside closes the drawer and returns focus to its opener without moving the chart or changing its range. There is no extra keyboard shortcut for this drawer. The existing **M** shortcut still sets the main chart range to 3M.
+
 ## Keyboard shortcuts
 
 | Key | Action |
@@ -41,4 +47,4 @@ Stock Lists is for period-return leaders and saved RS model lists. Period lists 
 
 ## Data and interpretation limits
 
-ChartBook reads the selected date/revision and available prepared price and ranking history; source status is visible in the book. It does not fill missing prices or prove complete US-market membership. Industry proxies and short stored histories should be interpreted according to their displayed method and date coverage. ChartBook is a research aid, not a trading recommendation.
+ChartBook reads the selected date/revision and available prepared price and ranking history; source status is visible in the book. It does not fill missing prices or prove complete US-market membership. Industry proxies and short stored histories should be interpreted according to their displayed method and date coverage. The constituents list uses group membership at the selected review session; the chart cursor does not change that date. ChartBook is a research aid, not a trading recommendation.

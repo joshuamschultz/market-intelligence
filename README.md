@@ -9,7 +9,7 @@
 Start with the whole U.S. market. Find the industry groups that lead it. Find the stocks that drive those groups.<br>
 Then review every chart once and keep a dated record of what you saw.
 
-[![Version](https://img.shields.io/badge/version-0.3.1-55d9bd?style=for-the-badge)](package.json)
+[![Version](https://img.shields.io/badge/version-0.3.2-55d9bd?style=for-the-badge)](package.json)
 [![Node.js](https://img.shields.io/badge/node-24.15%2B%20%7C%2026%20LTS-3c873a?style=for-the-badge&logo=node.js&logoColor=white)](#-requirements)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](docs/ARCHITECTURE.md)
 [![Local first](https://img.shields.io/badge/runs-on%20your%20machine-0b1216?style=for-the-badge)](#-privacy-and-security)
@@ -119,6 +119,7 @@ Most tools show you one piece: a chart, a screener, or an index. Market Intellig
 
 #### 📈 ChartBook and notes
 - Merge saved lists into one deduplicated review
+- Open an industry's pinned stock list, preview 3M candles, and click through to full ticker stats
 - Candles with 20D and 50D SMA, SPY, and industry lines
 - ±4% move markers and a metrics strip under each chart
 - Dated notes for a stock or a market/industry chart
@@ -376,7 +377,7 @@ npm test
 
 ## 📍 Project status
 
-Source package version: **0.3.1**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
+Source package version: **0.3.2**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
 
 | Area | Status | Notes |
 | :--- | :---: | :--- |
