@@ -7,6 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { independentPreparedQueryScreens } from '../backend/prepared-query-screen.mjs';
 import { analysisWorkspaceScopeHash } from '../backend/analysis-readiness.mjs';
 import { expectedSessions } from '../backend/calendar.mjs';
 import { CALCULATION_VERSION, dataVersion, isoDate, listWorkspace, marketDay } from '../backend/database.mjs';
@@ -94,7 +95,9 @@ function shardEdges(rows, dates, expectedChunk) {
 }
 
 function workspaceModelHash(db) {
+  const independentQueries = independentPreparedQueryScreens(db);
   return hash(modelKinds.map((kind) => [kind, listWorkspace(db, kind)
+    .filter(({ id, version }) => kind !== 'screen' || independentQueries.get(id) !== version)
     .filter(({ definition }) => kind !== 'alert-rule' || definition.active !== false && ['stocks', 'screen'].includes(definition.type))
     .map(({ id, version, name, definition }) => [id, version, name, definition])
     .sort((left, right) => left[0].localeCompare(right[0]))]));

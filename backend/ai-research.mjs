@@ -19,7 +19,7 @@ import { createResearchNotes } from './research-notes.mjs';
 import { screenStocks } from './screener.mjs';
 import { readPreparedSummation } from './summation.mjs';
 import { decodeStoredJson } from './storage-codec.mjs';
-import { stockFields } from './ai-tools.mjs';
+import { stockColumns, stockFields } from './ai-tools.mjs';
 
 export const researchError = (message, status = 400) => Object.assign(new Error(message), { status });
 const currencies = new Set(['close', 'open', 'high', 'low', 'dollarVolume', 'market_cap', 'adv_20d']);
@@ -28,7 +28,6 @@ const units = (key) => key.startsWith('return_') || ['relative_return_21d', 'dis
     : ['rsPercentile', 'industryRS', 'industryBreadth'].includes(key) ? 'percent'
       : currencies.has(key) ? 'USD' : ['volume', 'float', 'shares'].includes(key) ? 'shares'
         : key.endsWith('Date') || key.endsWith('KnownAt') ? 'ISO date' : 'native';
-const stockColumns = ['securityId', 'symbol', 'name', 'sector', 'industry', 'close', 'return_21d', 'rsRank', 'rsPercentile'];
 const monitorKeys = ['down_13pct_34d', 'up_13pct_34d'];
 const listKinds = ['watchlist', 'screen', 'chartbook', 'market-chartbook'];
 const finite = Number.isFinite;
@@ -615,7 +614,7 @@ function readJournals(db, point, input, now) {
       includeRetrospective: !!input.includeRetrospective } });
 }
 
-export function createResearchEngine(db, { now = () => new Date() } = {}) {
+export function createResearchEngine(db, { now = () => new Date(), workspaceWriter } = {}) {
   const engine = createEngine(db);
   const notes = createResearchNotes(db, engine);
   const book = createChartBook(db, engine, {
@@ -656,6 +655,11 @@ export function createResearchEngine(db, { now = () => new Date() } = {}) {
 
   return {
     async run(name, input, principal) {
+      if (name === 'create_watchlist' || name === 'create_screen') {
+        if (!workspaceWriter) throw researchError('Workspace creation is unavailable.', 503);
+        const saved = name === 'create_watchlist' ? workspaceWriter.createWatchlist(input, principal) : workspaceWriter.createScreen(input, principal);
+        return response(null, 'saved workspace', { state: 'created', data: { saved } });
+      }
       if (name === 'describe_research') return describe(input);
       const point = resolvePoint(db, engine, input.context);
       try { return await runAt(point, name, input, principal); }

@@ -9,7 +9,7 @@
 Start with the whole U.S. market. Find the industry groups that lead it. Find the stocks that drive those groups.<br>
 Then review every chart once and keep a dated record of what you saw.
 
-[![Version](https://img.shields.io/badge/version-0.3.2-55d9bd?style=for-the-badge)](package.json)
+[![Version](https://img.shields.io/badge/version-0.3.3-55d9bd?style=for-the-badge)](package.json)
 [![Node.js](https://img.shields.io/badge/node-24.15%2B%20%7C%2026%20LTS-3c873a?style=for-the-badge&logo=node.js&logoColor=white)](#-requirements)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](docs/ARCHITECTURE.md)
 [![Local first](https://img.shields.io/badge/runs-on%20your%20machine-0b1216?style=for-the-badge)](#-privacy-and-security)
@@ -325,7 +325,7 @@ Copy `.env.example` to `.env` and set what you need. Keep `.env` private.
 | **Frontend** | Plain JavaScript, HTML, and CSS, no build step |
 | **Exports** | CSV, Parquet via DuckDB CLI |
 | **Tests** | Node built-in test runner, jsdom for UI tests |
-| **AI (optional)** | Anthropic Claude for Market Journal drafts; scoped read-only research API and MCP |
+| **AI (optional)** | Anthropic Claude for Market Journal drafts; scoped research API/MCP with optional list creation |
 
 ## 📁 Project layout
 
@@ -360,7 +360,7 @@ Copy `.env.example` to `.env` and set what you need. Keep `.env` private.
 - 🏠 **Local by default.** The server binds to `127.0.0.1`. The warehouse, captures, logs, and backups stay in `data/`, which Git ignores.
 - 🔑 **Keys stay on the server.** Provider keys are never sent to the browser.
 - 🤖 **AI is opt-in.** Market Journal drafts send selected context to Anthropic when requested; private notes require a separate opt-in. External research clients receive only results allowed by their scoped token, and their prompt/tool results are sent to the provider you choose.
-- 🧩 **Research API and MCP** provide scoped, read-only access to prepared data. External clients receive the tool results you request; provider accounts are not connected by default. See [AI connections](docs/AI-CONNECTIONS.md) and [AI research contract](docs/AI-RESEARCH-CONTRACT.md).
+- 🧩 **Research API and MCP** provide prepared-data reads plus optional creation of watchlists and saved screens. Read tools remain read-only; creation requires a separate scope. External clients receive the tool results you request; provider accounts are not connected by default. See [AI research API](docs/AI-RESEARCH-API.md).
 
 ## 🧑‍💻 Development
 
@@ -377,7 +377,7 @@ npm test
 
 ## 📍 Project status
 
-Source package version: **0.3.2**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
+Source package version: **0.3.3**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
 
 | Area | Status | Notes |
 | :--- | :---: | :--- |
@@ -400,6 +400,7 @@ Open items: [Remaining work](docs/REMAINING-WORK.md) · [Performance acceptance]
 | 🏗️ [Architecture](docs/ARCHITECTURE.md) | Data flow and system design |
 | 🧭 [AI connections](docs/AI-CONNECTIONS.md) | Scoped API/MCP access and provider-specific connection limits |
 | 🤖 [AI research contract](docs/AI-RESEARCH-CONTRACT.md) | Tool catalog, provenance, pagination, and statistical interpretation |
+| 🔌 [AI research API](docs/AI-RESEARCH-API.md) | Prepared reads and optional, idempotent watchlist/screen creation |
 | 🏭 [Industry velocity](docs/INDUSTRY-VELOCITY.md) | Dated and current-member group RS comparisons, coverage, and limits |
 | 📊 [Session Review](docs/SESSION-REVIEW.md) | Rule profile, trend and breadth definitions, data limits |
 | 📈 [ChartBook guide](docs/CHARTBOOK.md) | Chart review, shortcuts, and notes |

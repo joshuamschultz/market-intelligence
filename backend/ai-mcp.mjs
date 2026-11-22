@@ -6,6 +6,7 @@ import { availableTools, invokeResearchTool, researchOpenApi, toolManifest } fro
 export const researchRequestBytes = 64 * 1024;
 const serverInfo = { name: 'market-intelligence-research', version: '1.0.0' };
 const credentialsRequired = 'A valid dedicated research bearer is required';
+const challenge = { 'WWW-Authenticate': 'Bearer realm="Market Intelligence Research"' };
 const message = (error) => error.status >= 400 && error.status < 500 || error.status === 503
   ? error.message : 'Research request could not be completed';
 
@@ -38,7 +39,7 @@ export function createResearchHttp({ access, research }) {
     async handle({ req, res, pathname, json, readBody }) {
       const token = researchTokenFromHeader(req.headers.authorization);
       const principal = access.authenticate(token);
-      if (!principal) return json(401, { error: credentialsRequired }, { 'WWW-Authenticate': 'Bearer realm="Market Intelligence Research"' });
+      if (!principal) return json(401, { error: credentialsRequired }, challenge);
       if (req.headers.origin) {
         let trusted = false;
         try {
@@ -69,7 +70,9 @@ export function createResearchHttp({ access, research }) {
       }
       try {
         const input = await readBody(req, researchRequestBytes);
-        return json(200, await invokeResearchTool(research, principal, tool, input));
+        const active = access.authenticate(token);
+        if (!active) return json(401, { error: credentialsRequired }, challenge);
+        return json(200, await invokeResearchTool(research, active, tool, input));
       } catch (error) {
         return json(error.status || 500, { error: message(error) });
       }

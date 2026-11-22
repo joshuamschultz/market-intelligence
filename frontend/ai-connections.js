@@ -6,6 +6,7 @@ const scopeDetails = {
   [readScope]: 'Read prepared market data and analysis.',
   'research:notes': 'Lets the client request private research notes.',
   'research:journals': 'Lets the client request private Market Journal entries.',
+  'research:workspace:create': 'Lets the client create new watchlists and saved screens in this workspace.',
 };
 const tokenPlaceholder = 'PASTE_RESEARCH_TOKEN_HERE';
 const guides = {
@@ -85,19 +86,30 @@ function connectionSetup(data, origin) {
   </section>`;
 }
 
+function permissionFields(scopes, idPrefix) {
+  return `<fieldset><legend>Permissions</legend>
+    ${scopes.map(({ id, label, required }) => {
+      const detailId = `${idPrefix}-${id}-detail`;
+      return `<div class="ai-connections-scope">
+        <label><input type="checkbox" name="scopes" value="${safe(id)}" aria-describedby="${safe(detailId)}"${required ? ' checked disabled' : ''}>
+          <span>${safe(label)}${required ? ' (required)' : ''}</span></label>
+        <p class="muted" id="${safe(detailId)}">${safe(scopeDetails[id])}</p></div>`;
+    }).join('')}
+  </fieldset>`;
+}
+
+function selectedScopes(form, retained = []) {
+  return [...new Set([readScope, ...retained, ...Array.from(form.querySelectorAll('input[name="scopes"]:checked'), (input) => input.value)])];
+}
+
 function controls(scopes) {
   return `<div class="stack">
     <section class="panel panel-body" aria-labelledby="ai-connections-create">
       <header class="panel-head"><div><h2 id="ai-connections-create">Create a research token</h2>
       <p class="muted">Use a separate token for each client so you can revoke its access independently.</p></div></header>
-      <form class="ai-connections-form" autocomplete="off">
+      <form class="ai-connections-form" autocomplete="off" data-ai-create-form>
         ${field('Connection name', '<input name="name" required maxlength="100" placeholder="e.g. Claude Desktop" autocomplete="off">')}
-        <fieldset><legend>Permissions</legend>
-        ${scopes.map(({ id, label, required }) => `<div class="ai-connections-scope">
-          <label><input type="checkbox" name="scopes" value="${safe(id)}" aria-describedby="${safe(id)}-detail"${required ? ' checked disabled' : ''}>
-            <span>${safe(label)}${required ? ' (required)' : ''}</span></label>
-          <p class="muted" id="${safe(id)}-detail">${safe(scopeDetails[id])}</p></div>`).join('')}
-        </fieldset>
+        ${permissionFields(scopes, 'ai-create')}
         <p class="form-error" role="alert" data-ai-create-error hidden></p>
         <div><button type="submit" class="button primary">Create token</button></div>
       </form>
@@ -117,6 +129,15 @@ function controls(scopes) {
       <header class="panel-head"><div><h2 id="ai-connections-tokens" tabindex="-1">Issued tokens</h2></div></header>
       <p class="muted" data-ai-list-status role="status" hidden></p>
       <div data-ai-records></div>
+      <form id="ai-connections-edit" class="ai-connections-form ai-connections-edit" aria-labelledby="ai-connections-edit-title" data-ai-edit-form hidden>
+        <h3 id="ai-connections-edit-title" tabindex="-1"></h3>
+        ${permissionFields(scopes, 'ai-edit')}
+        <p class="form-error" role="alert" data-ai-edit-error hidden></p>
+        <div class="actions">
+          <button type="submit" class="button primary">Save permissions</button>
+          <button type="button" class="button" data-ai-edit-cancel>Cancel</button>
+        </div>
+      </form>
       <section class="ai-connections-revoke" aria-labelledby="ai-connections-revoke-title" data-ai-confirm hidden>
         <h3 id="ai-connections-revoke-title">Revoke token?</h3>
         <p class="muted" data-ai-revoke-detail></p>
@@ -130,7 +151,7 @@ function controls(scopes) {
   </div>`;
 }
 
-function recordList(records, scopeLabels) {
+function recordList(records, scopeLabels, editingId) {
   if (!records.length) return '<p class="muted">No tokens issued yet.</p>';
   return `<ul class="ai-connections-records">${records.map((record) => {
     const { id, name, createdAt, revokedAt, scopes } = record;
@@ -140,7 +161,9 @@ function recordList(records, scopeLabels) {
         ` · Revoked <time datetime="${safe(revokedAt)}">${dateLabel(revokedAt)}</time>` : ''}</p>
       <p class="muted">${safe(scopes.map((scope) => scopeLabels.get(scope) ?? scope).join(' · '))}</p>
       </div><div class="actions">${chip(revokedAt ? 'Revoked' : 'Active token', revokedAt ? '' : 'accent')}
-        ${revokedAt ? '' : `<button type="button" class="button danger" aria-label="${safe(`Revoke ${name}`)}" data-ai-revoke="${safe(id)}">Revoke</button>`}
+        ${revokedAt ? '' : `<button type="button" class="button" aria-label="${safe(`Edit permissions for ${name}`)}" aria-controls="ai-connections-edit"
+          aria-expanded="${editingId === id}" data-ai-edit="${safe(id)}">Edit permissions</button>
+          <button type="button" class="button danger" aria-label="${safe(`Revoke ${name}`)}" data-ai-revoke="${safe(id)}">Revoke</button>`}
       </div></div></li>`;
   }).join('')}</ul>`;
 }
@@ -196,12 +219,14 @@ export function mountAiConnections(env, target) {
   }
 
   function mountControls(data) {
-    const scopes = data.scopes.filter(({ id }) => Object.hasOwn(scopeDetails, id));
-    const scopeLabels = new Map(scopes.map(({ id, label }) => [id, label]));
+    const scopes = data.scopes.filter(({ id }) => Object.hasOwn(scopeDetails, id))
+      .map((scope) => ({ ...scope, required: scope.id === readScope || scope.required }));
+    const scopeLabels = new Map(data.scopes.map(({ id, label }) => [id, label]));
+    const editableScopes = new Set(scopes.map(({ id }) => id));
     let records = data.integrations;
     target.innerHTML = `<div class="ai-connections">${controls(scopes)}${connectionSetup(data, win.location.origin)}</div>`;
 
-    const form = query('form');
+    const form = query('[data-ai-create-form]');
     const name = form.elements.namedItem('name');
     const submit = form.querySelector('[type="submit"]');
     const createError = query('[data-ai-create-error]');
@@ -213,12 +238,20 @@ export function mountAiConnections(env, target) {
     const confirmButton = query('[data-ai-revoke-confirm]');
     const cancelButton = query('[data-ai-revoke-cancel]');
     const revokeError = query('[data-ai-revoke-error]');
+    const editForm = query('[data-ai-edit-form]');
+    const editTitle = query('#ai-connections-edit-title');
+    const editFields = editForm.querySelector('fieldset');
+    const editSubmit = editForm.querySelector('[type="submit"]');
+    const editCancel = query('[data-ai-edit-cancel]');
+    const editError = query('[data-ai-edit-error]');
     const list = query('[data-ai-records]');
     const listStatus = query('[data-ai-list-status]');
     let creating = false;
     let issuedId;
+    let editing;
     let revoking;
-    const drawRecords = () => { list.innerHTML = recordList(records, scopeLabels); };
+    const drawRecords = () => { list.innerHTML = recordList(records, scopeLabels, editing?.id); };
+    const recordControl = (attribute, id) => [...list.querySelectorAll(`[${attribute}]`)].find((button) => button.getAttribute(attribute) === id);
 
     function toggleToken(visible) {
       token.type = visible ? 'text' : 'password';
@@ -240,7 +273,16 @@ export function mountAiConnections(env, target) {
       revoking = undefined;
       confirm.hidden = true;
       setMessage(revokeError);
-      if (restoreFocus) [...list.querySelectorAll('[data-ai-revoke]')].find((button) => button.dataset.aiRevoke === id)?.focus();
+      if (restoreFocus) recordControl('data-ai-revoke', id)?.focus();
+    }
+
+    function cancelEdit(restoreFocus = true) {
+      const opener = recordControl('data-ai-edit', editing?.id);
+      editing = undefined;
+      editForm.hidden = true;
+      setMessage(editError);
+      opener?.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) opener?.focus();
     }
 
     form.addEventListener('submit', async (event) => {
@@ -252,8 +294,7 @@ export function mountAiConnections(env, target) {
         name.focus();
         return;
       }
-      const selected = [...form.querySelectorAll('input[name="scopes"]:checked')].map((input) => input.value);
-      const body = { name: connectionName, scopes: [...new Set([readScope, ...selected])] };
+      const body = { name: connectionName, scopes: selectedScopes(form) };
       const generation = pageGeneration;
       setMessage(createError);
       creating = submit.disabled = true;
@@ -282,15 +323,63 @@ export function mountAiConnections(env, target) {
     });
 
     list.addEventListener('click', (event) => {
-      const opener = event.target.closest('[data-ai-revoke]');
-      if (!opener || !alive() || confirmButton.disabled) return;
-      revoking = records.find(({ id }) => id === opener.dataset.aiRevoke);
-      if (!revoking) return;
-      setMessage(revokeError);
+      const opener = event.target.closest('[data-ai-edit], [data-ai-revoke]');
+      if (!opener || !alive() || confirmButton.disabled || editSubmit.disabled) return;
+      const record = records.find(({ id }) => id === (opener.dataset.aiEdit ?? opener.dataset.aiRevoke));
+      if (!record || record.revokedAt) return;
       setMessage(listStatus);
-      query('[data-ai-revoke-detail]').textContent = `Revoke access for ${revoking.name}? The client will need a new token to use research tools.`;
-      confirm.hidden = false;
-      cancelButton.focus();
+      if (opener.hasAttribute('data-ai-edit')) {
+        cancelRevoke(false);
+        if (editing?.id !== record.id) {
+          cancelEdit(false);
+          editing = record;
+          editTitle.textContent = `Edit permissions · ${record.name}`;
+          for (const input of editFields.querySelectorAll('input[name="scopes"]')) {
+            input.checked = input.disabled || record.scopes.includes(input.value);
+          }
+          editForm.hidden = false;
+          opener.setAttribute('aria-expanded', 'true');
+        }
+        editTitle.focus();
+      } else {
+        cancelEdit(false);
+        revoking = record;
+        setMessage(revokeError);
+        query('[data-ai-revoke-detail]').textContent = `Revoke access for ${record.name}? The client will need a new token to use research tools.`;
+        confirm.hidden = false;
+        cancelButton.focus();
+      }
+    });
+
+    editCancel.addEventListener('click', () => cancelEdit());
+    editForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (!alive() || !editing || editSubmit.disabled) return;
+      const { id, scopes: previous } = editing;
+      const nextScopes = selectedScopes(editForm, previous.filter((scope) => !editableScopes.has(scope)));
+      setMessage(editError);
+      editFields.disabled = editCancel.disabled = editSubmit.disabled = true;
+      editSubmit.textContent = 'Saving…';
+      try {
+        const { integration } = await env.api(`${endpoint}/${pathPart(id)}`, { method: 'PATCH', body: { scopes: nextScopes }, plain: true, signal: request.signal });
+        if (!alive()) return;
+        if (integration?.id !== id || integration.revokedAt || !Array.isArray(integration.scopes) || !integration.scopes.includes(readScope)) {
+          throw new Error('The workspace did not confirm the permission changes.');
+        }
+        records = records.map((record) => record.id === id ? integration : record);
+        cancelEdit(false);
+        drawRecords();
+        setMessage(listStatus, `Permissions saved for ${integration.name}. Reconnect your MCP client to refresh the available tools.`);
+        recordControl('data-ai-edit', id)?.focus();
+      } catch (error) {
+        if (alive()) setMessage(editError, error.message || 'Could not save permissions.');
+      } finally {
+        if (alive()) {
+          editFields.disabled = editCancel.disabled = editSubmit.disabled = false;
+          editSubmit.textContent = 'Save permissions';
+          if (editing && doc.activeElement === doc.body) editSubmit.focus();
+        }
+      }
     });
 
     cancelButton.addEventListener('click', () => cancelRevoke());
@@ -360,8 +449,13 @@ export function mountAiConnections(env, target) {
 
     target.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape' || !alive()) return;
-      if (confirm.contains(event.target) && !confirmButton.disabled) cancelRevoke();
-      else if (issuedId) clearToken();
+      if (editForm.contains(event.target) && editing) {
+        if (editSubmit.disabled) return;
+        cancelEdit();
+      } else if (confirm.contains(event.target) && revoking) {
+        if (confirmButton.disabled) return;
+        cancelRevoke();
+      } else if (issuedId) clearToken();
       else return;
       event.preventDefault();
       event.stopPropagation();

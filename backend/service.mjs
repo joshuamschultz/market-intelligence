@@ -27,6 +27,7 @@ import { parquetAvailable, parquetBackup, parquetRows } from './parquet.mjs';
 import { materializeHistory, readMaterializedHistory } from './materialization.mjs';
 import { precomputeProduction, precomputeWorkspace } from './precompute.mjs';
 import { createPreparedDetailWriter, detailRiskWindows, prepareDetailsBatch, readPreparedDetail, riskMetrics } from './prepared-details.mjs';
+import { independentPreparedQueryScreens, isPreparedQueryScreen } from './prepared-query-screen.mjs';
 import { tickerChart } from './ticker-chart.mjs';
 import { hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot } from './prepared-snapshots.mjs';
 import { batchPreparationSpecs, enqueuePreparation, preparationInput, preparationSpecs, preparationStatus, preparationSuperseded, preparationType, readPreparedRanks,
@@ -466,7 +467,7 @@ function validMembers(input, { dated = false } = {}) {
   });
 }
 
-function workspaceDefinition(kind, input) {
+export function workspaceDefinition(kind, input) {
   const value = input.definition || {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw asError('Definition must be an object');
   switch (kind) {
@@ -895,8 +896,10 @@ function riskHistoryPending(db, config, lookback) {
 export function preparationWorkspaceScopes(db, engine, { date, version = dataVersion(db), pinnedDefaults = false } = {}) {
   const base = { ...workspaceDefaults(db, pinnedDefaults ? { date, version } : null), date, dataVersion: version };
   const basePoint = engine.context(base);
-  const savedScreens = listWorkspace(db, 'screen').map(({ definition }) => ({ definition,
-    context: { ...savedScreenContext(definition), ...screenDataNeeds(definition), rangeWindows: rangeWindowsForScreen(definition) } }));
+  const independentScreens = independentPreparedQueryScreens(db);
+  const savedScreens = listWorkspace(db, 'screen').filter((screen) => independentScreens.get(screen.id) !== screen.version)
+    .map(({ definition }) => ({ definition,
+      context: { ...savedScreenContext(definition), ...screenDataNeeds(definition), rangeWindows: rangeWindowsForScreen(definition) } }));
   const alerts = listWorkspace(db, 'alert-rule').flatMap(({ definition }) => {
     if (definition.active === false || !['stocks', 'screen'].includes(definition.type)) return [];
     const screen = definition.type === 'screen' ? getWorkspace(db, 'screen', definition.screenId)?.definition : definition;
@@ -2995,7 +2998,8 @@ export function createService({ db, provider, journalClient, workers = true, pre
         if (!item && method === 'GET') return response([...defaults, ...listWorkspace(db, kind)]);
         if (!item && method === 'POST') {
           const saved = storeWorkspace(db, kind, { name: body.name, definition: workspaceDefinition(kind, body) });
-          if (preparedOnly && ['screen', 'universe', 'ranking-model', 'theme', 'alert-rule', 'health-model'].includes(kind)) {
+          if (preparedOnly && ['screen', 'universe', 'ranking-model', 'theme', 'alert-rule', 'health-model'].includes(kind)
+              && (kind !== 'screen' || !isPreparedQueryScreen(saved.definition))) {
             scheduledPreparation = null;
             prepareStandard();
           }

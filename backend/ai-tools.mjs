@@ -1,6 +1,7 @@
 import * as z from 'zod/v4';
 import { BREADTH_METRICS } from './breadth.mjs';
-import { researchEndpoints } from './ai-access.mjs';
+import { researchEndpoints, workspaceCreateScope } from './ai-access.mjs';
+import { PREPARED_QUERY_FIELDS } from './prepared-query-screen.mjs';
 
 const date = z.iso.date().refine((value) => value >= '1900-01-01', 'Dates start in 1900');
 const label = z.string().min(1).max(180);
@@ -14,14 +15,8 @@ const levels = z.enum(['sector', 'industry', 'subindustry', 'theme']);
 const metrics = z.enum([...BREADTH_METRICS.map(({ key }) => key), 'down_13pct_34d', 'up_13pct_34d']);
 const marketMetrics = z.union([metrics, z.enum(['adSpread', 'adRatio'])]);
 
-export const stockFields = [
-  'securityId', 'symbol', 'name', 'exchange', 'type', 'sector', 'industry', 'industryId', 'subindustry', 'traded', 'close', 'open', 'high', 'low',
-  'volume', 'dollarVolume', 'market_cap', 'float', 'shares', 'floatDate', 'floatKnownAt', 'sharesDate', 'sharesKnownAt', 'return_1d', 'return_5d', 'return_10d', 'return_20d', 'return_21d',
-  'return_42d', 'return_63d', 'return_126d', 'return_252d', 'relative_return_21d', 'distance_high_252d', 'adv_20d', 'rvol_20d', 'udv_50d',
-  'udv_state_50d', 'rsScore', 'rsRank', 'rsPercentile', 'velocity4w', 'velocity12w', 'rankChange4w', 'rankChange12w', 'industryRS',
-  'industryBreadth', 'industryVelocity', 'above_20d', 'above_50d', 'above_100d', 'above_200d', 'new_high_20d', 'new_low_20d', 'new_high_252d',
-  'new_low_252d', 'ma_50_above_200', 'ma_rising_50', 'ma_rising_200', 'ma_aligned', 'obv_slope', 'marketCapBucket',
-];
+export const stockFields = PREPARED_QUERY_FIELDS;
+export const stockColumns = ['securityId', 'symbol', 'name', 'sector', 'industry', 'close', 'return_21d', 'rsRank', 'rsPercentile'];
 const stock = z.enum(stockFields);
 const fields = z.array(stock).min(1).max(20);
 const scalar = z.union([z.string().max(180), z.number(), z.boolean(), z.null()]);
@@ -50,6 +45,33 @@ const result = z.object({
 const entry = (name, description, shape, scope = 'research:read') => ({
   name, description, scope, input: z.strictObject(shape), output: result,
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+});
+const printable = /^[^\u0000-\u001f\u007f]+$/;
+const createShape = {
+  name: z.string().trim().min(1).max(100).regex(printable),
+  idempotencyKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/).describe('Reuse this key when retrying the same creation request.'),
+};
+const comparable = z.union([z.string().max(180), z.number(), z.boolean()]);
+const orderedValue = z.union([z.number(), date]);
+const interval = z.union([z.tuple([z.number(), z.number()]), z.tuple([date, date])])
+  .refine(([low, high]) => low <= high, 'Put the lower bound first');
+const savedFilter = z.discriminatedUnion('op', [
+  z.strictObject({ field: stock, op: z.enum(['eq', 'ne']), value: comparable }),
+  z.strictObject({ field: stock, op: z.enum(['gt', 'gte', 'lt', 'lte']), value: orderedValue }),
+  z.strictObject({ field: stock, op: z.literal('in'), value: z.array(comparable).min(1).max(30) }),
+  z.strictObject({ field: stock, op: z.literal('contains'), value: z.string().min(1).max(180) }),
+  z.strictObject({ field: stock, op: z.literal('between'), value: interval }),
+  z.strictObject({ field: stock, op: z.enum(['missing', 'present', 'true', 'false']), value: z.null().optional() }),
+]);
+const writeResult = result.extend({
+  state: z.literal('created'), context: z.null(), data: z.object({ saved: z.object({
+    kind: z.enum(['watchlist', 'screen']), id: z.uuid(), version, name: label, definition: dataObject,
+    created_at: z.iso.datetime(), updated_at: z.iso.datetime(), deleted: z.literal(0),
+  }) }),
+});
+const writeEntry = (name, description, shape) => ({
+  ...entry(name, description, { ...createShape, ...shape }, workspaceCreateScope), output: writeResult,
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 });
 
 export const researchTools = [
@@ -99,6 +121,14 @@ export const researchTools = [
   entry('read_journals', 'Read previously generated private market journals. Explicit as-of and end dates enforce historical New York calendar-day availability. Provider settings, prompts and keys are excluded.', {
     context, from: date.optional(), to: date.optional(), includeRetrospective: z.boolean().optional(), ...page,
   }, 'research:journals'),
+  writeEntry('create_watchlist', 'Create a manual workspace watchlist from current unambiguous tickers or permanent security IDs. Every supplied member must resolve.', {
+    members: z.array(z.string().trim().min(1).max(180).regex(printable)).max(200),
+  }),
+  writeEntry('create_screen', 'Create a saved workspace screen using typed comparisons on already prepared stock fields. The screen follows the latest session.', {
+    filters: z.array(savedFilter).max(12).optional(), combine: z.enum(['and', 'or']).optional(),
+    sort: z.array(sort).min(1).max(4).optional(), fields: fields.optional(), q: z.string().trim().max(100).optional(),
+    includeUntraded: z.boolean().optional(),
+  }),
 ];
 
 export function availableTools(principal) {
@@ -113,13 +143,14 @@ export function toolManifest(principal) {
 }
 
 export function researchOpenApi(principal) {
-  const paths = Object.fromEntries(toolManifest(principal).map(({ name, description, inputSchema, outputSchema }) => [
+  const paths = Object.fromEntries(toolManifest(principal).map(({ name, description, inputSchema, outputSchema, annotations }) => [
     `${researchEndpoints.tools}/${name}`, {
       post: { operationId: name, description, requestBody: { required: true, content: { 'application/json': { schema: inputSchema } } },
         responses: { 200: { description: 'Structured research result', content: { 'application/json': { schema: outputSchema } } },
           400: { description: 'Invalid tool arguments' }, 401: { description: 'Research bearer required' },
           403: { description: 'Integration does not have the required scope' }, 404: { description: 'Requested item unavailable' },
-          503: { description: 'Verified data or requested preparation unavailable' } } },
+          ...(!annotations.readOnlyHint && { 409: { description: 'Idempotency key was used with a different creation request' } }),
+          503: { description: annotations.readOnlyHint ? 'Verified data or requested preparation unavailable' : 'Workspace creation unavailable' } } },
     },
   ]));
   return { openapi: '3.1.0', info: { title: 'Market Intelligence Research', version: '1.0.0' },

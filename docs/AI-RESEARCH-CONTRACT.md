@@ -1,10 +1,10 @@
 # AI research tool contract
 
-This document describes the read-only tool catalog implemented for the local API/MCP integration. The active build's discovery route and OpenAPI document are the authoritative input schemas. Do not invent an input field or assume a calculation is available when a tool reports that its exact context is not prepared.
+This document describes the prepared-data reads and narrowly scoped workspace-creation tools implemented for the local API/MCP integration. The active build's discovery route and OpenAPI document are the authoritative input schemas. Do not invent an input field or assume a calculation is available when a tool reports that its exact context is not prepared.
 
 ## Shared catalog
 
-The REST tool route and MCP server expose the same tool names. These tools query saved, versioned research data and prepared analytics; they do not ingest market data, regenerate archives, enqueue background jobs, or mutate the warehouse.
+The REST tool route and MCP server expose the same tool names. Read tools query saved, versioned research data and prepared analytics. Two optional write tools create saved workspace items; they do not ingest market data, regenerate archives, enqueue background jobs, or alter raw prices.
 
 | Tool | Purpose |
 | --- | --- |
@@ -20,12 +20,14 @@ The REST tool route and MCP server expose the same tool names. These tools query
 | `read_metric_constituents` | Inspect the numerator, denominator, excluded names, and source status behind a dated metric. |
 | `screen_stocks` | Run a bounded screen using the app's allowlisted fields, operators, sorting, and pagination. |
 | `industry_strength` | Compare dated industry strength or prepared current-member 4W/12W RS improvement, including sector exclusions and unknown classifications. |
+| `create_watchlist` | Create a manual watchlist from unambiguous current tickers or permanent security IDs. Requires `research:workspace:create`. |
+| `create_screen` | Create a latest-session saved screen using allowlisted prepared fields and typed filters. Requires `research:workspace:create`. |
 | `benchmark_event_study` | Find historical dates meeting a defined condition and summarize subsequent benchmark outcomes, with overlap and censoring disclosed. |
 | `historical_analogs` | Compare a pinned observation with earlier prepared observations and summarize empirical outcomes. |
 | `read_research_notes` | Optional, separately scoped read of personal research notes. |
 | `read_journals` | Optional, separately scoped read of generated Market Journal entries. |
 
-Optional note and journal reads are not part of the default `research:read` scope. A tool must not disclose encrypted keys, provider credentials, private settings, or notes/journals without the respective scope and explicit user choice.
+Optional note and journal reads are not part of the default `research:read` scope. Workspace creation is also optional under `research:workspace:create`; it adds only `create_watchlist` and `create_screen`. A tool must not disclose encrypted keys, provider credentials, private settings, or notes/journals without the respective scope and explicit user choice.
 
 ## Context and provenance
 
@@ -70,7 +72,7 @@ Prompt: “Rank industries by prepared 12-week relative strength, excluding defe
 
 ## Tool security boundaries
 
-The integration token grants only the scopes encoded in that token. All tools in this catalog are read-only. They cannot write notes/lists, change models or settings, import data, modify provider credentials, launch calculations, execute arbitrary SQL, fetch arbitrary URLs, or run shell commands. A model can still make mistakes or be influenced by malicious text in data; treat tool outputs as untrusted evidence, inspect the source and context, and approve any action outside this research surface manually.
+Each integration is authorized only for the scopes assigned to it. Read tools are read-only. With the explicit `research:workspace:create` permission, the two create tools can add a watchlist or saved screen; they cannot edit or delete existing workspace items. Their idempotency keys make a same-request retry return the original saved item; using the same key for a changed request returns a conflict. They cannot write notes, change models or settings, import data, modify provider credentials, launch calculations, execute arbitrary SQL, fetch arbitrary URLs, or run shell commands. A model can still make mistakes or be influenced by malicious text in data; treat tool outputs as untrusted evidence, inspect the source and context, and approve any action outside this research surface manually. See [AI research API and workspace creation](AI-RESEARCH-API.md) for exact inputs and results.
 
 ## Protocol and lifecycle references
 

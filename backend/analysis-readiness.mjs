@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { independentPreparedQueryScreens } from './prepared-query-screen.mjs';
 import { expectedSessions, isMarketSession, shiftDate } from './calendar.mjs';
 import { isoDate } from './database.mjs';
 import { reusableArchiveVersions, usableArchiveRow } from './archive-lineage.mjs';
@@ -29,8 +30,9 @@ const hasTable = (db, table) => !!db.prepare("SELECT 1 FROM main.sqlite_schema W
 export const isAnalysisCalculationJob = (type) => calculationJobs.has(type);
 
 // Versions come from the same workspace inputs used to build preparation recipes.
-// Books, notes, manual lists and frozen cohort content are research records.
+// Books, notes, manual lists and independent prepared-data queries are research records.
 export function analysisWorkspaceScopeHash(db) {
+  const independentQueries = independentPreparedQueryScreens(db);
   const definitions = hasTable(db, 'workspace') ? db.prepare(`
     SELECT a.kind, a.id, a.version FROM workspace a
     WHERE a.kind IN (SELECT value FROM json_each(?)) AND a.deleted=0
@@ -38,7 +40,8 @@ export function analysisWorkspaceScopeHash(db) {
       AND (a.kind<>'alert-rule' OR (json_extract(a.definition,'$.type') IN ('stocks','screen')
         AND json_extract(a.definition,'$.active') IS NOT 0))
     ORDER BY a.kind, a.id
-  `).all(JSON.stringify(scopeKinds)).map(({ kind, id, version }) => [kind, id, version]) : [];
+  `).all(JSON.stringify(scopeKinds)).filter(({ kind, id, version }) => kind !== 'screen' || independentQueries.get(id) !== version)
+    .map(({ kind, id, version }) => [kind, id, version]) : [];
   const registered = hasTable(db, 'preparation_definitions')
     ? db.prepare('SELECT id FROM preparation_definitions ORDER BY id').all().map(({ id }) => id) : [];
   return hash(['analysis-scope-1', definitions, registered]);

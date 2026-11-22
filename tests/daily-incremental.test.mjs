@@ -6,6 +6,7 @@ import { analysisWorkspaceScopeHash, dailyAnalysisParent, readAnalysisReadiness 
 import { prepareBatchedSnapshots } from '../backend/batch-preparation.mjs';
 import { expectedSessions } from '../backend/calendar.mjs';
 import { CALCULATION_VERSION, createJob, dataVersion, importDataset, jobById, openDatabase, recordDailyPublication, storeWorkspace, updateJob } from '../backend/database.mjs';
+import { PREPARED_QUERY_MODE } from '../backend/prepared-query-screen.mjs';
 import { createEngine } from '../backend/engine.mjs';
 import { batchPreparationSpecs, preparationSpecs, registerPreparation } from '../backend/preparation.mjs';
 import { createPreparedDetailWriter, readPreparedDetail } from '../backend/prepared-details.mjs';
@@ -259,6 +260,13 @@ test('scheduled clean append reads prepared inputs, writes only new products, an
   assert.equal(readiness.state, 'ready');
   assert.equal(readiness.publicationId, publicationId);
   assert.equal(readiness.sessions, 1261);
+  const savedQueryScope = analysisWorkspaceScopeHash(db);
+  storeWorkspace(db, 'screen', { name: 'Daily prepared leaders', definition: {
+    preparationMode: PREPARED_QUERY_MODE, dateMode: 'latest', context: {}, filter: null,
+    sort: [{ field: 'rsRank', direction: 'asc' }], columns: ['symbol'], search: '', includeUntraded: false,
+  } }, 'daily-prepared-leaders');
+  assert.equal(analysisWorkspaceScopeHash(db), savedQueryScope);
+  assert.deepEqual(readAnalysisReadiness(db, first.point), readiness);
   const oldest = db.prepare('SELECT min(date) AS oldest FROM prepared_snapshot_contexts WHERE data_version=?').get(first.point.dataVersion).oldest;
   assert.equal(oldest, anchor);
   const child = await scheduled(db, through + 2);

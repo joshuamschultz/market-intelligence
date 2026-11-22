@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { createResearchAccess, isResearchAuthorization } from '../backend/ai-access.mjs';
+import { createResearchAccess, isResearchAuthorization, workspaceCreateScope } from '../backend/ai-access.mjs';
 
 test('dedicated integration credentials store only a digest, preserve private scopes and can be revoked', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'market research access '));
@@ -33,4 +33,23 @@ test('dedicated integration credentials store only a digest, preserve private sc
   assert.ok(second.revoke(integration.id).integration.revokedAt);
   assert.equal(access.authenticate(token), null);
   assert.equal(access.list().integrations.length, 1);
+});
+
+test('scope edits preserve the integration ID, digest and timestamps, and cannot reenable a revoked token', (t) => {
+  const access = createResearchAccess({ filename: ':memory:' });
+  t.after(() => access.close());
+  const { integration, token } = access.create({ name: 'Scope edit', scopes: ['research:notes'] });
+  const other = access.create({ name: 'Existing read-only' });
+  for (const invalid of [{}, { scopes: null }, { scopes: ['admin'] }, { scopes: [], name: 'Changed' }, { name: 'Changed' }]) {
+    assert.throws(() => access.update(integration.id, invalid), { status: 400 });
+  }
+  const scopes = ['research:notes', workspaceCreateScope];
+  assert.deepEqual(access.update(integration.id, { scopes }), { integration: { ...integration, scopes: ['research:read', ...scopes] } });
+  assert.deepEqual(access.authenticate(token).scopes, ['research:read', ...scopes]);
+  assert.deepEqual(access.authenticate(other.token), other.integration);
+  assert.deepEqual(access.update(integration.id, { scopes: ['research:notes'] }), { integration });
+  assert.deepEqual(access.authenticate(token), integration);
+  access.revoke(integration.id);
+  assert.throws(() => access.update(integration.id, { scopes }), { status: 404 });
+  assert.equal(access.authenticate(token), null);
 });

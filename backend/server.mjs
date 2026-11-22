@@ -13,6 +13,7 @@ import { runningRelease } from '../scripts/release.mjs';
 import { createResearchAccess, isResearchAuthorization } from './ai-access.mjs';
 import { createResearchHttp, researchRequestBytes } from './ai-mcp.mjs';
 import { createResearchEngine } from './ai-research.mjs';
+import { createResearchWorkspaceWriter } from './ai-workspace-writes.mjs';
 
 const publicDir = fileURLToPath(new URL('../frontend/', import.meta.url));
 const backendDir = fileURLToPath(new URL('./', import.meta.url));
@@ -122,6 +123,7 @@ export function createHandler({ service, token = '', host = '127.0.0.1', researc
             if (req.method === 'POST') return json(201, access.create(await readBody(req, researchRequestBytes)));
           }
           const id = /^\/api\/v1\/research-access\/([^/]+)$/.exec(pathname)?.[1];
+          if (id && req.method === 'PATCH') return json(200, access.update(id, await readBody(req, researchRequestBytes)));
           if (id && req.method === 'DELETE') return json(200, access.revoke(id));
           return json(405, { error: 'Research access method is unavailable' });
         }
@@ -277,7 +279,8 @@ export function startServer() {
   const researchDb = warehouse ? new DatabaseSync(warehouse, { readOnly: true }) : db;
   if (researchDb !== db) researchDb.exec('PRAGMA busy_timeout=5000');
   const access = createResearchAccess({ filename: warehouse ? `${warehouse}.research-access.sqlite` : ':memory:' });
-  const research = createResearchEngine(researchDb);
+  const workspaceWriter = warehouse ? createResearchWorkspaceWriter(warehouse) : null;
+  const research = createResearchEngine(researchDb, { workspaceWriter });
   const workspace = release ? resolve(codeRoot, '../../..') : codeRoot;
   const researchRuntime = { command: process.execPath, scriptPath: resolve(workspace, 'scripts/research-mcp.mjs'), database: warehouse };
   const server = createServer(createHandler({ service, token, host, research, access, researchRuntime }));

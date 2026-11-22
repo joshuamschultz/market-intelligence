@@ -26,7 +26,7 @@
 .ai-connections-scope label input { margin: 0; }
 .ai-connections-scope p { margin: 2px 0 0 21px; }
 
-.ai-connections-issued, .ai-connections-revoke {
+.ai-connections-issued, .ai-connections-revoke, .ai-connections-edit {
   margin-top: 14px;
   padding: 12px;
   background: var(--surface-raised);

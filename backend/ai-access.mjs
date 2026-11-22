@@ -2,10 +2,12 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { closeSync, existsSync, lstatSync, openSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
+export const workspaceCreateScope = 'research:workspace:create';
 export const researchScopes = [
   { id: 'research:read', label: 'Read market research', required: true },
   { id: 'research:notes', label: 'Read private research notes', required: false },
   { id: 'research:journals', label: 'Read private market journals', required: false },
+  { id: workspaceCreateScope, label: 'Create watchlists and saved screens', required: false },
 ];
 export const researchEndpoints = {
   tools: '/research/v1/tools', openapi: '/research/v1/openapi.json', mcp: '/mcp',
@@ -19,6 +21,13 @@ const record = ({ id, name, scopes, created_at, revoked_at }) => ({
   id, name, scopes: JSON.parse(scopes), createdAt: created_at, revokedAt: revoked_at,
 });
 const error = (message, status = 400) => Object.assign(new Error(message), { status });
+
+function validateScopes(scopes) {
+  if (!Array.isArray(scopes) || scopes.length > researchScopes.length || scopes.some((scope) => !allowedScopes.has(scope))) {
+    throw error('Choose supported research scopes');
+  }
+  return JSON.stringify([...new Set(['research:read', ...scopes])]);
+}
 
 export const researchTokenFromHeader = (header) => /^Bearer (\S+)$/i.exec(header || '')?.[1];
 export function isResearchAuthorization(header) {
@@ -77,20 +86,29 @@ export function createResearchAccess({ filename, now = () => new Date() } = {}) 
           Object.keys(input).some((key) => !['name', 'scopes'].includes(key))) throw error('Provide a name and optional research scopes');
       const name = typeof input.name === 'string' ? input.name.trim() : '';
       if (!name || name.length > 100 || /[\u0000-\u001f\u007f]/.test(name)) throw error('Choose an integration name from 1 to 100 characters');
-      const scopes = input.scopes ?? [];
-      if (!Array.isArray(scopes) || scopes.length > researchScopes.length || scopes.some((scope) => !allowedScopes.has(scope))) {
-        throw error('Choose supported research scopes');
-      }
+      const scopes = validateScopes(input.scopes ?? []);
       const id = randomUUID();
       const token = `${prefix}${id}.${randomBytes(32).toString('base64url')}`;
-      const scopeList = [...new Set(['research:read', ...scopes])];
       return withStore(true, (db) => {
         if (db.prepare('SELECT count(*) AS count FROM integrations WHERE revoked_at IS NULL').get().count >= 100) {
           throw error('Revoke an existing integration before creating another', 409);
         }
         const row = db.prepare('INSERT INTO integrations VALUES (?,?,?,?,?,NULL) RETURNING id,name,scopes,created_at,revoked_at')
-          .get(id, name, JSON.stringify(scopeList), digest(token), now().toISOString());
+          .get(id, name, scopes, digest(token), now().toISOString());
         return { integration: record(row), token };
+      });
+    },
+    update(id, input) {
+      if (!idPattern.test(id)) throw error('Integration not found', 404);
+      if (!input || Array.isArray(input) || typeof input !== 'object' || Object.keys(input).length !== 1 || !Object.hasOwn(input, 'scopes')) {
+        throw error('Provide research scopes only');
+      }
+      const scopes = validateScopes(input.scopes);
+      return withStore(true, (db) => {
+        const row = db.prepare(`UPDATE integrations SET scopes=? WHERE id=? AND revoked_at IS NULL
+          RETURNING id,name,scopes,created_at,revoked_at`).get(scopes, id);
+        if (!row) throw error('Active integration not found', 404);
+        return { integration: record(row) };
       });
     },
     revoke(id) {

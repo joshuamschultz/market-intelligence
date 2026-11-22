@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { analysisWorkspaceScopeHash, readAnalysisReadiness } from '../backend/analysis-readiness.mjs';
+import { PREPARED_QUERY_MODE } from '../backend/prepared-query-screen.mjs';
 import { expectedSessions } from '../backend/calendar.mjs';
 import { CALCULATION_VERSION, createJob, openDatabase, storeWorkspace, updateJob } from '../backend/database.mjs';
 import { createService } from '../backend/service.mjs';
@@ -147,4 +148,16 @@ test('service reports whole-generation readiness separately on a warehouse statu
   assert.deepEqual(body.analysisReadiness, { date: null, dataVersion: 0, calculationVersion: CALCULATION_VERSION,
     state: 'incomplete', reason: 'no_source_data' });
   assert.equal(db.prepare('SELECT total_changes() AS changes').get().changes, before);
+});
+
+
+test('a prepared-data saved query preserves a verified publication until it gains calculation dependencies', (t) => {
+  const db = fixture(t);
+  const id = publication(db);
+  const definition = { preparationMode: PREPARED_QUERY_MODE, dateMode: 'latest', context: {}, filter: null,
+    sort: [{ field: 'rsRank', direction: 'asc' }], columns: ['symbol'], search: '', includeUntraded: false };
+  storeWorkspace(db, 'screen', { name: 'Prepared leaders', definition }, 'prepared-leaders');
+  assert.equal(readAnalysisReadiness(db, point).publicationId, id);
+  storeWorkspace(db, 'screen', { name: 'Advanced leaders', definition: { ...definition, context: { windows: [73] } } }, 'prepared-leaders');
+  assert.equal(readAnalysisReadiness(db, point).state, 'incomplete');
 });
