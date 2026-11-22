@@ -6,7 +6,7 @@ A local, data-versioned research workspace for U.S. stock leadership, relative s
 
 ## Current status
 
-Immutable R11 / app 0.2.1 is live; check `/api/v1/build` and `data/active-release.json` for the active build. The development warehouse is preparing calculation `2-081` across five years / 1,260 sessions; it has exceeded 600 seconds and remains unpublished, so the ten-minute target is not met. See [Remaining work](docs/REMAINING-WORK.md) and [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md) for the gate and validation status.
+Immutable R12 / app 0.2.2 is live with calculation `2-be44dec1f429`; check `/api/v1/build` and `data/active-release.json` for the active build. Bounded verification of the previously saved five-year `2-081` output is in progress; it remains unpublished, and the ten-minute target is not met. See [Remaining work](docs/REMAINING-WORK.md) and [Performance acceptance](docs/PERFORMANCE-ACCEPTANCE.md) for current readiness and validation status.
 
 ## From market context to a saved review
 
@@ -75,7 +75,7 @@ npm run check
 npm test
 ```
 
-A clean checkout passed `npm ci`, `npm run check`, and an isolated empty-warehouse startup smoke test. The final full suite passed 300/300 tests. All-screen native review and full five-year performance acceptance remain pending. Use the active release manifest and validation log for current build results. Cached page timings do not establish cold-history calculation performance.
+A clean checkout passed `npm ci`, `npm run check`, and an isolated empty-warehouse startup smoke test. The earlier source snapshot passed 300/300 tests; the current source-index snapshot passed 316/316 and `npm run check`. All-screen native review and full five-year performance acceptance remain pending. Use the active release manifest and validation log for current build results. Cached page timings do not establish cold-history calculation performance.
 
 The project uses a Node/browser modular monolith with durable SQLite WAL storage. The `data/` directory contains local databases, raw captures, logs, backups, and derived outputs; it is ignored by Git and should be treated as private workspace state. The browser UI and source warehouse are local, but an explicitly requested Claude generation sends the selected market context to Anthropic. Follow [Operations](docs/OPERATIONS.md) before importing, restoring, or archiving data.
 

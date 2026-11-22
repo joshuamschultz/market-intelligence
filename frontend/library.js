@@ -7,6 +7,7 @@ import { loadUniverseCounts, universeCountFacts, universeDefinition } from './co
 import { modelEditor } from './screener.js';
 import { mountJournalSettings } from './journal.js';
 import { mountQualityAudit } from './data-quality.js';
+import { setTickerPreviewContext } from './ticker-preview.js';
 
 const rateKeys = ['close', 'return_1d', 'return_21d', 'rsRank', 'rsPercentile', 'velocity4w', 'udv_50d'];
 const listColumns = ['symbol', 'name', ...rateKeys];
@@ -209,7 +210,8 @@ async function renderWatchlists(env) {
   const currentScreen = env.config.screens.find(({id})=>id===selected?.definition?.screenId);
   const dynamic = !!selected?.definition?.screenId;
   const source = currentScreen?.definition;
-  const fixed = source && savedScreenRoute(source).date;
+  const sourceContext = source ? savedScreenRoute(source) : {};
+  const fixed = sourceContext.date;
   env.state.live = !!source && !fixed;
   if (env.state.selectedList !== selected?.id) {
     env.state.selectedList = selected?.id;
@@ -225,6 +227,9 @@ async function renderWatchlists(env) {
       if (!target.isConnected) return;
       const lastPage = Math.max(1, Math.ceil(result.total / result.perPage));
       if (env.state.page > lastPage) { env.state.page = lastPage; return load(); }
+      setTickerPreviewContext(target, { ...env.snapshotContext, ...sourceContext,
+        date: result.date || fixed || env.snapshotContext.date,
+        dataVersion: result.dataVersion ?? sourceContext.dataVersion ?? env.snapshotContext.dataVersion });
       target.innerHTML = (result.unavailable?.length ? notice('Some members are unavailable', `${count(result.unavailable.length)} saved securities fall outside the selected universe or session.`) : '') +
         (result.date ? `<p class="muted">Session ${safe(dateLabel(result.date))}${result.period ? ` · ${count(result.period.comparable)} period-comparable stocks` : ''}</p>` : '') +
         table(result.rows, result.period ? ['symbol','name','periodRank','periodPercentile','periodReturn',...rateKeys] : listColumns,

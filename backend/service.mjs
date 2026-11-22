@@ -23,6 +23,7 @@ import { parquetAvailable, parquetBackup, parquetRows } from './parquet.mjs';
 import { materializeHistory, readMaterializedHistory } from './materialization.mjs';
 import { precomputeProduction, precomputeWorkspace } from './precompute.mjs';
 import { createPreparedDetailWriter, detailRiskWindows, prepareDetailsBatch, readPreparedDetail, riskMetrics } from './prepared-details.mjs';
+import { tickerChart } from './ticker-chart.mjs';
 import { hasPreparedSnapshot, preparedSnapshotDates, readPreparedSnapshot } from './prepared-snapshots.mjs';
 import { batchPreparationSpecs, enqueuePreparation, preparationInput, preparationSpecs, preparationStatus, preparationSuperseded, preparationType, readPreparedRanks,
   recentPreparationSessions, registerPreparation, registeredPreparations, requirePreparationSpace, runPreparation } from './preparation.mjs';
@@ -2584,6 +2585,10 @@ export function createService({ db, provider, journalClient, workers = true, pre
       }
       if (area === 'stocks' && method === 'GET' && item) {
         const config = asContext();
+        if (action === 'chart') {
+          if (sub) return response({ error: 'Route not found' }, 404);
+          return response(tickerChart(db, config, requireStockIdentity(db, config, item), parseCount(query.lookback, 1, 126, 63)));
+        }
         if (item === 'search' && !action) return response({ date: config.date, dataVersion: config.dataVersion,
           rows: securitySearch(db, config, String(query.q || '').trim().slice(0, 100), parseCount(query.limit, 1, 25, 12)) });
         if (action === 'screens') {

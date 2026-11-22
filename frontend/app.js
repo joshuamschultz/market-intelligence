@@ -4,6 +4,7 @@ import {
 import { exportChart } from './charts.js';
 import { industryDataExplanation, industryDataNames, openCoverageDrawer, priceProvider, universeDefinition } from './coverage.js';
 import { helpTopic, loadHelp, searchHelp } from './help.js';
+import { mountTickerPreview, setTickerPreviewContext } from './ticker-preview.js';
 
 const viewModules = {
   overview: () => import('./overview.js'),
@@ -202,6 +203,16 @@ function snapshotContext() {
   return { ...context, ...(dataVersion == null ? {} : { dataVersion }), ...(liveListDate ? { date: liveListDate } : {}) };
 }
 
+const tickerPreview = mountTickerPreview({
+  api,
+  getContext() {
+    const context = snapshotContext();
+    return { ...context, date: context.date || analysisStatus?.latestDate,
+      calculationVersion: config?.status?.calculationVersion };
+  },
+  getGeneration: () => generation,
+});
+
 function toast(message) {
   clearTimeout(feedbackTimer);
   feedback.textContent = message;
@@ -211,6 +222,7 @@ function toast(message) {
 
 const analysisStorageKey = 'market-intelligence.analysis-revision';
 function applyAnalysisStatus(status) {
+  tickerPreview.reset();
   analysisStatus = { ...status, appliedAt: status.appliedAt || Date.now() };
   try {
     window.sessionStorage.setItem(analysisStorageKey, JSON.stringify({
@@ -642,6 +654,7 @@ function makeEnvironment(signal) {
 
 let controller;
 async function render({ reload = false } = {}) {
+  tickerPreview.reset();
   const current = ++generation;
   controller?.abort();
   controller = new AbortController();
@@ -741,6 +754,7 @@ function searchDialog(opener = searchButton) {
   };
   function paint() {
     if (!isOpen()) return;
+    setTickerPreviewContext(target, point);
     const items = {
       stocks,
       pages: Object.entries(names).filter(([id, name]) => id !== 'stock' && matches(name))
@@ -757,7 +771,7 @@ function searchDialog(opener = searchButton) {
           const index = options.length;
           options.push({ ...entry, kind, key: `${kind}:${entry.id}:${entry.anchor || ''}` });
           return `<button type="button" class="search-option" role="option" tabindex="-1" aria-selected="false" id="workspace-option-${index}"
-            data-search-index="${index}" data-search-kind="${kind}"><strong>${safe(entry.title)}</strong>${entry.description ? `<span>${safe(entry.description)}</span>` : ''}</button>`;
+            data-search-index="${index}" data-search-kind="${kind}"${attr('data-ticker-preview', kind === 'stocks' ? entry.id : null)}><strong>${safe(entry.title)}</strong>${entry.description ? `<span>${safe(entry.description)}</span>` : ''}</button>`;
         }).join('')}</section>`).join('');
     input.setAttribute('aria-expanded', String(options.length > 0));
     select(options.some(({ key }) => key === selected) ? selected : null);
@@ -856,7 +870,9 @@ function searchDialog(opener = searchButton) {
     const next = index < 0 ? (event.key === 'ArrowDown' ? 0 : options.length - 1)
       : (index + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length;
     select(options[next].key);
-    document.getElementById(`workspace-option-${next}`)?.scrollIntoView?.({ block: 'nearest' });
+    const option = document.getElementById(`workspace-option-${next}`);
+    option?.scrollIntoView?.({ block: 'nearest' });
+    tickerPreview.focusOption(option, input);
   });
   body.querySelector('form').addEventListener('submit', (event) => {
     event.preventDefault();

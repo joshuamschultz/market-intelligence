@@ -9,17 +9,16 @@ import { preparationDependencies, preparationSeedKey, prepareBatchedSnapshots } 
 import { expectedSessions, shiftDate } from '../backend/calendar.mjs';
 import { dataVersion, importDataset, listWorkspace, openDatabase, CALCULATION_VERSION } from '../backend/database.mjs';
 import { createEngine } from '../backend/engine.mjs';
-import { createMaterializedHistoryWriter, readMaterializedHistory } from '../backend/materialization.mjs';
-import { batchPreparationSpecs, compactWeeklySnapshot, preparationSpecs, verifyPreparedRankCoverage } from '../backend/preparation.mjs';
-import { createPreparedDetailWriter, readPreparedDetail } from '../backend/prepared-details.mjs';
-import { preparedSnapshotDates, readPreparedSnapshot, readPreparedSnapshotRankWitnesses } from '../backend/prepared-snapshots.mjs';
-import { prepareRangeHistoryBatch, prepareRangeMetrics, verifyPreparedExactRanges, verifyPreparedRangeHistory } from '../backend/range-metrics.mjs';
-import { createRiskHistoryWriter, normalizeRiskBenchmarks, normalizeRiskWindows, prepareRiskHistoryBatch, prepareRiskHistoryBenchmarks,
-  readRiskHistory, riskHistoryManifest } from '../backend/risk-history.mjs';
-import { preparationHistoryWarmup, preparationWorkspaceScopes, prepareNyseSummation, prepareStandardHealth, rangeContext, summationContext } from '../backend/service.mjs';
-import { decodeStoredJson, preparedCodec } from '../backend/storage-codec.mjs';
+import { createMaterializedHistoryWriter } from '../backend/materialization.mjs';
+import { compactWeeklySnapshot } from '../backend/preparation.mjs';
+import { createPreparedDetailWriter } from '../backend/prepared-details.mjs';
+import { prepareRangeHistoryBatch, prepareRangeMetrics } from '../backend/range-metrics.mjs';
+import { createRiskHistoryWriter, prepareRiskHistoryBatch, prepareRiskHistoryBenchmarks } from '../backend/risk-history.mjs';
+import { preparationHistoryWarmup, preparationWorkspaceScopes, prepareNyseSummation, prepareStandardHealth, summationContext } from '../backend/service.mjs';
+import { preparedCodec } from '../backend/storage-codec.mjs';
 import { readPreparedSummation } from '../backend/summation.mjs';
 import { topDecileIds } from '../backend/ranking.mjs';
+import { benchmarkContexts, benchmarkRecipeDigest, dateTiles, exactRangePlans, verifyBoundaryWindow, verifyCoreTile, verifyInstrumentProducts } from './pipeline-verification.mjs';
 import { preparationSourcePin } from '../backend/pipeline-shards.mjs';
 
 const { values: options } = parseArgs({ options: {
@@ -195,41 +194,6 @@ function copyMetadata(source, target, version) {
   }
 }
 
-function benchmarkContexts(source, engine, point, scopes = preparationWorkspaceScopes(source, engine, { date: point.date, version: point.dataVersion })) {
-  const { base, custom, rangeInputs } = scopes;
-  const specs = preparationSpecs(source, engine, base, { custom }).filter(({ phase }) => phase === 'history');
-  const available = batchPreparationSpecs(engine, specs).flatMap(({ contexts }) => contexts);
-  const variants = available.slice(0, contextLimit);
-  const ranges = new Map();
-  for (const input of rangeInputs) {
-    if (!input.rangeWindows?.length) continue;
-    let config;
-    try { config = rangeContext(engine, engine.context({ ...base, ...input })); } catch { continue; }
-    if (!config.date) continue;
-    const reference = config.referenceMode === 'latest' && config.date === config.latestDate ? config.observedReferenceDate : null;
-    const key = JSON.stringify([config.date, config.dataVersion, config.basis, reference]);
-    if (!ranges.has(key)) ranges.set(key, { config, windows: new Set() });
-    for (const window of input.rangeWindows) ranges.get(key).windows.add(window);
-  }
-  const rangePlans = [...ranges.values()].map(({ config, windows }) => ({ config, windows: [...windows].sort((a, b) => a - b) }));
-  return { configs: variants.map(({ context, rank }) => ({ config: engine.context(context), rank })),
-    availableContexts: available.length,
-    rangePlans, rangeWindows: [...new Set(rangePlans.flatMap(({ windows }) => windows))].sort((a, b) => a - b),
-    riskWindows: normalizeRiskWindows([...normalizeRiskWindows(), ...listWorkspace(source, 'stock-detail-preparation').map(({ definition }) => definition.lookback)]),
-    benchmarks: normalizeRiskBenchmarks(listWorkspace(source, 'stock-detail-preparation').map(({ definition }) => definition.benchmark), point.benchmark) };
-}
-
-function exactRangePlans(recipes, point, dates) {
-  const measured = new Set(dates);
-  return recipes.rangePlans.filter(({ config }) => config.basis !== 'reconstructed' ||
-    config.dataVersion !== point.dataVersion || !measured.has(config.date));
-}
-
-function benchmarkRecipeDigest(recipes, dates, prerequisites) {
-  return createHash('sha256').update(JSON.stringify({ calculationVersion: CALCULATION_VERSION,
-    recipes, dates, prerequisites, scope: options.scope, calibration: options.calibration })).digest('hex');
-}
-
 function measuredCorePayload(target, dates, revision) {
   const tables = ['prepared_snapshot_frames', 'prepared_snapshot_layouts', 'prepared_snapshot_blobs',
     'prepared_stock_base', 'prepared_rank_blocks', 'market_history', 'market_history_group_blocks'];
@@ -343,107 +307,15 @@ async function prepareCalibration(target, source, engine, point, dates, recipes,
   return { breadth, health, sum, nyse };
 }
 
-function verifyInstrumentRoster(target, source, config, dates, recipes, report) {
-  const roster = source.prepare(`SELECT id FROM securities WHERE EXISTS
-    (SELECT 1 FROM price_revisions WHERE security_id=securities.id AND version<=? AND date<=? LIMIT 1) ORDER BY id`)
-    .all(config.dataVersion, config.date).map(({ id }) => id);
-  const products = target.prepare(`SELECT security_id, blocks FROM prepared_detail_products
-    WHERE calculation_version=? AND basis=? AND data_version=? AND anchor_date=? ORDER BY security_id`);
-  const hasBlock = target.prepare('SELECT 1 FROM prepared_detail_blocks WHERE hash=?');
-  const linked = new Set();
-  let observed = 0;
-  for (const { security_id: id, blocks } of products.iterate(CALCULATION_VERSION, config.basis, config.dataVersion, config.date)) {
-    if (id !== roster[observed++]) throw new Error('Prepared ticker detail roster differs from the pinned price source');
-    const manifest = decodeStoredJson(blocks);
-    if (!Array.isArray(manifest)) throw new Error(`Invalid chart block manifest for ${id}`);
-    for (const block of manifest) {
-      if (linked.has(block.hash)) continue;
-      if (!hasBlock.get(block.hash)) throw new Error(`Missing ticker detail chart block for ${id}`);
-      linked.add(block.hash);
-    }
-  }
-  if (observed !== roster.length) throw new Error(`Prepared ticker detail roster is incomplete: ${observed}/${roster.length}`);
-  const risk = riskHistoryManifest(target, report.risk.runId);
-  const riskDates = dates.filter((date) => date >= report.riskFrom);
-  const benchmarks = [...recipes.benchmarks].sort();
-  const riskKeyCount = roster.length * riskDates.length * recipes.riskWindows.length * benchmarks.length;
-  const riskBlockCount = roster.length * (1 + benchmarks.length);
-  if (!risk?.done || risk.calculationVersion !== CALCULATION_VERSION || risk.basis !== config.basis || risk.dataVersion !== config.dataVersion ||
-      risk.date !== config.date || riskDates.join() !== risk.dates.join() || recipes.riskWindows.join() !== risk.windows.join() ||
-      benchmarks.join() !== risk.benchmarks.join() || risk.actualSecurities !== roster.length || risk.totalSecurities !== roster.length ||
-      risk.processedSecurities !== roster.length || risk.actualBlocks !== riskBlockCount || risk.riskBlocks !== riskBlockCount ||
-      risk.expectedBlocks !== riskBlockCount || risk.expectedKeys !== riskKeyCount || risk.riskKeys + risk.basisExclusions !== riskKeyCount) {
-    throw new Error('Prepared risk archive differs from its pinned roster, date, or coverage manifest');
-  }
-  const roles = ['', ...benchmarks];
-  let riskRows = 0;
-  for (const row of target.prepare(`SELECT security_id,benchmark FROM prepared_risk_history_blocks
-    WHERE run_id=? ORDER BY security_id,benchmark`).iterate(risk.runId)) {
-    if (row.security_id !== roster[Math.floor(riskRows / roles.length)] || row.benchmark !== roles[riskRows % roles.length]) {
-      throw new Error('Prepared risk blocks do not match every pinned security/benchmark key');
-    }
-    riskRows++;
-  }
-  if (riskRows !== riskBlockCount) throw new Error('Prepared risk blocks are incomplete');
-  return { risk, detailProducts: observed, detailChartBlocks: linked.size };
-}
-
 function verify(target, source, engine, point, dates, recipes, instrumentReport, calibration) {
-  const verified = { base: 0, velocity: 0, ranks: 0, history: 0, selectedStocks: 0, rankTradeIds: 0 };
-  const witnessCache = new Map();
-  const rankCache = new Map();
-  const sampleDates = [...new Set([dates[0], dates.at(-1)])];
-  for (const { config, rank } of recipes.configs) {
-    const selectedDates = dates.filter((date) => date <= config.date && date >= config.earliestDate);
-    const base = preparedSnapshotDates(target, engine, config, selectedDates).size;
-    const velocity = rank ? preparedSnapshotDates(target, engine, config, selectedDates, { velocity: true }).size : selectedDates.length;
-    const rankCoverage = rank ? verifyPreparedRankCoverage(target, config, selectedDates,
-      readPreparedSnapshotRankWitnesses(target, engine, config, selectedDates, witnessCache), rankCache) : null;
-    const ranks = rankCoverage?.dates ?? selectedDates.length;
-    const history = createMaterializedHistoryWriter(target, engine, config, selectedDates);
-    const thin = selectedDates.filter((date) => history.has(date)).length;
-    if ([base, velocity, ranks, thin].some((count) => count !== selectedDates.length)) throw new Error(`Reopened archive is incomplete for ${config.universe.id}/${config.model.id}`);
-    verified.base += base;
-    verified.velocity += rank ? velocity : 0;
-    verified.ranks += rank ? ranks : 0;
-    verified.rankTradeIds += rankCoverage?.tradedIds ?? 0;
-    verified.history += thin;
-    for (const date of sampleDates.filter((date) => selectedDates.includes(date))) {
-      const scoped = { ...config, date };
-      const snapshot = readPreparedSnapshot(target, engine, scoped, { velocity: rank,
-        ...(!options['full-readback'] && { stockFields: ['symbol', 'close', 'return_1d', 'rsRank', 'rsPercentile', 'industry'] }) });
-      const history = readMaterializedHistory(target, engine, config, { from: date, to: date, limit: 1 });
-      if (!snapshot || snapshot.date !== date || history.rows[0]?.date !== date || snapshot.stocks.length !== history.rows[0].coverage.listed) {
-        throw new Error(`Reopened sample did not match its prepared manifest on ${date}`);
-      }
-      verified.selectedStocks += snapshot.stocks.length;
-    }
+  const verified = {};
+  for (const tile of dateTiles(dates, 8)) {
+    const result = verifyCoreTile(target, engine, recipes.configs, tile, {
+      exact: false, sampleDates: [dates[0], dates.at(-1)], fullReadback: options['full-readback'] === true,
+    });
+    for (const [key, value] of Object.entries(result)) verified[key] = (verified[key] ?? 0) + value;
   }
-  verified.physicalRankDates = rankCache.size;
-  verified.physicalRankBlocks = [...rankCache.values()].reduce((count, row) => count + row.blocks, 0);
-  if (instrumentReport) {
-    const config = { ...point, referenceMode: 'as-of' };
-    const coverage = { pairs: 0, emptyPairs: 0, runs: 0, blocks: 0 };
-    for (let start = 0; start < recipes.rangeWindows.length; start += 16) {
-      const report = verifyPreparedRangeHistory(target, config, dates, recipes.rangeWindows.slice(start, start + 16), { sourceDb: source });
-      for (const [key, value] of Object.entries(report)) coverage[key] += value;
-    }
-    if (coverage.pairs !== dates.length * recipes.rangeWindows.length) throw new Error('Required range date/window coverage is incomplete');
-    coverage.exactPairs = 0;
-    for (const { config, windows } of exactRangePlans(recipes, point, dates)) {
-      for (let start = 0; start < windows.length; start += 16) {
-        coverage.exactPairs += verifyPreparedExactRanges(target, config, windows.slice(start, start + 16));
-      }
-    }
-    coverage.windows = recipes.rangeWindows;
-    const sample = engine.findSecurity(config, config.benchmark);
-    const id = sample?.id ?? sample?.securityId;
-    const detail = id && readPreparedDetail(target, config, id);
-    if (!detail?.detail && !detail?.chartBars) throw new Error('Reopened stock detail sample is unavailable');
-    const riskSample = readRiskHistory(target, config, id, { lookback: recipes.riskWindows[0] });
-    if (riskSample.state !== 'ready') throw new Error('Reopened risk sample is unavailable');
-    Object.assign(verified, verifyInstrumentRoster(target, source, config, dates, recipes, instrumentReport), { ranges: coverage });
-  }
+  if (instrumentReport) Object.assign(verified, verifyInstrumentProducts(target, source, engine, point, dates, recipes, instrumentReport));
   if (calibration) {
     const health = target.prepare("SELECT 1 FROM sqlite_schema WHERE name='prepared_health'").get()
       ? target.prepare('SELECT count(*) AS count FROM prepared_health WHERE data_version<=?').get(point.dataVersion).count : 0;
@@ -458,75 +330,16 @@ function verify(target, source, engine, point, dates, recipes, instrumentReport,
   return verified;
 }
 
-const stockVelocityFields = ['velocity1w', 'velocity4w', 'velocity12w', 'rankChange1w', 'rankChange4w', 'rankChange12w',
-  'industryVelocity', 'industryImproving', 'industryEmerging'];
-const groupVelocityFields = ['id', 'velocity4w', 'velocity12w', 'rankChange4w', 'rankChange12w', 'emerging'];
-const leaderFields = ['previousLeaderDate', 'leaderReturn', 'leaderReturnExpected', 'leaderReturnObservations',
-  'leadershipRankObservations', 'leadershipPersistence', 'leadershipTurnover'];
-
-function equalOracleVector(left, right) {
-  return left.length === right.length && left.every((value, index) => {
-    const expected = right[index];
-    return typeof value === 'number' && typeof expected === 'number'
-      ? Math.abs(value - expected) <= 1e-10 * Math.max(1, Math.abs(expected)) : value === expected;
-  });
-}
-
 function verifyBoundaryOracle(reader, engine, configurations, dates, prerequisites, sessionsPerShard) {
-  const boundaries = [];
-  for (let start = 0; start < dates.length; start += sessionsPerShard) {
-    boundaries.push(dates[start], dates[Math.min(start + sessionsPerShard, dates.length) - 1]);
+  const sampled = [...new Set(dateTiles(dates, sessionsPerShard).flatMap((shard) => [shard[0], shard.at(-1)]))];
+  const archiveDates = new Set([...dates, ...prerequisites]);
+  const verified = {};
+  for (const window of dateTiles(sampled, 8)) {
+    const result = verifyBoundaryWindow(reader, engine, configurations, window, archiveDates,
+      { directory: dirname(output), tileSize: Math.min(tileSize, 8), codec: options.codec, exact: false });
+    for (const [key, value] of Object.entries(result)) verified[key] = (verified[key] ?? 0) + value;
   }
-  const sampled = [...new Set(boundaries)];
-  const archivedDates = new Set([...dates, ...prerequisites]);
-  const previous = new Map(sampled.map((date) => [date, expectedSessions(shiftDate(date, -12), shiftDate(date, -1)).at(-1)]));
-  const priorDates = [...new Set([...previous.values()].filter((date) => archivedDates.has(date)))];
-  const oracle = openDatabase(':memory:');
-  const verified = { sessions: sampled.length, velocitySnapshots: 0, leaderContexts: 0, priorLeaderRosters: 0 };
-  try {
-    prepareBatchedSnapshots(oracle, engine, configurations, { dates: sampled, tileSize, codec: options.codec });
-    // Preserve the prior-leader roster in the independent output only where the
-    // measured archive also owns the preceding session or calibration seed.
-    const priorOnly = priorDates.filter((date) => !sampled.includes(date)).sort();
-    if (priorOnly.length) prepareBatchedSnapshots(oracle, engine,
-      configurations.map(({ config }) => ({ config, rank: false, historyOnly: true })), { dates: priorOnly, tileSize, codec: options.codec });
-    const pick = (item, fields) => fields.map((name) => item[name]);
-    for (const { config, rank } of configurations) {
-      const actualLeaders = createMaterializedHistoryWriter(reader, engine, config, []).previousLeaders(priorDates);
-      const expectedLeaders = createMaterializedHistoryWriter(oracle, engine, config, []).previousLeaders(priorDates);
-      for (const date of sampled.filter((date) => date >= config.earliestDate && date <= config.date)) {
-        const point = { ...config, date };
-        if (rank) {
-          const flags = { velocity: true, stockFields: stockVelocityFields };
-          const saved = readPreparedSnapshot(reader, engine, point, flags);
-          const baseline = readPreparedSnapshot(oracle, engine, point, flags);
-          const stockFields = ['securityId', ...stockVelocityFields];
-          if (!saved || !baseline || saved.stocks.length !== baseline.stocks.length || saved.groups.length !== baseline.groups.length ||
-            !saved.stocks.every((stock, index) => equalOracleVector(pick(stock, stockFields), pick(baseline.stocks[index], stockFields))) ||
-            !saved.groups.every((group, index) => equalOracleVector(pick(group, groupVelocityFields), pick(baseline.groups[index], groupVelocityFields)))) {
-            throw new Error(`Serial velocity oracle disagrees at shard boundary ${date} for ${config.universe.id}/${config.model.id}`);
-          }
-          verified.velocitySnapshots++;
-        }
-        const span = { from: date, to: date, limit: 1 };
-        const [actual] = readMaterializedHistory(reader, engine, config, span).rows;
-        const [expected] = readMaterializedHistory(oracle, engine, config, span).rows;
-        if (!actual || !expected || !equalOracleVector(pick(actual.aggregates, leaderFields), pick(expected.aggregates, leaderFields))) {
-          throw new Error(`Serial leader oracle disagrees at shard boundary ${date} for ${config.universe.id}/${config.model.id}`);
-        }
-        const prior = previous.get(date);
-        if (archivedDates.has(prior) && prior >= config.earliestDate) {
-          if (!actualLeaders.has(prior) || !expectedLeaders.has(prior) ||
-              !equalOracleVector(actualLeaders.get(prior), expectedLeaders.get(prior))) {
-            throw new Error(`Serial prior leader roster disagrees at shard boundary ${date}`);
-          }
-          verified.priorLeaderRosters++;
-        }
-        verified.leaderContexts++;
-      }
-    }
-    return verified;
-  } finally { oracle.close(); }
+  return verified;
 }
 
 const started = performance.now();
@@ -558,14 +371,14 @@ try {
     if (!dates.length) throw new Error('No available trading sessions in the requested benchmark range');
     if (options['five-year-gate'] && dates.length < fiveYearSessions) throw new Error(`The five-year gate requires ${fiveYearSessions} prepared market sessions`);
     copyMetadata(source, target, revision);
-    const recipes = benchmarkContexts(source, engine, point, scopes);
+    const recipes = benchmarkContexts(source, engine, point, scopes, { contextLimit });
     createMaterializedHistoryWriter(target, engine, recipes.configs[0].config, []);
     if (options['five-year-gate'] && recipes.configs.length !== recipes.availableContexts) {
       throw new Error('The five-year gate requires all available preparation recipes');
     }
     const first = calendar.indexOf(dates[0]);
     const prerequisites = options.scope === 'all' ? calendar.slice(Math.max(0, first - preparationHistoryWarmup(source)), first) : [];
-    const recipeDigest = benchmarkRecipeDigest(recipes, dates, prerequisites);
+    const recipeDigest = benchmarkRecipeDigest(recipes, dates, prerequisites, options);
     const pin = options.source ? preparationSourcePin(source, sourcePath, recipes.configs) : null;
     if (pin) sourceChecks.push({ point, dates, prerequisites, recipeDigest, pin });
     const checkBoundaries = workers > 1 && (options['boundary-oracle'] || options.calibration === 'full');
@@ -637,8 +450,8 @@ try {
   const sourceVersionAfter = dataVersion(source);
   if (options.source && sourceVersionBefore !== sourceVersionAfter) throw new Error('Source warehouse advanced during the benchmark; rerun with a stable source revision');
   for (const { point, dates, prerequisites, recipeDigest, pin } of sourceChecks) {
-    const current = benchmarkContexts(source, engine, point);
-    if (benchmarkRecipeDigest(current, dates, prerequisites) !== recipeDigest ||
+    const current = benchmarkContexts(source, engine, point, undefined, { contextLimit });
+    if (benchmarkRecipeDigest(current, dates, prerequisites, options) !== recipeDigest ||
         JSON.stringify(preparationSourcePin(source, sourcePath, current.configs)) !== JSON.stringify(pin)) {
       throw new Error('Pinned source lineage or workspace recipe changed during benchmark verification');
     }

@@ -1,7 +1,7 @@
 import {
   action, attr, bindHelpTooltips, bindObservedCoverage, breadthMoveHelp, breadthMoveKey, breadthMovePresets, chip, compact,
-  count, dateLabel, direction, empty, heading, helpField, helpTooltip, icon, iconButton, notice, number, numeric, option,
-  observedCoverageFields, observedCoverageParams, observedCoverageSummary,
+  count, dateLabel, direction, empty, field, heading, helpField, helpTooltip, icon, iconButton, notice, number, numeric, option,
+  observedCoverageParams,
   pagination, panelHead, pending, publishingHistory, percent, rate, ratio, safe, segment, signed, summary, table,
 } from './ui.js';
 import { chart } from './charts.js';
@@ -11,10 +11,12 @@ import { universeDefinition } from './coverage.js';
 import { renderMarketReading } from './market-reading.js';
 import { mountSummation } from './summation.js';
 import { groupHeatmapMetrics, renderGroupHeatmap } from './group-visuals.js';
-import { renderHealthComponents } from './health-visuals.js';
+import { renderHealthAvailability, renderHealthComponents } from './health-visuals.js';
 
 const dailyKeys = ['up_4pct', 'down_4pct', 'up_2pct', 'down_2pct', 'up_1pct', 'down_1pct'];
 const averageKeys = ['above_10d', 'above_20d', 'above_50d', 'above_100d', 'above_150d', 'above_200d', 'ma_50_above_200', 'ma_rising_50', 'ma_rising_200', 'ma_aligned'];
+const observedHealthDefaults = { observedMinimum: 20, observedThreshold: 0.8 };
+const coveragePercent = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 });
 const fieldCoverageSelect = (value) => `<label class="field"><span>Coverage basis</span><select name="coverageMode">
   ${option('verified','Verified market coverage',value)}${option('observed','Observed universe (descriptive)',value)}</select></label>`;
 const dailyChartKeys = ['above_50d', 'above_200d', 'above_20d'];
@@ -29,6 +31,7 @@ const moverViews = [['daily', 'Daily movers'], ['20', '20-day highs / lows'], ['
 const moverSides = [['gainers', 'Gainers'], ['losers', 'Losers']];
 const extremeSides = [['high', 'Highs'], ['low', 'Lows']];
 const dailyMoverThreshold = .10 + Number.EPSILON;
+const moverPageSize = 25;
 
 export function partialCoverage(coverage, routeUrl, { score = false } = {}) {
   if (coverage?.state === 'complete') return '';
@@ -51,6 +54,7 @@ export function partialCoverage(coverage, routeUrl, { score = false } = {}) {
 const measurement = (metric) => metric ? `${count(metric.numerator)} / ${count(metric.denominator)} comparable` : 'No comparable securities';
 const breadthValue = (metric) => percent(metric?.value);
 const overviewRowColumns = ['symbol', 'name', 'return_1d', 'rsPercentile'];
+const moverColumns = [...overviewRowColumns, 'industry'];
 
 function metricTile(key, data, definitions, universe) {
   const metric = data?.[key];
@@ -102,10 +106,6 @@ function volumeTiles(aggregate) {
     ['Equal-weight 1D return', rate(aggregate.equalWeightReturn)], ['Median 1D return', rate(aggregate.medianReturn)],
   ].map(([label, value]) => `<div class="metric-tile"><span>${label}</span><strong>${value}</strong></div>`).join('');
 }
-const healthReasons = {
-  insufficient_coverage: 'Comparable whole-universe coverage has not been established.',
-  insufficient_inputs: 'One or more weighted components lack sufficient data.',
-};
 const comparisonLabels = { gt: '>', gte: '≥', lt: '<', lte: '≤', eq: '=', ne: '≠' };
 const conditionLabel = (condition) => condition.any ? condition.any.map(conditionLabel).join(' or ')
   : `${healthFeatureLabels[condition.metric] || condition.metric}: ${number(condition.actual)} ${comparisonLabels[condition.op] || condition.op} ${number(condition.value)}`;
@@ -114,12 +114,12 @@ const healthFeatureLabels = {
   longBreadth: 'Long-term breadth', priceMomentum: 'Price momentum', industryLeadership: 'Industry leadership',
   priorWeakSessions: 'Prior weak sessions', shortChange: 'Short breadth change', intermediateChange: 'Intermediate breadth change',
 };
-function healthPanel(health = {}, { snapshot, weights, industryUrl }) {
+function healthPanel(health = {}, { snapshot, weights, industryUrl, datedHealthUrl }) {
   const conditions = health.regime?.conditions || [];
   return `<section class="panel panel-body">${panelHead('Market health', health.model?.name || 'Composite model')}
     ${numeric(health.score) ? `<div class="health-title"><span class="summary-value">${number(health.score)}</span>
       ${health.regime?.label ? chip(health.regime.label, 'accent') : ''}</div>`
-      : `<p class="muted">Composite score unavailable.${health.reason ? ` ${safe(healthReasons[health.reason] || health.reason)}` : ''}</p>`}
+      : renderHealthAvailability(health, { coverage: snapshot.coverage, datedHealthUrl })}
     ${health.regime?.sessions ? `<p class="muted section-space">Since ${dateLabel(health.regime.since)} · ${count(health.regime.sessions)} comparable sessions</p>` : ''}
     ${conditions.length ? `<div class="inline-stack section-space">${conditions.map((condition) => chip(conditionLabel(condition), condition.met ? 'accent' : '')).join('')}</div>` : ''}
     ${renderHealthComponents(health, { snapshot, weights, industryUrl })}
@@ -127,10 +127,29 @@ function healthPanel(health = {}, { snapshot, weights, industryUrl }) {
 }
 
 function coveragePolicyLine(mode, coverage, settings = {}) {
-  if (mode === 'observed') return `Observed universe · ${observedCoverageSummary({ observedMinimum: 20, observedThreshold: 0.8, ...settings })}`;
-  return coverage.state === 'complete' ? 'Verified market coverage · Market-wide analysis'
-    : 'Verified market coverage selected · Composite scoring requires reconciled coverage';
+  if (mode === 'observed') {
+    const { observedMinimum, observedThreshold } = { ...observedHealthDefaults, ...settings };
+    return `${coveragePercent.format(observedThreshold)} comparable · ${count(observedMinimum)} traded minimum`;
+  }
+  return coverage.state === 'complete' ? 'Market-wide analysis' : 'Requires reconciled source coverage';
 }
+
+function healthCoverageRules(settings = {}) {
+  const { coverageMode, observedMinimum, observedThreshold } = { ...observedHealthDefaults, ...settings };
+  const hidden = coverageMode === 'observed' ? '' : ' hidden';
+  const disabled = hidden ? ' disabled' : '';
+  return `<details class="health-coverage-rules" data-observed-coverage${hidden}>
+    <summary class="button ghost">${icon('settings')} Coverage rules</summary>
+    <div class="health-coverage-fields inline-form">
+      ${field('Minimum traded securities', `<input name="observedMinimum" type="number" min="1" max="100000" step="1" required value="${safe(observedMinimum)}"${disabled}>`)}
+      ${field('Comparable coverage (%)', `<input name="observedThreshold" type="number" min="0.1" max="100" step="0.1" required value="${number(observedThreshold * 100)}"${disabled}>`)}
+    </div></details>`;
+}
+
+const fallbackHealthComponents = (health) => (health?.components || []).map(({ id, value, numerator, denominator, readings, weight, definition }) =>
+  ({ id, value, numerator, denominator, readings, weight, definition }));
+
+const healthScoreNote = (health) => health?.regime?.label || (health?.state === 'loading' ? 'Loading score' : 'Score unavailable');
 
 function compactStatus(message, controls = '') {
   return `<div class="inline-stack"><p class="muted">${safe(message)}</p>${controls}</div>`;
@@ -156,7 +175,7 @@ export async function render(env) {
   state.heatmapMetric ||= 'medianRS';
   let groupRequest;
   let dailyMoverPanel;
-  const moverRequests = new Map();
+  let moverPreview;
   let chartRequest = 0;
   let monitorRequest = 0;
   let customRequest = 0;
@@ -165,9 +184,12 @@ export async function render(env) {
   function marketHealthPanel(health) {
     const baseline = config.healthModels?.find(({ id }) => id === 'default');
     const selected = config.healthModels?.find(({ id }) => id === context.healthModel);
-    const industryUrl = (overview.classificationSystem || context.classification) === 'nasdaq' && config.classificationSystems?.includes('sec-sic')
-      ? groupRoute({ classification: 'sec-sic', reference: 'as-of', level: 'industry', groupView: 'velocity' }) : null;
-    return healthPanel(health ?? {}, { snapshot: overview, weights: { ...baseline?.weights, ...selected?.definition?.weights }, industryUrl });
+    const canUseDatedGroups = (overview.classificationSystem || context.classification) === 'nasdaq' && config.classificationSystems?.includes('sec-sic');
+    const datedGroups = { classification: 'sec-sic', reference: 'as-of' };
+    const industryUrl = canUseDatedGroups ? groupRoute({ ...datedGroups, level: 'industry', groupView: 'velocity' }) : null;
+    const datedHealthUrl = canUseDatedGroups ? routeUrl('overview', { ...datedGroups, tab: 'health',
+      ...(state.healthCoverage?.coverageMode === 'observed' ? { coverage: 'observed' } : {}) }) : null;
+    return healthPanel(health ?? {}, { snapshot: overview, weights: { ...baseline?.weights, ...selected?.definition?.weights }, industryUrl, datedHealthUrl });
   }
 
   function showOverview({ prepareHealth = false } = {}) {
@@ -176,15 +198,12 @@ export async function render(env) {
     const universeName = overview.universe?.name || config.universes?.find(({ id }) => id === context.universe)?.name || 'Selected universe';
     const definition = universeDefinition(context.universe);
     const policy = state.healthCoverage?.coverageMode || 'verified';
-    const coverageNote = partialCoverage(coverage, routeUrl, { score: true });
-    const classificationNote = active === 'health' && context.classification === 'nasdaq' && config.classificationSystems?.includes('sec-sic')
-      ? `<p class="muted">The latest Nasdaq directory does not establish earlier industry membership.
-        <a class="text-link" href="${safe(routeUrl('overview', { tab: 'health', classification: 'sec-sic', reference: 'as-of',
-          ...(policy === 'observed' ? { coverage: 'observed' } : {}) }))}">Use filing-dated SEC groups ${icon('chevron-right')}</a></p>` : '';
+    const coverageNote = partialCoverage(coverage, routeUrl, { score: active !== 'health' });
+    const currentHealth = active === 'health' && policy === 'observed' ? { state: 'loading', components: fallbackHealthComponents(health) } : health;
     const undergoingPreparation = overview.materialization?.pending || overview.materialization?.captureInProgress;
-    const notes = coverageNote || classificationNote || undergoingPreparation || active === 'health'
+    const notes = coverageNote || undergoingPreparation || active === 'health'
       ? `<details class="panel panel-body formula-help section-space" id="overview-data-notes"><summary>Data notes</summary>
-        <div class="section-space">${coverageNote}${classificationNote}<div id="overview-preparation" aria-live="polite"></div>
+        <div class="section-space">${coverageNote}<div id="overview-preparation" aria-live="polite"></div>
           <p id="health-data-note" class="muted" hidden></p></div></details>` : '';
     main.innerHTML = heading('Market Overview', definition ? `${universeName} · ${definition}` : `${universeName} · Participation, momentum, and leadership`,
       `${overview.date ? chip(`Session ${dateLabel(overview.date)}`) : ''}<a class="button" href="${safe(routeUrl('monitor'))}">${icon('pulse')} Market monitor</a><a class="button" href="${safe(routeUrl('history'))}">${icon('history')} Explore history</a>`) +
@@ -195,7 +214,7 @@ export async function render(env) {
         ${summary('Above 50D SMA', breadthValue(breadth.above_50d), measurement(breadth.above_50d), { action: 'breadth', value: 'above_50d' })}
         ${summary('Advance / decline spread', percent(breadth.adSpread?.value, 1, true), `${count(breadth.advancers?.numerator)} advance · ${count(breadth.decliners?.numerator)} decline`,
           { action: 'breadth', value: 'adSpread', style: direction(breadth.adSpread?.value) })}
-        ${summary('Composite health', number(health?.score), health?.regime?.label || 'Score unavailable', { action: 'overview-tab', value: 'health' })}
+        ${summary('Composite health', number(currentHealth?.score), healthScoreNote(currentHealth), { action: 'overview-tab', value: 'health' })}
       </section>` +
       segment('overview-tab', [['overview', 'Breadth overview'], ['monitor', 'Session breakdown'], ['health', 'Health & regimes']], active, 'tabs') +
       (active === 'overview' ? `<div class="market-grid">
@@ -222,14 +241,15 @@ export async function render(env) {
         <div id="overview-heatmap" class="section-space">${pending('Loading sector and industry groups…')}</div></section>
       <section class="panel panel-body">${panelHead('Moving-average participation', 'Open a reading to reconcile its contributing securities.')}<div class="metric-grid">${averageKeys.map((key) => metricTile(key, breadth, definitions)).join('')}</div></section>
       <div id="market-summation" class="section-space"></div>`
-      : active === 'monitor' ? monitorLayout() : `<p class="muted" id="health-coverage-policy">${safe(coveragePolicyLine(policy, coverage, state.healthCoverage))}</p>
-      <form id="health-coverage-form" class="inline-form section-space">
+      : active === 'monitor' ? monitorLayout() : `<form id="health-coverage-form" class="health-coverage-form" aria-describedby="health-coverage-policy">
         ${fieldCoverageSelect(policy)}
-        ${observedCoverageFields(state.healthCoverage)}
-        <button class="button primary" type="submit">Apply coverage</button>
-        ${policy === 'verified' && coverage.state !== 'complete' ? action('Use observed universe', 'observe-health', 'pulse') : ''}</form>
-        <div class="split-grid"><div id="current-health">${marketHealthPanel(health)}</div>
-        <section class="panel panel-body">${panelHead('Breadth divergences', 'Dated benchmark and market participation comparisons')}<div id="divergences">${pending()}</div></section></div>
+        <p class="muted" id="health-coverage-policy">${safe(coveragePolicyLine(policy, coverage, state.healthCoverage))}</p>
+        ${healthCoverageRules(state.healthCoverage)}
+        <button class="button" type="submit">Apply coverage</button>
+        ${policy === 'verified' && coverage.state !== 'complete' ? action('Use observed universe', 'observe-health', 'pulse') : ''}
+      </form>
+        <div class="split-grid"><div id="current-health">${marketHealthPanel(currentHealth)}</div>
+        <section class="panel panel-body health-divergence-panel">${panelHead('Breadth divergences', 'Dated benchmark and market participation comparisons')}<div id="divergences">${pending()}</div></section></div>
         <section class="panel panel-body">${panelHead('Market health history', 'Published composite scores using the selected market context.',
           rangeSegment('health-range', state.healthRange) + iconButton('Export market health history CSV', 'export-chart', 'download', 'market-health.csv'))}<div id="health-chart">${pending()}</div></section>`) + notes;
     if (active === 'overview') {
@@ -259,20 +279,65 @@ export async function render(env) {
   }
 
   function moverTable(rows, label, emptyText, params = groupContext()) {
-    return table(rows, [...overviewRowColumns, 'industry'], { label, emptyText, cells: {
+    return table(rows, moverColumns, { label, emptyText, cells: {
       symbol: (row) => `<a class="stock-link mono" href="${safe(routeUrl('stock', { ...params, symbol: row.securityId || row.symbol }))}">${safe(row.symbol || row.securityId)}</a>`,
       industry: (row) => row.industryId && row.industry
         ? `<a class="text-link" href="${safe(routeUrl('industries', { ...params, level: 'industry', group: row.industryId, groupView: 'table' }))}">${safe(row.industry)}</a>` : null,
     } });
   }
 
-  function paintMoverPreview(target, { label, rows, total, emptyText, fullList }) {
-    const totalLabel = numeric(total) ? `${count(total)} qualifying ${total === 1 ? 'stock' : 'stocks'}` : 'Full count unavailable';
-    target.innerHTML = `<div class="panel-head"><p class="muted">${totalLabel}${numeric(total) && rows.length < total ? ` · Showing ${count(rows.length)}` : ''}</p>
-      ${rows.length ? fullList : ''}</div>${moverTable(rows, label, emptyText)}`;
+  function dailyMoverPage(side, params, page, perPage) {
+    const gainers = side === 'gainers';
+    return api('screens/query', { signal, params, body: { context: params, page, perPage, columns: moverColumns,
+      filter: { operator: 'and', filters: [{ field: 'return_1d', op: gainers ? 'gt' : 'lt', value: gainers ? dailyMoverThreshold : -dailyMoverThreshold }] },
+      sort: [{ field: 'return_1d', direction: gainers ? 'desc' : 'asc' }] } });
   }
 
-  async function loadMovers() {
+  async function loadMoverPreviewPage(page, button) {
+    const preview = moverPreview;
+    if (!preview || preview.loading) return;
+    const { target, params, label, fetchPage, emptyText, fullList } = preview;
+    const active = () => env.isActive() && moverPreview === preview && target.isConnected;
+    const status = target.querySelector('[data-mover-page-status]');
+    const controls = [...target.querySelectorAll('.pagination button:not(:disabled)')];
+    const report = (message) => {
+      if (status) status.textContent = message;
+      else target.innerHTML = `<p class="muted" role="status">${safe(message)}</p>`;
+    };
+    preview.loading = true;
+    for (const control of controls) control.setAttribute('aria-disabled', 'true');
+    if (status) status.textContent = `Loading page ${count(page)}…`;
+    else target.innerHTML = pending('Loading qualifying stocks…');
+    try {
+      const result = await fetchPage(page);
+      if (!active()) return;
+      if (result.pendingOnly || !numeric(result.total)) {
+        report('This list is not prepared for the selected session and revision.');
+        return;
+      }
+      if (result.metric?.denominator === 0) {
+        report('No stocks have enough comparable history for this lookback in the selected session.');
+        return;
+      }
+      const rows = result.rows || [];
+      const total = result.total;
+      const moveFocus = button && target.ownerDocument.activeElement === button;
+      target.innerHTML = `<div class="panel-head"><p class="muted">${count(total)} qualifying ${total === 1 ? 'stock' : 'stocks'}</p>${total ? fullList : ''}</div>
+        ${rows.length ? moverTable(rows, label, emptyText, params) : `<p class="muted">${safe(emptyText)}</p>`}
+        ${total > moverPageSize ? pagination({ total, page, perPage: moverPageSize }, 'mover-preview-page') : ''}
+        <p class="muted" role="status" data-mover-page-status></p>`;
+      const scroll = target.querySelector('.table-scroll');
+      scroll?.classList.add('market-mover-scroll');
+      if (moveFocus) scroll?.focus({ preventScroll: true });
+    } catch (error) {
+      if (active() && error.name !== 'AbortError') report(`Could not load qualifying stocks. ${error.message}`);
+    } finally {
+      preview.loading = false;
+      for (const control of controls) control.removeAttribute('aria-disabled');
+    }
+  }
+
+  function loadMovers() {
     const panel = main.querySelector('#market-movers');
     if (!panel) return;
     const view = state.moverView;
@@ -283,50 +348,30 @@ export async function render(env) {
       : `Session ${side} ${side === 'high' ? 'exceeds' : 'undercuts'} the preceding ${view} sessions’ ${side}s`)}
       <div class="inline-stack">${segment('mover-view', moverViews, view)}
       ${segment('mover-side', daily ? moverSides : extremeSides, side)}</div>
-      <div class="section-space" data-mover-preview aria-live="polite"></div>`;
+      <div class="section-space" data-mover-preview></div>`;
     const target = panel.querySelector('[data-mover-preview]');
+    moverPreview = null;
     if (overview.coverage.state === 'unprepared') {
       target.innerHTML = '<p class="muted">This list is not prepared for the selected session and revision.</p>';
       return;
     }
+    const params = groupContext();
     if (daily) {
       const saved = overview.movers?.[side];
-      if (!Array.isArray(saved)) {
-        target.innerHTML = '<p class="muted">No saved daily movers reading for this context.</p>';
-        return;
-      }
       const rows = dailyMoverRows(saved, side);
-      const total = overview.movers?.counts?.[side] ?? (rows.length < 5 ? rows.length : null);
-      paintMoverPreview(target, { label, rows, total, fullList: action('Full list', 'daily-mover-list', 'layers', { value: side }),
-        emptyText: `No stocks ${side === 'gainers' ? 'gained' : 'lost'} more than 10% from the prior close in this universe.` });
-      return;
-    }
-    const key = `new_${side}_${view}d`;
-    const params = groupContext();
-    const cacheKey = `${params.date}|${params.dataVersion}|${key}`;
-    target.innerHTML = pending('Reading saved constituents…');
-    try {
-      if (!moverRequests.has(cacheKey)) moverRequests.set(cacheKey,
-        api(`market/breadth/${key}/contributors`, { signal, params: { ...params, include: 'numerator', page: 1, perPage: 5 } }));
-      const result = await moverRequests.get(cacheKey);
-      if (result.pendingOnly) moverRequests.delete(cacheKey);
-      if (!target.isConnected) return;
-      if (result.pendingOnly || !numeric(result.total)) {
-        target.innerHTML = '<p class="muted">This list is not prepared for the selected session and revision.</p>';
-        return;
-      }
-      const rows = result.rows || [];
-      if (result.metric?.denominator === 0) {
-        target.innerHTML = '<p class="muted">No stocks have enough comparable history for this lookback in the selected session.</p>';
-        return;
-      }
-      paintMoverPreview(target, { label, rows, total: result.total,
+      const total = overview.movers?.counts?.[side];
+      const complete = Array.isArray(saved) && total === rows.length && rows.length <= moverPageSize;
+      moverPreview = { target, params, label, fullList: action('Full list', 'daily-mover-list', 'layers', { value: side }),
+        emptyText: `No stocks ${side === 'gainers' ? 'gained' : 'lost'} more than 10% from the prior close in this universe.`,
+        fetchPage: complete ? () => ({ rows, total }) : (page) => dailyMoverPage(side, params, page, moverPageSize) };
+    } else {
+      const key = `new_${side}_${view}d`;
+      moverPreview = { target, params, label,
         fullList: action('Full list', 'breadth', 'layers', { value: key }),
-        emptyText: `No stocks reached a new ${view === '252' ? '52-week' : '20-day'} ${side} in this universe.` });
-    } catch (error) {
-      moverRequests.delete(cacheKey);
-      if (target.isConnected && error.name !== 'AbortError') target.innerHTML = notice('Saved list unavailable', error.message, '', true);
+        emptyText: `No stocks reached a new ${view === '252' ? '52-week' : '20-day'} ${side} in this universe.`,
+        fetchPage: (page) => api(`market/breadth/${key}/contributors`, { signal, params: { ...params, include: 'numerator', page, perPage: moverPageSize } }) };
     }
+    return loadMoverPreviewPage(1);
   }
 
   function openDailyMoverList(side) {
@@ -338,12 +383,9 @@ export async function render(env) {
 
   async function loadDailyMoverList(page) {
     const { side, params, title, target } = dailyMoverPanel;
-    const gainers = side === 'gainers';
     target.innerHTML = pending('Loading qualifying stocks…');
     try {
-      const result = await api('screens/query', { signal, params, body: { context: params, page, perPage: 30,
-        filter: { operator: 'and', filters: [{ field: 'return_1d', op: gainers ? 'gt' : 'lt', value: gainers ? dailyMoverThreshold : -dailyMoverThreshold }] },
-        sort: [{ field: 'return_1d', direction: gainers ? 'desc' : 'asc' }] } });
+      const result = await dailyMoverPage(side, params, page, 30);
       if (!target.isConnected) return;
       target.innerHTML = result.pendingOnly ? '<p class="muted">This list is not prepared for the selected session and revision.</p>'
         : moverTable(result.rows || [], title, 'No qualifying stocks for this session.', params) + pagination(result, 'daily-mover-page');
@@ -514,6 +556,13 @@ export async function render(env) {
     const active = () => env.isActive() && run === healthRequest && target.isConnected;
     const settings = state.healthCoverage || { coverageMode: 'verified' };
     const { coverageMode } = settings;
+    const setCurrentHealth = (result) => {
+      const components = result.components?.length ? result.components : fallbackHealthComponents(overview.health);
+      main.querySelector('#current-health').innerHTML = marketHealthPanel({ ...result, components });
+      const tile = main.querySelector('.summary-card[data-action="overview-tab"][data-value="health"]');
+      tile.querySelector('.summary-value').textContent = number(result.score);
+      tile.querySelector('.summary-foot').textContent = healthScoreNote(result);
+    };
     if (overview.coverage.state !== 'complete' && coverageMode === 'verified') {
       target.innerHTML = compactStatus('Verified divergence events are unavailable for this context.');
       plot.innerHTML = compactStatus('Verified composite history requires reconciled coverage.');
@@ -544,8 +593,7 @@ export async function render(env) {
       }
       const result = await env.publishedSeries('market/health', request, progress);
       if (!active()) return;
-      const components = result.components?.length ? result.components : (overview.health?.components || []).map((part) => ({ ...part, score: null }));
-      main.querySelector('#current-health').innerHTML = marketHealthPanel({ ...result, components });
+      setCurrentHealth({ coverageMode, ...result });
       main.querySelector('#health-coverage-policy').textContent = coveragePolicyLine(coverageMode, overview.coverage, { ...settings, ...result });
       const note = main.querySelector('#health-data-note');
       note.textContent = result.coverageWarning || '';
@@ -569,11 +617,13 @@ export async function render(env) {
       const events = (result.events || []).toReversed();
       plot.innerHTML = chart(result.history || [], [{ key: 'score', label: 'Market health score', format: number }], { domain: [0, 100], fill: true });
       exportButton.disabled = !plot.querySelector('[data-chart]');
-      target.innerHTML = events.length ? events.map((event) =>
-        `<div class="simple-row"><strong>${safe(event.label || event.id)}</strong><span>${dateLabel(event.date)}</span></div>`).join('')
+      target.innerHTML = events.length ? `<div class="health-divergence-list" tabindex="0" role="region" aria-label="Dated breadth divergence events">
+        <ul>${events.map((event) => `<li class="simple-row"><strong>${safe(event.label || event.id)}</strong>
+          <time datetime="${safe(event.date)}">${dateLabel(event.date)}</time></li>`).join('')}</ul></div>`
         : empty('No divergences in this range', 'Recent comparable sessions contain no matching events.', 'pulse');
     } catch (error) {
       if (active() && error.name !== 'AbortError') {
+        if (coverageMode === 'observed') setCurrentHealth({ coverageMode, reason: 'Could not load market health for the selected coverage.' });
         target.innerHTML = compactStatus('Divergence history unavailable.');
         plot.innerHTML = compactStatus(error.message,
           config.automaticPreparation ? action('Prepare market health', 'prepare-health', 'chart') : '');
@@ -585,23 +635,30 @@ export async function render(env) {
 
   env.setActions({
     'overview-tab'(value) { state.tab = value; showOverview(); },
-    'observe-health'() { state.healthCoverage = { coverageMode: 'observed' }; showOverview({ prepareHealth: true }); },
+    'observe-health'() {
+      state.healthCoverage = { coverageMode: 'observed' };
+      showOverview({ prepareHealth: true });
+      main.querySelector('#health-coverage-form [name="coverageMode"]').focus();
+    },
     'check-health-readiness'() { return loadHealth(); },
     'prepare-health'() { return loadHealth({ prepare: true }); },
     'overview-range'(value) { state.range = Number(value); showOverview(); },
     'health-range'(value) { state.healthRange = Number(value); showOverview(); },
     'ad-range'(value) { state.adRange = Number(value); showOverview(); },
     'mover-view'(value) {
+      if (state.moverView === value) return;
       state.moverView = value;
       loadMovers();
       main.querySelector('[data-action="mover-view"][aria-pressed="true"]')?.focus();
     },
     'mover-side'(value) {
+      if ((state.moverView === 'daily' ? state.movers : state.extremeSide) === value) return;
       if (state.moverView === 'daily') state.movers = value;
       else state.extremeSide = value;
       loadMovers();
       main.querySelector('[data-action="mover-side"][aria-pressed="true"]')?.focus();
     },
+    'mover-preview-page'(value, button) { return loadMoverPreviewPage(Number(value), button); },
     'daily-mover-list': openDailyMoverList,
     'daily-mover-page'(value) { return loadDailyMoverList(Number(value)); },
     'breakdown-view'(value) { return env.go('overview', { ...env.params, tab: 'monitor', breakdownView: value }); },
@@ -625,8 +682,11 @@ export async function render(env) {
   main.onsubmit = async (event) => {
     if (event.target.id === 'health-coverage-form') {
       event.preventDefault();
-      state.healthCoverage = observedCoverageParams(Object.fromEntries(new FormData(event.target)));
+      const fields = Object.fromEntries(new FormData(event.target));
+      if (fields.coverageMode === 'observed') fields.observedThreshold = Math.round(Number(fields.observedThreshold) * 10) / 1000;
+      state.healthCoverage = observedCoverageParams(fields);
       showOverview({ prepareHealth: true });
+      main.querySelector('#health-coverage-form [name="coverageMode"]').focus();
       return;
     }
     if (event.target.id !== 'monitor-form') return;

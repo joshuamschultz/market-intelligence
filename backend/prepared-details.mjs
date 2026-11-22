@@ -313,6 +313,16 @@ function splitProjection(bars, actions, date, anchorDate) {
   return output;
 }
 
+export function readPreparedChart(db, config, securityId, lookback = 63) {
+  if (!Number.isInteger(lookback) || lookback < 1 || lookback > 126) throw new RangeError('Invalid stock chart lookback');
+  const product = findProduct(db, config, securityId);
+  if (product.state !== 'ready') return { state: product.state, bars: [], sourceDataVersion: null };
+  const { header, anchorDate, sourceDataVersion } = product;
+  const chart = readBars(db, decodeStoredJson(product.blocks), config.date, lookback);
+  const bars = anchorDate === config.date ? chart : splitProjection(chart, header.actions, config.date, anchorDate);
+  return { state: bars ? 'ready' : 'requires-exact-date', bars: bars ?? [], sourceDataVersion };
+}
+
 export function readPreparedDetail(db, config, securityId, { lookback = 252, benchmark = config.benchmark } = {}) {
   if (!Number.isInteger(lookback) || lookback < 1 || lookback > maximumSessions) throw new RangeError('Invalid stock detail lookback');
   const product = findProduct(db, config, securityId);

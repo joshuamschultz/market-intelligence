@@ -209,6 +209,8 @@ button.metric-tile:hover { border-color: #4a7772; }
 .table-scroll tr:last-child td { border-bottom: 0; }
 .table-scroll tbody tr:hover td { background: var(--surface-hover); }
 .table-scroll td.pin-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+.market-mover-scroll { max-height: clamp(12rem, 40vh, 18rem); overscroll-behavior-y: contain; scrollbar-gutter: stable; }
+.market-mover-scroll td:last-child { white-space: normal; min-width: 8rem; }
 .table-scroll.selectable .pin-check, .table-scroll.selectable .pin-symbol, .table-scroll.selectable .pin-name { position: sticky; z-index: 1; }
 .table-scroll.selectable th.pin-check, .table-scroll.selectable th.pin-symbol, .table-scroll.selectable th.pin-name { z-index: 3; }
 .table-scroll.selectable .pin-check { left: 0; min-width: 36px; width: 36px; }
@@ -228,7 +230,24 @@ button.metric-tile:hover { border-color: #4a7772; }
 .notice .text-link { display: inline-flex; align-items: center; gap: 5px; }
 .summary-grid.two { grid-template-columns: repeat(2,minmax(0,1fr)); }
 .summary-grid.three { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.health-coverage-form { display: flex; flex-wrap: wrap; align-items: start; gap: 8px 12px; margin-block: 14px; }
+.health-coverage-form > .field { display: flex; align-items: center; gap: 9px; max-width: 100%; }
+.health-coverage-form > .field span { white-space: nowrap; }
+.health-coverage-form select { width: auto; max-width: 100%; }
+.health-coverage-form > p { align-self: start; padding-block: 9px; }
+.health-coverage-rules > summary { cursor: pointer; }
+.health-coverage-fields { margin-top: 6px; padding: 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.health-coverage-fields input { max-width: 10rem; }
 .health-title { display: flex; align-items: center; gap: 9px; }
+#health-availability strong { color: var(--text); }
+#health-availability ul { margin-block: 7px; padding-inline-start: 19px; }
+#health-availability li + li { margin-top: 4px; }
+.health-divergence-panel { align-self: start; }
+.health-divergence-list { max-height: clamp(20rem, 55vh, 36rem); overflow-y: auto; overscroll-behavior-y: contain;
+  scrollbar-gutter: stable; padding-inline-end: 7px; }
+.health-divergence-list ul { margin: 0; padding: 0; list-style: none; }
+.health-divergence-list .simple-row { align-items: baseline; }
+.health-divergence-list time { white-space: nowrap; color: var(--muted); font-size: 12px; }
 .health-component-list { margin-top: 5px; }
 .health-component { display: grid; gap: 5px; min-width: 0; padding: 8px 0; border-bottom: 1px solid var(--subtle-border); }
 .health-component-line, .health-component-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 12px; }

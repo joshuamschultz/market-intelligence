@@ -16,6 +16,99 @@ const reasons = {
   input_unavailable: 'Required observations are unavailable for this component.',
 };
 
+const coveragePercent = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 3 });
+const preciseCoveragePercent = new Intl.NumberFormat('en-US', { style: 'percent', maximumSignificantDigits: 17 });
+
+function belowCoverage(ratio, threshold) {
+  if (!numeric(ratio) || !numeric(threshold) || ratio >= threshold) return '';
+  const format = coveragePercent.format(ratio) === coveragePercent.format(threshold) ? preciseCoveragePercent : coveragePercent;
+  return `(${format.format(ratio)}), below the ${format.format(threshold)} minimum.`;
+}
+
+function coverageGap({ observed, expected, ratio, threshold }, label) {
+  const below = belowCoverage(ratio, threshold);
+  return below && numeric(observed) && numeric(expected) ? `${count(observed)} of ${count(expected)} ${label} ${below}` : '';
+}
+
+function sourceGate(health, snapshotCoverage) {
+  const coverage = health.coverage || snapshotCoverage;
+  const observedMode = health.coverageMode === 'observed';
+  const reportedFailure = health.state === 'insufficient_coverage' || health.reason === 'insufficient_coverage';
+  const coverageFailure = health.coverage ? coverage.ready === false : !observedMode && coverage.state === 'partial';
+  if (!reportedFailure && !coverageFailure) return null;
+  if (observedMode) {
+    const { traded, listed, ratio, threshold, minimum } = coverage.observed || {};
+    const below = coverageGap({ observed: traded, expected: listed, ratio, threshold }, 'eligible securities traded');
+    const sample = numeric(traded) && numeric(minimum) && traded < minimum
+      ? `${count(traded)} securities traded, below the ${count(minimum)} minimum sample.` : '';
+    return { label: 'Observed universe coverage', detail: [below, sample].filter(Boolean).join(' ') || 'Eligible and traded counts did not establish adequate coverage.' };
+  }
+  const { ratio, completenessThreshold: threshold, received, traded, expected } = coverage;
+  const observed = numeric(received) && numeric(traded) ? Math.min(received, traded) : received ?? traded;
+  const below = belowCoverage(ratio, threshold);
+  const counts = numeric(observed) && numeric(expected) ? `${count(observed)} of ${count(expected)} expected securities` : 'Recorded coverage';
+  const detail = below ? `${counts} ${below}` : numeric(ratio)
+    ? 'This context does not qualify for verified market coverage.' : 'A reconciled provider roster is unavailable for this session.';
+  return { label: 'Provider source coverage', detail };
+}
+
+function componentCoverage(part, minimum) {
+  const { adequacy } = part;
+  if (!adequacy) return [];
+  const { observed, expected, groupRatio, observedIndustries, comparableIndustries, threshold } = adequacy;
+  const classifiedSubset = adequacy.comparisonScope === 'observed_classified_subset';
+  const industry = part.id === 'industryLeadership';
+  const securityGap = !classifiedSubset && coverageGap(adequacy, industry ? 'securities classified' : 'comparable securities');
+  const groupGap = coverageGap({ observed: observedIndustries, expected: comparableIndustries, ratio: groupRatio, threshold }, 'comparable industries');
+  const sampleMinimum = classifiedSubset ? adequacy.minimumClassified : minimum;
+  const sampleGap = numeric(observed) && numeric(sampleMinimum) && observed < sampleMinimum
+    ? `${count(observed)} ${industry ? 'classified' : 'comparable'} securities, below the ${count(sampleMinimum)} minimum sample.` : '';
+  return [securityGap, groupGap, sampleGap].filter(Boolean);
+}
+
+function componentGate(part, minimum, datedHealthUrl) {
+  const industryMissing = part.id === 'industryLeadership' && !numeric(part.value) &&
+    (part.reason === 'input_unavailable' || part.denominator === 0);
+  if (part.reason === 'insufficient_calibration_history') {
+    const { observations, minObservations } = part.calibration || {};
+    return { detail: numeric(observations) && numeric(minObservations)
+      ? `Calibration has ${count(observations)} prior readings and requires ${count(minObservations)}.` : reasons[part.reason] };
+  }
+  const details = part.reason === 'insufficient_comparable_coverage' ? componentCoverage(part, minimum) : [];
+  if (industryMissing) details.push(datedHealthUrl
+    ? 'Four-week relative strength comparison unavailable with the Nasdaq directory.'
+    : 'No comparable four-week industry relative strength readings.');
+  const { ratio, groupRatio, threshold, comparisonScope } = part.adequacy || {};
+  const comparableRatios = comparisonScope === 'observed_classified_subset' ? [groupRatio] : [ratio, groupRatio];
+  const gap = numeric(threshold) ? Math.max(0, ...comparableRatios.filter(numeric).map((value) => threshold - value)) : 0;
+  return { detail: details.join(' ') || reasons[part.reason] || 'Score unavailable.',
+    missingInput: industryMissing || part.reason === 'input_unavailable', gap, url: industryMissing ? datedHealthUrl : null };
+}
+
+export function renderHealthAvailability(health = {}, { coverage = {}, datedHealthUrl } = {}) {
+  if (numeric(health.score)) return '';
+  if (health.state === 'loading') return '<p id="health-availability" class="muted" role="status">Loading market health for the selected coverage…</p>';
+  const source = sourceGate(health, coverage);
+  const missing = new Set(health.missingComponents);
+  const supplied = new Map((health.components || []).map((part) => [part.id, part]));
+  const sorted = components.flatMap(([id, label]) => {
+    const part = supplied.get(id);
+    if (!missing.has(id) && !(part?.weight > 0 && part.score === null)) return [];
+    return [{ label, ...componentGate(part || { id }, health.observedMinimum ?? health.coverage?.observed?.minimum, datedHealthUrl) }];
+  }).sort((left, right) => Number(Boolean(right.missingInput)) - Number(Boolean(left.missingInput)) || (right.gap || 0) - (left.gap || 0));
+  const item = ({ label, detail, url }) => `<li><strong>${safe(label)}</strong> · ${safe(detail)}${url
+    ? ` <a class="text-link" href="${safe(url)}">Use filing-dated SEC groups</a>` : ''}</li>`;
+  const initial = [source, ...sorted.slice(0, 3)].filter(Boolean);
+  const more = sorted.slice(3);
+  const summary = initial.length || health.reason === 'insufficient_inputs' || health.state === 'insufficient_inputs'
+    ? 'The model requires adequate coverage and a score for every positively weighted component.'
+    : health.reason || '';
+  return `<div id="health-availability"><p class="muted"><strong>Composite score unavailable.</strong> ${safe(summary)}</p>
+    ${initial.length ? `<ul class="muted">${initial.map(item).join('')}</ul>` : ''}
+    ${more.length ? `<details class="formula-help"><summary>${count(more.length)} more component ${more.length === 1 ? 'requirement' : 'requirements'}</summary>
+      <ul class="muted">${more.map(item).join('')}</ul></details>` : ''}</div>`;
+}
+
 function rawInput(snapshot, id, breadthKey) {
   if (breadthKey) return snapshot.breadth?.[breadthKey] || {};
   if (id === 'volumeParticipation') {
@@ -126,9 +219,9 @@ export function renderHealthComponents(health = {}, { snapshot = {}, weights = {
       ${part.history}
       <div class="health-component-meta"><span>${part.description}</span>${part.weight == null ? '' : `<span>Weight ${part.weightLabel}</span>`}
         ${part.score == null ? '' : `<span class="health-score">Score ${number(part.score)} / 100</span>`}</div></div>`).join('')}</div>
-    ${missingIndustry && industryUrl ? `<p class="muted section-space">Industry velocity needs dated group membership. <a class="text-link" href="${safe(industryUrl)}">View filing-dated SEC groups</a></p>` : ''}
-    ${missingScores ? `<p class="muted section-space">${count(missingScores)} component ${missingScores === 1 ? 'score unavailable' : 'scores unavailable'}. See Component details for the underlying inputs and coverage.</p>` : ''}
     <details class="formula-help section-space"><summary>Component details</summary>
+      ${missingScores ? `<p class="muted">${count(missingScores)} component ${missingScores === 1 ? 'score unavailable' : 'scores unavailable'}.</p>` : ''}
+      ${missingIndustry && industryUrl ? `<p class="muted"><a class="text-link" href="${safe(industryUrl)}">View filing-dated SEC industry rankings</a></p>` : ''}
       <div class="table-scroll section-space" tabindex="0" role="region" aria-label="Health component inputs and coverage"><table>
         <thead><tr><th scope="col">Component</th><th scope="col">Raw reading</th><th scope="col">Weight</th><th scope="col">Score / 100</th><th scope="col">Inputs and coverage</th></tr></thead>
         <tbody>${rows.map((part) => {

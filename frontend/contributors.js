@@ -4,6 +4,7 @@ import {
 } from './ui.js';
 import { chart } from './charts.js';
 import { rangeSegment } from './chart-ranges.js';
+import { setTickerPreviewContext } from './ticker-preview.js';
 
 const membership = [['numerator','Qualifiers'],['denominator','Comparable'],['excluded','Excluded']];
 const sides = [['numerator','Net contributors'],['advancers','Advancers'],['decliners','Decliners'],...membership.slice(1)];
@@ -153,6 +154,8 @@ export async function openBreadthDrawer(env, { key, date, title, universe, readi
       if (changed || !trendRows.length) controls();
       drawListHeader();
       const visibleColumns = binary==='adSpread'?[...columns,'contribution']:columns;
+      setTickerPreviewContext(target, { ...env.snapshotContext, ...scoped, date: selectedDate,
+        dataVersion: result.dataVersion ?? env.snapshotContext?.dataVersion });
       target.innerHTML = table(result.rows,visibleColumns,{selectable:true,selected,label:'Contributing securities',
         emptyText:'No securities in this selection.'}) + pagination(result,'breadth-drawer-page');
     } catch (error) {

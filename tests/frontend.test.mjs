@@ -273,21 +273,24 @@ test('research workspace workflows use the published API and a copy of the local
   assert.match(participation.title, /\d[\d,]* \/ \d[\d,]* comparable/);
   assert.match(participation.getAttribute('aria-label'), /comparable/);
   assert.doesNotMatch(participation.textContent, /\d\s*\/\s*\d/);
-  assert.match($('[aria-label="Daily movers"] thead').textContent, /Industry/);
+  await wait(() => $('#market-movers [data-mover-preview]')?.textContent.includes(`${expected.movers.counts.gainers.toLocaleString('en-US')} qualifying stock`), 'daily mover count');
+  if (expected.movers.counts.gainers) assert.match($('[aria-label="Daily movers"] thead').textContent, /Industry/);
+  else assert.equal($('#market-movers .market-mover-scroll'), null);
   for (const [lookback, side] of [['20', 'high'], ['20', 'low'], ['252', 'low'], ['252', 'high']]) {
     click(`[data-action="mover-view"][data-value="${lookback}"]`);
     click(`[data-action="mover-side"][data-value="${side}"]`);
     const key = `new_${side}_${lookback}d`;
     const reading = expected.breadth[key];
     await wait(() => $('#market-movers [data-mover-preview]')?.textContent.includes(reading.denominator
-      ? `${reading.numerator} qualifying stock` : 'enough comparable history'), `matching ${key} preview`);
+      ? `${reading.numerator.toLocaleString('en-US')} qualifying stock` : 'enough comparable history'), `matching ${key} preview`);
     const query = contributorQueries.findLast((url) => url.pathname.endsWith(`/${key}/contributors`));
-    assert.equal(query.searchParams.get('perPage'), '5');
+    assert.equal(query.searchParams.get('perPage'), '25');
     assert.equal(query.searchParams.get('date'), status.latestDate);
     assert.equal(query.searchParams.get('dataVersion'), String(status.dataVersion));
     assert.equal(query.searchParams.get('include'), 'numerator');
     if (reading.numerator > 0) {
-      assert.equal($$('#market-movers tbody .stock-link').length, Math.min(reading.numerator, 5));
+      assert.equal($$('#market-movers tbody .stock-link').length, Math.min(reading.numerator, 25));
+      assert.equal($('#market-movers .market-mover-scroll').tabIndex, 0);
       const stock = new URLSearchParams($('#market-movers tbody .stock-link').hash.split('?')[1]);
       assert.equal(stock.get('date'), status.latestDate);
       assert.equal(stock.get('dataVersion'), String(status.dataVersion));
@@ -328,11 +331,14 @@ test('research workspace workflows use the published API and a copy of the local
   click('[data-action="overview-tab"][data-value="health"]');
   assert.ok($('#health-coverage-form [name="observedMinimum"]').disabled);
   set('#health-coverage-form [name="coverageMode"]','observed');
+  assert.equal($('#health-coverage-form details').open, false);
+  click('#health-coverage-form details summary');
+  assert.equal($('#health-coverage-form details').open, true);
   assert.equal($('#health-coverage-form [name="observedMinimum"]').value,'20');
   set('#health-coverage-form [name="observedMinimum"]','3');
-  set('#health-coverage-form [name="observedThreshold"]','0.75');
+  set('#health-coverage-form [name="observedThreshold"]','75');
   submit('#health-coverage-form');
-  await wait(() => $('#health-coverage-policy')?.textContent.includes('Minimum 3 traded securities · 75.0% comparable coverage') &&
+  await wait(() => $('#health-coverage-policy')?.textContent.includes('75% comparable · 3 traded minimum') &&
     healthQueries.some((params) => params.get('coverageMode') === 'observed' && params.get('observedMinimum') === '3' &&
       params.get('observedThreshold') === '0.75'),
     'observed health controls reach API and label coverage policy');
