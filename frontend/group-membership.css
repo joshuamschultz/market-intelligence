@@ -1,0 +1,28 @@
+.group-membership-bar {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--subtle-border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+.group-membership-controls, .group-membership-dates, .group-membership-dates > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.group-membership-controls .segmented { margin: 0; }
+.group-membership-label { color: var(--muted); font-size: 12px; font-weight: 650; }
+.group-membership-controls > .group-membership-label + .group-membership-label { color: var(--text); }
+.group-membership-dates { gap: 4px 15px; margin: 0; color: var(--muted); font-size: 11px; }
+.group-membership-dates > div { gap: 4px; }
+.group-membership-dates dd { margin: 0; color: var(--text); font-family: var(--mono); }
+.group-membership-details { padding: 10px 0 14px; }
+.group-membership-details h3 { margin-bottom: 8px; }
+.group-membership-details dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(235px, 100%), 1fr)); gap: 8px; margin: 0; }
+.group-membership-details dl > div { padding: 8px; border: 1px solid var(--subtle-border); border-radius: 6px; }
+.group-membership-details dt { font-size: 12px; }
+.group-membership-details dt strong { margin-left: 5px; font-family: var(--mono); }
+.group-membership-details dd { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }

@@ -12,6 +12,7 @@ import { renderMarketReading } from './market-reading.js';
 import { createTimingReview } from './market-timing.js';
 import { mountSummation } from './summation.js';
 import { groupHeatmapMetrics, renderGroupHeatmap } from './group-visuals.js';
+import { groupMembershipView, loadGroupMembershipStyles, renderGroupMembership } from './group-membership.js';
 import { renderHealthAvailability, renderHealthComponents } from './health-visuals.js';
 
 const dailyKeys = ['up_4pct', 'down_4pct', 'up_2pct', 'down_2pct', 'up_1pct', 'down_1pct'];
@@ -176,6 +177,7 @@ export async function render(env) {
   state.breakdownView = env.params.breakdownView === 'cards' ? 'cards' : 'compare';
   state.heatmapLevel ||= 'sector';
   state.heatmapMetric ||= 'medianRS';
+  let heatmapMembership = env.params.membership;
   let groupRequest;
   let dailyMoverPanel;
   let moverPreview;
@@ -240,8 +242,8 @@ export async function render(env) {
         segment('overview-heatmap-level', [['sector', 'Sectors'], ['industry', 'Industries']], state.heatmapLevel))}
         <div class="inline-form"><label class="field"><span>Heatmap metric</span><select data-change="overview-heatmap-metric">
           ${groupHeatmapMetrics.map(([key, label]) => option(key, label, state.heatmapMetric)).join('')}</select></label>
-          <a class="button ghost" href="${safe(groupRoute({ level: state.heatmapLevel, groupView: 'velocity' }))}">RS vs velocity ${icon('chevron-right')}</a>
-          <a class="button ghost" href="${safe(groupRoute({ level: state.heatmapLevel, groupView: 'table' }))}">Group table ${icon('chevron-right')}</a></div>
+          <a class="button ghost" data-overview-group-view="velocity" href="${safe(groupRoute({ level: state.heatmapLevel, groupView: 'velocity' }))}">RS vs velocity ${icon('chevron-right')}</a>
+          <a class="button ghost" data-overview-group-view="table" href="${safe(groupRoute({ level: state.heatmapLevel, groupView: 'table' }))}">Group table ${icon('chevron-right')}</a></div>
         <div id="overview-heatmap" class="section-space">${pending('Loading sector and industry groups…')}</div></section>
       <section class="panel panel-body">${panelHead('Moving-average participation', 'Open a reading to reconcile its contributing securities.')}<div class="metric-grid">${averageKeys.map((key) => metricTile(key, breadth, definitions)).join('')}</div></section>
       <div id="market-summation" class="section-space"></div>`
@@ -399,20 +401,30 @@ export async function render(env) {
     }
   }
 
-  async function loadHeatmap() {
+  async function loadHeatmap({ focusMembership = false } = {}) {
     const target = main.querySelector('#overview-heatmap');
     const params = groupContext();
     const key = `${params.date}|${params.dataVersion}|${overview.coverage.state}`;
     if (groupRequest?.key !== key) groupRequest = { key, promise: api('industries', { signal, params }) };
     const level = state.heatmapLevel;
     const metric = state.heatmapMetric;
+    const selection = heatmapMembership;
     try {
       const result = await groupRequest.promise;
-      if (!target?.isConnected || level !== state.heatmapLevel || metric !== state.heatmapMetric) return;
-      target.innerHTML = renderGroupHeatmap(result.groups, { level, metric, date: result.date,
+      if (!target?.isConnected || level !== state.heatmapLevel || metric !== state.heatmapMetric || selection !== heatmapMembership) return;
+      const membership = groupMembershipView(result, { level, selection, classification: context.classification });
+      const routeMembership = membership.projection ? { membership: membership.basis } : {};
+      loadGroupMembershipStyles(main.ownerDocument);
+      target.innerHTML = renderGroupMembership(membership, { action: 'overview-group-membership', helpId: 'overview-membership-help' }) +
+        renderGroupHeatmap(result.groups, { level, metric, date: result.date, membership,
         contextLabel: overview.universe?.name, unavailableReason: result.coverage?.state === 'unprepared'
           ? 'Group readings are not prepared for this exact date and revision.' : undefined,
-        routeUrl: (group) => groupRoute({ level: group.level, group: group.id, groupView: 'heatmap' }) });
+        routeUrl: (group) => groupRoute({ level: group.level, group: group.id, groupView: 'heatmap', ...routeMembership }) });
+      for (const link of main.querySelectorAll('[data-overview-group-view]')) {
+        link.href = groupRoute({ level, groupView: link.dataset.overviewGroupView, ...routeMembership });
+      }
+      bindHelpTooltips(target);
+      if (focusMembership) target.querySelector('[data-action="overview-group-membership"][aria-pressed="true"]')?.focus();
     } catch (error) {
       if (target?.isConnected && error.name !== 'AbortError') target.innerHTML = notice('Group heatmap unavailable', error.message, '', true);
     }
@@ -672,6 +684,12 @@ export async function render(env) {
     'breakdown-view'(value) { return env.go('overview', { ...env.params, tab: 'monitor', breakdownView: value }); },
     'overview-heatmap-level'(value) { state.heatmapLevel = value; showOverview(); },
     'change:overview-heatmap-metric'(value) { state.heatmapMetric = value; loadHeatmap(); },
+    'overview-group-membership'(value) {
+      if (value !== 'dated' && value !== 'current') return;
+      heatmapMembership = value;
+      env.replaceParams?.({ membership: value });
+      return loadHeatmap({ focusMembership: true });
+    },
     'rolling-window'(value, button) {
       const form = button.closest('form');
       form.elements.sessions.value = value;

@@ -9,7 +9,7 @@
 Start with the whole U.S. market. Find the industry groups that lead it. Find the stocks that drive those groups.<br>
 Then review every chart once and keep a dated record of what you saw.
 
-[![Version](https://img.shields.io/badge/version-0.3.0-55d9bd?style=for-the-badge)](package.json)
+[![Version](https://img.shields.io/badge/version-0.3.1-55d9bd?style=for-the-badge)](package.json)
 [![Node.js](https://img.shields.io/badge/node-24.15%2B%20%7C%2026%20LTS-3c873a?style=for-the-badge&logo=node.js&logoColor=white)](#-requirements)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](docs/ARCHITECTURE.md)
 [![Local first](https://img.shields.io/badge/runs-on%20your%20machine-0b1216?style=for-the-badge)](#-privacy-and-security)
@@ -97,6 +97,7 @@ Most tools show you one piece: a chart, a screener, or an index. Market Intellig
 #### 🏭 Industry groups and themes
 - **Heatmap**, **RS vs velocity**, and **table** views
 - Median RS percentile and participation per group
+- Current-member 4W/12W RS backcast when dated Nasdaq velocity is unavailable
 - Filing-dated **SEC/SIC** groups
 - Current **Nasdaq directory** groups
 - Rotation, breadth, and emerging-group views
@@ -375,7 +376,7 @@ npm test
 
 ## 📍 Project status
 
-Source package version: **0.3.0**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
+Source package version: **0.3.1**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
 
 | Area | Status | Notes |
 | :--- | :---: | :--- |
@@ -398,6 +399,7 @@ Open items: [Remaining work](docs/REMAINING-WORK.md) · [Performance acceptance]
 | 🏗️ [Architecture](docs/ARCHITECTURE.md) | Data flow and system design |
 | 🧭 [AI connections](docs/AI-CONNECTIONS.md) | Scoped API/MCP access and provider-specific connection limits |
 | 🤖 [AI research contract](docs/AI-RESEARCH-CONTRACT.md) | Tool catalog, provenance, pagination, and statistical interpretation |
+| 🏭 [Industry velocity](docs/INDUSTRY-VELOCITY.md) | Dated and current-member group RS comparisons, coverage, and limits |
 | 📊 [Session Review](docs/SESSION-REVIEW.md) | Rule profile, trend and breadth definitions, data limits |
 | 📈 [ChartBook guide](docs/CHARTBOOK.md) | Chart review, shortcuts, and notes |
 | 📋 [Requirements](docs/REQUIREMENTS.md) | Requirements and implementation status |

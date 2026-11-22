@@ -78,6 +78,7 @@ export const researchTools = [
   }),
   entry('industry_strength', 'Rank dated industries by 12-week RS percentile improvement, current rank, or 12-week compounded equal-weight return. Report excluded and ambiguous sectors.', {
     context, order: z.enum(['rs-improvement', 'current-rank', 'trailing-return']).optional(),
+    membership: z.enum(['auto', 'dated', 'current']).optional().describe('Auto uses prepared current membership for latest Nasdaq RS improvement when dated velocity is absent.'),
     excludeDefensive: z.boolean().optional(), excludedSectors: z.array(label).max(20).optional(),
     includeUnclassified: z.boolean().optional(), view: z.enum(['eligible', 'excluded', 'all']).optional(), ...page,
   }),

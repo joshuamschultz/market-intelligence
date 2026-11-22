@@ -6,6 +6,7 @@ import { expectedSessions, isMarketSession, shiftDate, weekEnd } from './calenda
 import { createChartBook } from './chartbook.mjs';
 import { CALCULATION_VERSION, dataVersion, getWorkspace, isoDate, listWorkspace, marketDay } from './database.mjs';
 import { createEngine, UNIVERSES } from './engine.mjs';
+import { attachGroupMembershipVelocity, groupMembershipBasis, isCurrentGroupMembership } from './group-velocity.mjs';
 import { readMaterializedHistory } from './materialization.mjs';
 import { readPreparedMarketTiming } from './market-timing.mjs';
 import { readPreparedRanks, preparationInput } from './preparation.mjs';
@@ -327,9 +328,23 @@ function classifySector(group, sectors, taxonomy, exclusions, excludeDefensive) 
 }
 
 function industryStrength(db, engine, config, input) {
-  const { order = 'rs-improvement', view = 'eligible', excludeDefensive = false, includeUnclassified = false } = input;
+  const { order = 'rs-improvement', view = 'eligible', excludeDefensive = false, includeUnclassified = false, membership = 'auto' } = input;
+  const currentSupported = isCurrentGroupMembership(config);
+  if (membership === 'current' && (order !== 'rs-improvement' || !currentSupported)) {
+    throw researchError('Current-membership RS improvement requires the selected latest Nasdaq reference.');
+  }
   const exclusions = new Set((input.excludedSectors ?? []).map(normalized));
-  const snapshot = requiredSnapshot(db, engine, config, { velocity: order === 'rs-improvement' });
+  const velocity = order === 'rs-improvement';
+  const available = velocity && currentSupported && membership !== 'dated'
+    ? preparedSnapshot(db, engine, config, { velocity: true }) ?? requiredSnapshot(db, engine, config)
+    : requiredSnapshot(db, engine, config, { velocity });
+  const dated = available.groups.filter(({ level }) => level === 'industry');
+  const useProjection = membership === 'current' || membership === 'auto' && velocity && currentSupported &&
+    !dated.some((group) => finite(group.velocity4w) || finite(group.velocity12w));
+  const projected = useProjection && attachGroupMembershipVelocity(db, config, available);
+  const current = membership === 'current' || projected && projected.groups.some((group) => group.level === 'industry' &&
+    (finite(group.currentMembership?.velocity4w) || finite(group.currentMembership?.velocity12w)));
+  const snapshot = current ? projected : available;
   const sectors = new Map(snapshot.groups.filter(({ level }) => level === 'sector').map(({ id, name }) => [id, name]));
   const groups = snapshot.groups.filter(({ level }) => level === 'industry');
   let latest;
@@ -356,12 +371,14 @@ function industryStrength(db, engine, config, input) {
     const classification = classifySector(group, sectors, config.classification, exclusions, excludeDefensive);
     const stats = returns?.get(group.id);
     const trailing = expected > 0 && stats?.count === expected ? (stats.gross - 1) * 100 : null;
-    const value = order === 'rs-improvement' ? group.velocity12w ?? null : order === 'current-rank' ? group.rank ?? null : trailing;
+    const score = current ? group.currentMembership?.velocity12w : group.velocity12w;
+    const value = order === 'rs-improvement' ? score ?? null : order === 'current-rank' ? group.rank ?? null : trailing;
     const unknown = ['unknown_sector', 'unmapped_sector', 'mixed_sic_division'].includes(classification.sectorDecision);
     const included = classification.sectorDecision === 'eligible' || unknown && includeUnclassified;
     decisions[classification.sectorDecision] = (decisions[classification.sectorDecision] ?? 0) + 1;
     return { ...pick(group, ['id', 'name', 'parent', 'rank', 'percentile', 'count', 'rankedCount', 'medianRS', 'velocity12w', 'rankChange12w']),
-      ...classification, included, value, ...(returns && { returnSessions: stats?.count ?? 0 }) };
+      ...classification, included, value, ...(current && { currentMembership: group.currentMembership ?? null }),
+      ...(returns && { returnSessions: stats?.count ?? 0 }) };
   });
   const unit = order === 'rs-improvement' ? 'percentile points' : order === 'current-rank' ? 'ordinal' : 'percent';
   const selected = rows.filter(({ included }) => view === 'all' || (view === 'eligible') === included);
@@ -370,14 +387,31 @@ function industryStrength(db, engine, config, input) {
     return (order === 'current-rank' ? left.value - right.value : right.value - left.value) || left.id.localeCompare(right.id);
   });
   const comparableGroups = selected.filter(({ value }) => finite(value)).length;
-  return response(config, order === 'trailing-return' ? 'materialized dated industry returns' : 'prepared industry snapshot', {
-    state: selected.length > 0 && comparableGroups < selected.length ? 'partial' : 'ready',
-    coverage: { ...snapshot.coverage, groups: groups.length, sectorDecisions: decisions, ...latest,
-      comparableGroups }, items: selected, input,
-    data: { order, unit, excludeDefensive, excludedSectors: input.excludedSectors ?? [], includeUnclassified, view,
-      methodology: order === 'rs-improvement' ? 'Current industry RS percentile minus its comparable percentile twelve weekly observations earlier.'
-        : order === 'current-rank' ? 'Current industry RS rank within the pinned universe.'
-          : 'Compounded equal-weight daily returns of dated industry members. A missing session makes that industry’s result unavailable.',
+  const coverage = current ? selected.reduce((summary, { currentMembership: cohort }) => {
+    if (!cohort) return summary;
+    summary.currentRankedMembers += cohort.cohortCount;
+    summary.anchorTradedMembers += cohort.tradedRosterCount;
+    summary.paired4wMembers += cohort.horizons['4w'].matchedMembers ?? 0;
+    summary.paired12wMembers += cohort.horizons['12w'].matchedMembers ?? 0;
+    return summary;
+  }, { currentRankedMembers: 0, anchorTradedMembers: 0, paired4wMembers: 0, paired12wMembers: 0 }) : null;
+  return response(config, current ? 'prepared current-membership industry RS archive'
+    : order === 'trailing-return' ? 'materialized dated industry returns' : 'prepared industry snapshot', {
+    state: current && snapshot.groupMembershipProjection?.state === 'unprepared' ? 'unprepared'
+      : selected.length > 0 && comparableGroups < selected.length ? 'partial' : 'ready',
+    coverage: { ...snapshot.coverage, groups: groups.length, sectorDecisions: decisions, ...latest, comparableGroups,
+      ...(coverage && { currentMembership: { ...coverage,
+        representativeness: coverage.anchorTradedMembers ? coverage.currentRankedMembers / coverage.anchorTradedMembers : null,
+        representativenessMeaning: 'Current RS-ranked members divided by all traded members of the selected industries.',
+        pairedCoverageMeaning: 'Within each group, members with finite RS at both endpoints divided by the frozen current RS-ranked members.',
+      } }) }, items: selected, input,
+    data: { order, unit, membership: current ? groupMembershipBasis : 'dated-membership', requestedMembership: membership,
+      ...(projected && { groupMembershipProjection: projected.groupMembershipProjection }),
+      excludeDefensive, excludedSectors: input.excludedSectors ?? [], includeUnclassified, view,
+      methodology: current ? 'Change in RS percentile across the same eligible peers and comparable members at both endpoints, using today’s frozen RS-eligible cohort. A high matched share can still represent only a small part of the traded industry.'
+        : order === 'rs-improvement' ? 'Current industry RS percentile minus its comparable percentile twelve weekly observations earlier.'
+          : order === 'current-rank' ? 'Current industry RS rank within the pinned universe.'
+            : 'Compounded equal-weight daily returns of dated industry members. A missing session makes that industry’s result unavailable.',
       sectorMethodology: 'Defense uses identified sector labels. Only SEC SIC Mining, Construction, and Finance/Insurance/Real Estate are treated as nondefensive. Other divisions are marked mixed or unmapped.',
       defensiveLabels: excludeDefensive ? [...defensive] : [] } });
 }

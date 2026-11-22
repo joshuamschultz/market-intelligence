@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildLeadershipMap, groupHeatmapMetrics, renderGroupHeatmap } from '../frontend/group-visuals.js';
+import { groupMembershipView } from '../frontend/group-membership.js';
 
 const sector = (id, values) => ({ id, name: id, level: 'sector', ...values });
 const industry = (id, values) => ({ id, name: id, level: 'industry', ...values });
@@ -75,4 +76,21 @@ test('RS map uses group percentile and separates flat velocity from missing hist
   assert.equal(twelveWeeks.plotted, 4);
   assert.equal(twelveWeeks.omitted, 3);
   assert.equal(twelveWeeks.quadrants.lowerRSFalling, 2);
+});
+
+test('membership selection preserves dated SEC and historical Nasdaq values and treats zero velocity as available', () => {
+  const date = '2026-11-20';
+  const groupMembershipProjection = { state: 'ready', basis: 'current-membership', anchorDate: date };
+  const projected = { velocity4w: 25, horizons: { '4w': { state: 'ready', current: { percentile: 30 } } } };
+  const rows = [industry('Example', { rank: 1, percentile: 100, velocity4w: 0, currentMembership: projected })];
+  const data = { date, classificationSystem: 'nasdaq', groups: rows, groupMembershipProjection };
+  const options = { level: 'industry' };
+  assert.equal(groupMembershipView(data, options).basis, 'dated');
+  const membership = groupMembershipView(data, { ...options, selection: 'current' });
+  assert.equal(membership.basis, 'current');
+  assert.equal(buildLeadershipMap(rows, { ...options, membership }).quadrants.lowerRSRising, 1);
+  assert.equal(buildLeadershipMap(rows, options).quadrants.flat, 1);
+  assert.equal(groupMembershipView({ ...data, classificationSystem: 'sec-sic' }, { ...options, selection: 'current' }).basis, 'dated');
+  assert.equal(groupMembershipView({ ...data, date: '2026-07-22' }, { ...options, selection: 'current' }).basis, 'dated');
+  assert.equal(groupMembershipView(data, { ...options, level: 'theme', selection: 'current' }).basis, 'dated');
 });

@@ -14,7 +14,8 @@ import { runBatchPreparation } from './batch-preparation.mjs';
 import { BREADTH_METRICS, breadthMetric, binaryMetric } from './breadth.mjs';
 import { chartBookIndustryJob, createChartBook, prepareChartBookIndustries, readChartBookSnapshot, scheduleChartBookIndustries } from './chartbook.mjs';
 import { createResearchNotes } from './research-notes.mjs';
-import { prepareDailyAnalysis } from './daily-analysis.mjs';
+import { prepareDailyAnalysis, requirePreparedGroupMemberships } from './daily-analysis.mjs';
+import { attachGroupMembershipVelocity, prepareGroupMemberships } from './group-velocity.mjs';
 import { marketTimingJournalContext, prepareDailyMarketTiming, readPreparedMarketTiming } from './market-timing.mjs';
 import { createEngine, UNIVERSES, validateUniverse } from './engine.mjs';
 import { AVERAGES, DEFAULT_WINDOWS, alignSeries, finite, mean, volumeRatio } from './metrics.mjs';
@@ -737,7 +738,7 @@ function workspaceDefaults(db, pin = null) {
     classification: classificationStatus(db, pin?.version).defaultClassification, reference: 'latest' };
 }
 
-function createServiceEngine(db) {
+export function createServiceEngine(db) {
   const engine = createEngine(db);
   const context = engine.context;
   const captures = new Map();
@@ -923,6 +924,18 @@ export function preparationWorkspaceScopes(db, engine, { date, version = dataVer
       ...knownRangeDependencies(screen, entry).map((dependency) => ({ ...context, ...dependency }))]);
   });
   return { base, basePoint, custom, rangeInputs: [{ rangeWindows: [20, 252] }, ...custom, ...historicalScreenRanges, ...alertRangeContexts] };
+}
+
+export function workspaceGroupMembershipContexts(db, engine, config) {
+  const scopes = preparationWorkspaceScopes(db, engine, { date: config.date, version: config.dataVersion, pinnedDefaults: true });
+  return preparationSpecs(db, engine, scopes.base, { custom: scopes.custom })
+    .filter(({ phase }) => phase === 'history')
+    .map(({ context }) => engine.context(context))
+    .filter((point) => point.date === config.date && point.dataVersion === config.dataVersion);
+}
+
+export function prepareWorkspaceGroupMemberships(db, engine, config, options) {
+  return prepareGroupMemberships(db, engine, workspaceGroupMembershipContexts(db, engine, config), options);
 }
 
 function schedulePreparation(db, engine, { date, version = dataVersion(db), requested, retry } = {}) {
@@ -1839,7 +1852,7 @@ function journalContext(db, engine, payload) {
   });
   if (!config.date || !config.earliestDate) throw new Error('Import prices before generating a market journal');
   if (payload.asOfDate && payload.asOfDate !== config.date) throw new Error('Choose a finalized session with market prices');
-  const snapshot = engine.snapshot({ ...config, currentVersion: false }, { cache: false });
+  const snapshot = attachGroupMembershipVelocity(db, config, engine.snapshot({ ...config, currentVersion: false }, { cache: false }));
   const health = marketHealth(db, engine, config, { snapshot });
   const prior = readMaterializedHistory(db, engine, config, { limit: 21 }).rows.filter((row) => row.date < config.date);
   const traded = snapshot.stocks.filter((row) => row.traded);
@@ -1852,6 +1865,7 @@ function journalContext(db, engine, payload) {
     sessionReview: marketTimingJournalContext(db, config),
     health: { score: health.score, state: health.state, regime: health.regime, components: health.components },
     groups: snapshot.groups.slice(0, 25).map(({ memberIds, ...group }) => group),
+    ...(snapshot.groupMembershipProjection && { groupMembershipProjection: snapshot.groupMembershipProjection }),
     leaders: traded.filter((row) => row.rsRank != null).sort((a, b) => a.rsRank - b.rsRank).slice(0, 12)
       .map(({ symbol, rsRank, rsPercentile, return_1d, return_21d, sector, industry }) =>
         ({ symbol, rsRank, rsPercentile, return_1d, return_21d, sector, industry })),
@@ -2035,6 +2049,10 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
           result.summation = prepareNyseSummation(db, engine, point);
         }
       }
+      if (!result.continuation && payload.phase === 'history') {
+        const requested = payload.contexts.map(({ context, rank }) => ({ config: engine.context(context), rank }));
+        result.groupMembership = requirePreparedGroupMemberships(prepareGroupMemberships(db, engine, requested));
+      }
       return result;
     }
     const result = runPreparation(db, engine, payload, progress);
@@ -2115,13 +2133,22 @@ export async function performJob(db, type, payload, { provider = EodhdProvider()
       return prepareDailyAnalysis(db, engine, config, { workspaceScopes: preparationWorkspaceScopes, rangeContext,
         summationContext, prepareStandardHealth, prepareProxies, progress,
         prepareTiming: (point) => prepareDailyMarketTiming(db, engine, point),
+        prepareMembership: (point, contexts) => contexts
+          ? prepareGroupMemberships(db, engine, contexts) : prepareWorkspaceGroupMemberships(db, engine, point),
         finalizeAlerts: (point) => updateAlerts(db, engine, point, { rangeOnly: true, priorPrepared: true }) });
     }
     const result = precomputeProduction(db, engine, config, { ...payload, progress });
     prepareStandardHealth(db, engine, config);
     const sessionReview = prepareDailyMarketTiming(db, engine, engine.context({ date: config.date, dataVersion: config.dataVersion }));
+    const membership = prepareWorkspaceGroupMemberships(db, engine, config);
+    const compactBaseline = db.prepare("SELECT 1 FROM sqlite_schema WHERE name='prepared_snapshot_contexts' AND type='table'").get() &&
+      db.prepare('SELECT 1 FROM prepared_snapshot_contexts LIMIT 1').get();
+    const groupMembership = compactBaseline || verifiedAnalysisPublication(db, {
+      date: config.date, dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION,
+    }) ? requirePreparedGroupMemberships(membership)
+      : { ...membership, reason: 'unsupported_legacy_archive' };
     scheduleChartBookIndustries(db, engine, materializationContext(config), (jobType, input) => createJob(db, jobType, input));
-    return { ...result, sessionReview };
+    return { ...result, sessionReview, groupMembership };
   }
   if (type === 'rank-materialize') return writeRankArchive(db, engine, engine.context(payload.context || {}), { ...payload, progress });
   if (type === 'materialize') {
@@ -2370,19 +2397,22 @@ export function createService({ db, provider, journalClient, workers = true, pre
     return { ...wide, stocks: wide.stocks.filter((row) => row.securityId === securityId) };
   }
 
-  function readSnapshot(config, { velocity = false, summary = false } = {}) {
+  function readSnapshot(config, { velocity = false, summary = false, groupMembership = false } = {}) {
+    const result = (snapshot, preparation) => ({
+      snapshot: groupMembership ? attachGroupMembershipVelocity(db, config, snapshot) : snapshot, preparation,
+    });
     if (!preparedOnly || engine.snapshotAvailable(config, { velocity })) {
-      return { snapshot: engine.snapshot(config, { velocity, persist: !preparedOnly }) };
+      return result(engine.snapshot(config, { velocity, persist: !preparedOnly }));
     }
     const compact = preparedView(config, { velocity });
-    if (compact) return { snapshot: compact };
+    if (compact) return result(compact);
     const preparation = pendingPreparation(config);
     if (summary) {
       const [archived] = readMaterializedHistory(db, engine, config, { limit: 1 }).rows;
-      if (archived?.date === config.date) return { snapshot: { ...archived, stocks: [] }, preparation };
+      if (archived?.date === config.date) return result({ ...archived, stocks: [] }, preparation);
     }
-    return { snapshot: { date: config.date, universe: config.universe, model: config.model, dataVersion: config.dataVersion,
-      coverage: { state: 'unprepared', listed: null, traded: null }, stocks: [], groups: [], breadth: {}, aggregates: {} }, preparation };
+    return result({ date: config.date, universe: config.universe, model: config.model, dataVersion: config.dataVersion,
+      coverage: { state: 'unprepared', listed: null, traded: null }, stocks: [], groups: [], breadth: {}, aggregates: {} }, preparation);
   }
 
   function velocityOptions(config) {
@@ -2690,7 +2720,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
             materialization: source.materialization, preparation, dataVersion: config.dataVersion });
         }
         if (item === 'overview') {
-          const { snapshot, preparation } = readSnapshot(config, { summary: true });
+          const { snapshot, preparation } = readSnapshot(config, { summary: true, groupMembership: true });
           const { stocks, ...thin } = snapshot;
           const traded = stocks.filter((row) => row.traded);
           const leaders = traded.filter(({ rsRank }) => rsRank != null).sort((a, b) => a.rsRank - b.rsRank).slice(0, 8);
@@ -2912,10 +2942,14 @@ export function createService({ db, provider, journalClient, workers = true, pre
       if (area === 'industries' && method === 'GET') {
         const config = asContext();
         const options = velocityOptions(config);
-        const { snapshot: snap, preparation } = options[resolvedSnapshot] ? { snapshot: options[resolvedSnapshot] }
-          : readSnapshot(config, { velocity: options.velocity, summary: true });
+        const exposeMembership = item !== 'compare' && action !== 'members';
+        const existing = options[resolvedSnapshot];
+        const { snapshot: snap, preparation } = existing
+          ? { snapshot: exposeMembership ? attachGroupMembershipVelocity(db, config, existing) : existing }
+          : readSnapshot(config, { velocity: options.velocity, summary: true, groupMembership: exposeMembership });
+        const membership = snap.groupMembershipProjection && { groupMembershipProjection: snap.groupMembershipProjection };
         if (!item) return response({ date: snap.date, ...options, referenceDate: snap.referenceDate, referenceMode: snap.referenceMode,
-          classificationSystem: snap.classificationSystem, coverage: snap.coverage, preparation,
+          classificationSystem: snap.classificationSystem, coverage: snap.coverage, preparation, ...membership,
           groups: snap.groups.filter((group) => !query.level || group.level === query.level) });
         if (item === 'compare') {
           const ids = String(query.ids || '').split(',').filter(Boolean).slice(0, 8);
@@ -2935,7 +2969,7 @@ export function createService({ db, provider, journalClient, workers = true, pre
           const selected = new Set(group.memberIds);
           return response(screenStocks({ ...snap, stocks: snap.stocks.filter((stock) => selected.has(stock.securityId)) }, query));
         }
-        return response(group);
+        return response({ ...group, ...membership });
       }
       if (area === 'research' && method === 'POST') {
         if (item === 'event-studies') return response(enqueue('event-study', { ...body, ...researchCoverage(body) }), 202);

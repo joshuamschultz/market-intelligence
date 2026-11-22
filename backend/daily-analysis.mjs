@@ -154,12 +154,22 @@ function prepareInstruments(db, engine, config, parent, plans, progress) {
     expected: { detail: roster.length, risk: report.expectedBlocks, ranges: plans.rangeWindows.length } };
 }
 
+export function requirePreparedGroupMemberships(result) {
+  const missing = result?.results?.find(({ state }) => state === 'unprepared');
+  if (missing) {
+    const { universe, model } = missing.scope;
+    throw new Error(`Missing prepared current group membership for ${universe}/${model}: ${missing.reason}`);
+  }
+  return result;
+}
+
 export function prepareDailyAnalysis(db, engine, config, {
-  workspaceScopes, rangeContext, summationContext, prepareStandardHealth, prepareProxies, prepareTiming = () => undefined, finalizeAlerts, progress,
+  workspaceScopes, rangeContext, summationContext, prepareStandardHealth, prepareProxies, prepareTiming = () => undefined, prepareMembership = () => undefined, finalizeAlerts, progress,
 }) {
   const point = { date: config.date, dataVersion: config.dataVersion, calculationVersion: CALCULATION_VERSION };
   const exact = verifiedAnalysisPublication(db, point);
-  if (exact) return { ...point, ...exact, chartBook: prepareProxies(config), sessionReview: prepareTiming(config) };
+  if (exact) return { ...point, ...exact, chartBook: prepareProxies(config), sessionReview: prepareTiming(config),
+    groupMembership: requirePreparedGroupMemberships(prepareMembership(config)) };
   const parent = dailyAnalysisParent(db, point);
   if (!parent) return { ...point, analysisPreparation: 'verified_baseline_required' };
   const scopes = workspaceScopes(db, engine, { date: point.date, version: point.dataVersion });
@@ -253,6 +263,7 @@ export function prepareDailyAnalysis(db, engine, config, {
   products.nyseSummation = 1;
   const chartBook = prepareProxies(config);
   const sessionReview = prepareTiming(scopes.basePoint);
+  const groupMembership = requirePreparedGroupMemberships(prepareMembership(scopes.basePoint, dated));
   const alerts = finalizeAlerts(point);
   if (alerts.deferred.length) throw new Error('A saved alert is missing required range or dated screen products');
   if (dataVersion(db) !== point.dataVersion) throw new Error('Warehouse revision changed during daily analysis preparation');
@@ -261,5 +272,5 @@ export function prepareDailyAnalysis(db, engine, config, {
   const receiptId = writeDailyAnalysisReceipt(db, point, parent, { recipeHash: rootPlan.recipeHash, contexts: parent.contexts, products: proof });
   progress(1);
   return { ...point, receiptId, parentDate: parent.date, parentDataVersion: parent.dataVersion, dates, products, core,
-    physicalContexts: plan.contexts.length, fixedContexts: fixed.length, instruments: stats, chartBook, sessionReview, alerts };
+    physicalContexts: plan.contexts.length, fixedContexts: fixed.length, instruments: stats, chartBook, sessionReview, groupMembership, alerts };
 }

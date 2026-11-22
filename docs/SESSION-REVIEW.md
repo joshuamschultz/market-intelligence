@@ -59,7 +59,7 @@ The posture combines SPY and IXIC benchmark phases, pressure signals, support, b
 
 - **Conservative:** both SPY and IXIC are in correction.
 - **Pressure:** an observed benchmark is in correction or shows a pressure flag, without both benchmarks meeting the conservative condition.
-- **Constructive:** both benchmarks are confirmed and above SMA50; each has at least 20 usable volume comparisons in the trailing 25 sessions; breadth is supportive; and five-session lagged leader response is positive.
+- **Constructive:** both benchmarks are confirmed and above SMA50; each has a usable current-session volume comparison and at least 20 usable volume comparisons in the trailing 25 sessions; breadth is supportive; and five-session lagged leader response is positive.
 - **Test:** at least one observed benchmark is in baseline, rally, or confirmed phase, but the constructive requirements are not met.
 - **Unknown:** available evidence does not support another posture.
 

@@ -83,12 +83,45 @@ export function readPreparedRanks(db, config, dates, { securityId, symbol } = {}
   return { observed, rows };
 }
 
+const rankWitnessSignature = (buckets) => createHash('sha256').update(JSON.stringify(buckets)).digest('hex');
+
+function rankBlockEvidence(read, recipe, version, date, { values = false } = {}) {
+  const buckets = [];
+  const percentiles = values ? new Map() : null;
+  let count = 0;
+  for (const { bucket, value } of read.iterate(recipe, version, date)) {
+    const rows = decodeStoredJson(value);
+    if (!Array.isArray(rows) || !rows.length) throw new Error(`Empty or invalid rank block for ${date}`);
+    const ids = rows.map((row) => {
+      const id = row?.[0];
+      if (!Array.isArray(row) || typeof id !== 'string' || !id || bucketFor(id) !== bucket) {
+        throw new Error(`Rank ID is outside its bucket for ${date}`);
+      }
+      if (percentiles) {
+        const percentile = row[3];
+        if (percentile !== null && (!Number.isFinite(percentile) || percentile < 0 || percentile > 100)) {
+          throw new Error(`Invalid archived stock percentile for ${date}`);
+        }
+        percentiles.set(id, percentile);
+      }
+      return id;
+    });
+    if (new Set(ids).size !== ids.length) throw new Error(`Duplicate traded ID in rank block for ${date}`);
+    count += ids.length;
+    buckets.push([bucket, ids.length, rankWitnessSignature(ids)]);
+  }
+  return { signature: rankWitnessSignature(buckets), blocks: buckets.length, tradedIds: count, percentiles };
+}
+
+function rankBlocks(db) {
+  return db.prepare(`SELECT bucket,value FROM prepared_rank_blocks
+    WHERE recipe=? AND data_version=? AND date=? ORDER BY bucket`);
+}
+
 export function verifyPreparedRankCoverage(db, config, dates, witnesses, cache = new Map()) {
   const verified = { dates: 0, blocks: 0, tradedIds: 0 };
   if (!dates.length) return verified;
-  const read = db.prepare(`SELECT bucket,value FROM prepared_rank_blocks
-    WHERE recipe=? AND data_version=? AND date=? ORDER BY bucket`);
-  const signature = (buckets) => createHash('sha256').update(JSON.stringify(buckets)).digest('hex');
+  const read = rankBlocks(db);
   for (const scope of referenceArchiveScopes(config, dates)) {
     const { recipe, selected } = compactScope(db, scope.config, scope.dates);
     for (const date of scope.dates) {
@@ -96,33 +129,40 @@ export function verifyPreparedRankCoverage(db, config, dates, witnesses, cache =
       const expected = witnesses.get(date);
       if (version == null || !Array.isArray(expected)) throw new Error(`Missing rank date or traded-stock witness for ${date}`);
       const key = `${recipe}:${version}:${date}`;
-      if (!cache.has(key)) {
-        const buckets = [];
-        let count = 0;
-        for (const { bucket, value } of read.iterate(recipe, version, date)) {
-          const rows = decodeStoredJson(value);
-          if (!Array.isArray(rows) || !rows.length) throw new Error(`Empty or invalid rank block for ${date}`);
-          const ids = rows.map((row) => {
-            const id = row?.[0];
-            if (!Array.isArray(row) || typeof id !== 'string' || !id || bucketFor(id) !== bucket) {
-              throw new Error(`Rank ID is outside its bucket for ${date}`);
-            }
-            return id;
-          });
-          if (new Set(ids).size !== ids.length) throw new Error(`Duplicate traded ID in rank block for ${date}`);
-          count += ids.length;
-          buckets.push([bucket, ids.length, createHash('sha256').update(JSON.stringify(ids)).digest('hex')]);
-        }
-        cache.set(key, { signature: signature(buckets), blocks: buckets.length, tradedIds: count });
-      }
+      if (!cache.has(key)) cache.set(key, rankBlockEvidence(read, recipe, version, date));
       const actual = cache.get(key);
-      if (actual.signature !== signature(expected)) throw new Error(`Rank blocks disagree with the saved traded-stock roster for ${date}`);
+      if (actual.signature !== rankWitnessSignature(expected)) throw new Error(`Rank blocks disagree with the saved traded-stock roster for ${date}`);
       verified.dates++;
       verified.blocks += actual.blocks;
       verified.tradedIds += actual.tradedIds;
     }
   }
   return verified;
+}
+
+export function readPreparedRankPercentiles(db, config, dates, witnesses, cache = new Map()) {
+  const result = new Map(dates.map((date) => [date, { state: 'unprepared', reason: 'rank_date_unprepared' }]));
+  if (!dates.length || !db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='prepared_rank_dates'").get()) return result;
+  const read = rankBlocks(db);
+  for (const scope of referenceArchiveScopes(config, dates)) {
+    const { recipe, selected } = compactScope(db, scope.config, scope.dates);
+    for (const [date, version] of selected) {
+      const witness = witnesses.get(date);
+      if (!Array.isArray(witness)) {
+        result.set(date, { state: 'unprepared', reason: 'rank_witness_unprepared' });
+        continue;
+      }
+      const key = `${recipe}:${version}:${date}`;
+      if (!(cache.get(key)?.percentiles instanceof Map)) cache.set(key, rankBlockEvidence(read, recipe, version, date, { values: true }));
+      const evidence = cache.get(key);
+      if (evidence.signature !== rankWitnessSignature(witness)) {
+        throw new Error(`Rank blocks disagree with the saved traded-stock roster for ${date}`);
+      }
+      result.set(date, { state: 'ready', recipe, dataVersion: version,
+        blockCount: evidence.blocks, tradedIds: evidence.tradedIds, percentiles: evidence.percentiles });
+    }
+  }
+  return result;
 }
 
 export function createPreparedRankWriter(db, config, dates, { codec } = {}) {
