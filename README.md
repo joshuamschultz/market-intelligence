@@ -4,7 +4,7 @@
 
 # Market Intelligence
 
-### Self-hosted stock research for relative strength, market breadth, and industry leadership
+### Open-source, self-hosted stock research for relative strength, market breadth, and industry leadership
 
 Start with the whole U.S. market. Find the industry groups that lead it. Find the stocks that drive those groups.<br>
 Then review every chart once and keep a dated record of what you saw.
@@ -14,7 +14,7 @@ Then review every chart once and keep a dated record of what you saw.
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](docs/ARCHITECTURE.md)
 [![Local first](https://img.shields.io/badge/runs-on%20your%20machine-0b1216?style=for-the-badge)](#-privacy-and-security)
 [![Status](https://img.shields.io/badge/status-active%20development-f0b429?style=for-the-badge)](#-project-status)
-[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-8a63d2?style=for-the-badge)](LICENSE.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-8a63d2?style=for-the-badge)](LICENSE)
 
 **[Features](#-features)** &nbsp;·&nbsp; **[Screenshots](#-screenshots)** &nbsp;·&nbsp; **[Quick start](#-quick-start)** &nbsp;·&nbsp; **[How it works](#-how-it-works)** &nbsp;·&nbsp; **[Docs](#-documentation)** &nbsp;·&nbsp; **[FAQ](#-faq)**
 
@@ -461,23 +461,15 @@ The capture pipeline uses **EODHD** for end-of-day prices, history, and corporat
 
 ## 📜 License
 
-Market Intelligence is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+Market Intelligence is open source under the [MIT License](LICENSE).
 
-| You may | You may not |
+| You may | You must |
 | :--- | :--- |
-| ✅ Use it for personal research, study, and hobby trading | ❌ Sell it, or use it inside a paid product or service |
-| ✅ Change it and share your changes for noncommercial use | ❌ Use it for commercial purposes without a separate license |
-| ✅ Use it at charities, schools, public research, and government groups | ❌ Remove the copyright notice |
+| ✅ Use it for any purpose, including commercial use | 📌 Keep the copyright notice and license text in every copy |
+| ✅ Change it and share your changes | |
+| ✅ Include it in your own projects | |
 
-Anyone who shares a copy must keep the license and this line:
-
-```text
-Required Notice: Copyright (c) 2026 Josh Schultz (https://github.com/joshuamschultz)
-```
-
-**Commercial use.** A commercial license is available from the author. Contact [Josh Schultz on GitHub](https://github.com/joshuamschultz).
-
-**Contributions.** By sending a pull request, you agree that the author may license your contribution under these terms and under separate commercial terms.
+Copyright (c) 2026 [Josh Schultz](https://github.com/joshuamschultz). The software comes as is, with no warranty.
 
 ## ⚖️ Disclaimer
 
@@ -487,5 +479,5 @@ Required Notice: Copyright (c) 2026 Josh Schultz (https://github.com/joshuamschu
 ---
 
 <div align="center">
-<sub>Market Intelligence · relative strength rankings · market breadth · industry group rotation · sector rotation · stock screener · self-hosted stock research</sub>
+<sub>Market Intelligence · relative strength rankings · market breadth · industry group rotation · sector rotation · stock screener · self-hosted stock research · open source</sub>
 </div>

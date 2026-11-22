@@ -2,7 +2,7 @@
   "name": "market-intelligence",
   "version": "0.2.7",
   "private": true,
-  "license": "PolyForm-Noncommercial-1.0.0",
+  "license": "MIT",
   "author": "Josh Schultz (https://github.com/joshuamschultz)",
   "type": "module",
   "engines": {
