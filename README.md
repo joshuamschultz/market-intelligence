@@ -9,7 +9,7 @@
 Start with the whole U.S. market. Find the industry groups that lead it. Find the stocks that drive those groups.<br>
 Then review every chart once and keep a dated record of what you saw.
 
-[![Version](https://img.shields.io/badge/version-0.3.3-55d9bd?style=for-the-badge)](package.json)
+[![Version](https://img.shields.io/badge/version-0.3.4-55d9bd?style=for-the-badge)](package.json)
 [![Node.js](https://img.shields.io/badge/node-24.15%2B%20%7C%2026%20LTS-3c873a?style=for-the-badge&logo=node.js&logoColor=white)](#-requirements)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](docs/ARCHITECTURE.md)
 [![Local first](https://img.shields.io/badge/runs-on%20your%20machine-0b1216?style=for-the-badge)](#-privacy-and-security)
@@ -177,7 +177,7 @@ Most tools show you one piece: a chart, a screener, or an index. Market Intellig
 | 📋 | **Stock Lists** | Return leaders for 1W to 1Y | *What led over this period?* |
 | 🏭 | **Industries** | Group heatmap, RS vs velocity, table | *Which groups lead, and which are rotating in?* |
 | 🕰️ | **Historical Explorer** | Replay, cohorts, events, forward returns | *What happened after similar setups?* |
-| 📓 | **Market Journal** | Dated market notes, optional Claude drafts | *What did I see, and when?* |
+| 📓 | **Market Journal** | Dated market notes, optional Claude drafts, [connection help](docs/JOURNAL-TROUBLESHOOTING.md) | *What did I see, and when?* |
 | 📈 | **ChartBook** | Keyboard chart review across saved lists | *Did I look at every candidate?* |
 | 💾 | **Saved Screens** | Reusable screen definitions | *Can I rerun last week's screen?* |
 | ⭐ | **Watchlists** | Manual lists or live screen members | *What am I tracking?* |
@@ -377,7 +377,7 @@ npm test
 
 ## 📍 Project status
 
-Source package version: **0.3.3**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
+Source package version: **0.3.4**. Use `/api/v1/build` or `data/active-release.json` to confirm which build is active.
 
 | Area | Status | Notes |
 | :--- | :---: | :--- |
@@ -397,6 +397,7 @@ Open items: [Remaining work](docs/REMAINING-WORK.md) · [Performance acceptance]
 | :--- | :--- |
 | 🖥️ [Desktop quickstart](docs/LOCAL-QUICKSTART.md) | Install and run the managed macOS service |
 | 🔧 [Operations](docs/OPERATIONS.md) | Import, backup, restore, and recovery |
+| 📓 [Journal troubleshooting](docs/JOURNAL-TROUBLESHOOTING.md) | Anthropic API errors, safe retries, and preserving Journal setup |
 | 🏗️ [Architecture](docs/ARCHITECTURE.md) | Data flow and system design |
 | 🧭 [AI connections](docs/AI-CONNECTIONS.md) | Scoped API/MCP access and provider-specific connection limits |
 | 🤖 [AI research contract](docs/AI-RESEARCH-CONTRACT.md) | Tool catalog, provenance, pagination, and statistical interpretation |

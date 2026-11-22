@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { expectedSessions, isMarketSession, latestFinalizableSession, shiftDate } from './calendar.mjs';
 import { dataVersion, isoDate, marketDay } from './database.mjs';
 import { runEventStudy } from './research.mjs';
@@ -8,6 +9,17 @@ import { runEventStudy } from './research.mjs';
 export const DEFAULT_JOURNAL_MODEL = 'claude-sonnet-5-5';
 const MODEL_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL_API_VERSION = '2023-06-01';
+const MODEL_TIMEOUT_MS = 120_000;
+const CONNECT_RETRY_DELAY_MS = 250;
+const connectErrors = new Set(['ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'ETIMEDOUT']);
+const timeoutErrors = new Set(['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT']);
+const tlsErrors = new Set(['DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'INVALID_CA',
+  'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE']);
+const incompleteJournalErrors = new Map([
+  ['max_tokens', 'Claude reached its output token limit before finishing the journal.'],
+  ['refusal', 'Claude declined to generate the journal. Review the saved prompt and any included notes.'],
+  ['model_context_window_exceeded', 'Claude reached its context limit before finishing the journal. Reduce the journal input size.'],
+]);
 const DEFAULT_AFTER = '20:30';
 const VAULT_AAD = Buffer.from('market-intelligence:journal:anthropic:1');
 const sentiments = ['bearish', 'cautious', 'neutral', 'constructive', 'bullish'];
@@ -297,24 +309,85 @@ function structuredOutput(output, factors) {
   return { ...output, title: output.title.trim(), factors: factors.map((item) => ({ key: item.key, label: item.label, value: byKey.get(item.key) })) };
 }
 
-export function createAnthropicJournalClient({ fetcher = fetch } = {}) {
+function connectionFailures(error) {
+  const cause = error?.cause ?? error;
+  return cause instanceof AggregateError && cause.errors.length ? cause.errors : [cause];
+}
+
+function claudeTransportError(error, signal, timeout, readingBody = false) {
+  signal?.throwIfAborted();
+  const codes = connectionFailures(error).map((failure) => failure?.code);
+  if (timeout.aborted || error?.name === 'TimeoutError' || codes.some((code) => timeoutErrors.has(code))) {
+    return new Error('The Claude API request timed out. Try generating the journal again.');
+  }
+  if (codes.some((code) => code === 'ENOTFOUND' || code === 'EAI_AGAIN')) {
+    return new Error('DNS could not resolve the Claude API host. Check the network DNS settings.');
+  }
+  if (codes.some((code) => tlsErrors.has(code) || typeof code === 'string' && /^(?:CERT_|ERR_TLS_|ERR_SSL_)/.test(code))) {
+    return new Error('The secure connection to the Claude API failed. Check the system clock and trusted certificates.');
+  }
+  return new Error(readingBody
+    ? 'The Claude API response was interrupted. Try generating the journal again.'
+    : 'The Claude API could not be reached. Check the network and proxy settings and try again.');
+}
+
+function claudeStatusError(status) {
+  const guidance = {
+    400: 'Check the selected model and Claude workspace limits.',
+    401: 'Check the saved Anthropic API key in Market Journal settings.',
+    402: 'Check your billing details in the Claude Console.',
+    403: 'Check that your Claude workspace and API key can access the selected model.',
+    404: 'Check that the selected Claude model is available to your workspace.',
+    413: 'Reduce the journal request size and try again.',
+    429: 'Check Claude workspace rate and spend limits before trying again.',
+    504: 'Claude timed out while generating the journal. Try again in a moment.',
+    529: 'Claude is temporarily overloaded. Try again in a moment.',
+  }[status] ?? (status >= 500 ? 'Try generating the journal again in a moment.' : 'Check your Claude workspace settings.');
+  return Object.assign(new Error(`Claude API request returned HTTP ${status}. ${guidance}`), { status });
+}
+
+export function createAnthropicJournalClient({ fetcher = fetch, timeoutMs = MODEL_TIMEOUT_MS } = {}) {
   return async ({ apiKey, model, system, user, schema, signal }) => {
+    signal?.throwIfAborted();
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const usesSonnet55 = model === 'claude-sonnet-5-5';
+    const request = { method: 'POST', redirect: 'error', headers: {
+      'x-api-key': apiKey, 'anthropic-version': MODEL_API_VERSION, 'content-type': 'application/json',
+    }, body: json({ model, max_tokens: usesSonnet55 ? 12_000 : 6500, system, messages: [{ role: 'user', content: user }],
+      output_config: { format: { type: 'json_schema', schema }, ...(usesSonnet55 ? { effort: 'medium' } : {}) } }), signal: requestSignal };
     let response;
-    try {
-      response = await fetcher(MODEL_URL, { method: 'POST', redirect: 'error', headers: {
-        'x-api-key': apiKey, 'anthropic-version': MODEL_API_VERSION, 'content-type': 'application/json',
-      }, body: json({ model, max_tokens: 6500, system, messages: [{ role: 'user', content: user }],
-        output_config: { format: { type: 'json_schema', schema } } }),
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000) });
-    } catch (error) {
-      if (signal?.aborted) throw signal.reason;
-      throw new Error('The Claude API could not be reached');
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (attempt > 0) await delay(CONNECT_RETRY_DELAY_MS, undefined, { signal: requestSignal });
+        requestSignal.throwIfAborted();
+        response = await fetcher(MODEL_URL, request);
+        break;
+      } catch (error) {
+        if (attempt > 0 || requestSignal.aborted) throw claudeTransportError(error, signal, timeout);
+        // Retry only failures that occurred before the connection could send the Messages request.
+        const retryable = connectionFailures(error).every((failure) => failure?.code === 'EAI_AGAIN' ||
+          failure?.code === 'UND_ERR_CONNECT_TIMEOUT' || failure?.syscall === 'connect' && connectErrors.has(failure.code));
+        if (!retryable) throw claudeTransportError(error, signal, timeout);
+      }
     }
-    if (!response.ok) throw Object.assign(new Error(`Claude API request returned HTTP ${response.status}`), { status: response.status });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw claudeStatusError(response.status);
+    }
     let body;
-    try { body = await response.json(); } catch { throw new Error('Claude returned an invalid API response'); }
-    if (['max_tokens', 'refusal'].includes(body.stop_reason)) throw new Error('Claude did not complete a journal response');
-    const text = body.content?.find((block) => block.type === 'text')?.text;
+    try {
+      body = await response.json();
+      requestSignal.throwIfAborted();
+    } catch (error) {
+      if (error instanceof SyntaxError && !requestSignal.aborted) throw new Error('Claude returned an invalid API response');
+      throw claudeTransportError(error, signal, timeout, true);
+    }
+    if (!Array.isArray(body?.content)) throw new Error('Claude returned an invalid API response');
+    const incomplete = incompleteJournalErrors.get(body.stop_reason);
+    if (incomplete) throw new Error(incomplete);
+    const text = body.content.find((block) => block?.type === 'text')?.text;
+    if (typeof text !== 'string') throw new Error('Claude did not return a structured journal document');
     let output;
     try { output = parse(text); } catch { throw new Error('Claude did not return a structured journal document'); }
     return { output, model: body.model ?? model, responseId: body.id ?? response.headers.get('request-id') };
